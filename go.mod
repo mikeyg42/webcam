@@ -4,8 +4,7 @@ go 1.22.0
 
 require (
 	github.com/antihax/optional v1.0.0
-	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
-	github.com/emersion/go-smtp v0.21.3
+	github.com/at-wat/ebml-go v0.17.1
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/mailslurp/mailslurp-client-go v0.0.0-20240603060551-5bc09baec5c5
@@ -16,9 +15,7 @@ require (
 )
 
 require (
-	github.com/blackjack/webcam v0.6.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/gen2brain/malgo v0.11.21 // indirect
 	github.com/golang/protobuf v1.2.0 // indirect
 	github.com/pion/datachannel v1.5.9 // indirect
 	github.com/pion/dtls/v2 v2.2.12 // indirect

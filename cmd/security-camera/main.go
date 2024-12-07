@@ -11,11 +11,11 @@ import (
 	"github.com/pion/mediadevices"
 	"gocv.io/x/gocv"
 
-	"github.com/mikey42/webcam/internal/config"
-	"github.com/mikey42/webcam/internal/motion"
-	"github.com/mikey42/webcam/internal/notification"
-	"github.com/mikey42/webcam/internal/video"
-	"github.com/mikey42/webcam/internal/webrtc"
+	"github.com/mikeyg42/webcam/internal/config"
+	"github.com/mikeyg42/webcam/internal/motion"
+	"github.com/mikeyg42/webcam/internal/notification"
+	"github.com/mikeyg42/webcam/internal/video"
+	"github.com/mikeyg42/webcam/internal/webrtc"
 )
 
 // Application struct that holds all components
@@ -56,17 +56,29 @@ func main() {
 }
 
 func NewApplication(cfg *config.Config) (*Application, error) {
-	notifier, err := notification.NewNotifier(&cfg.MailSlurpConfig)
+	notifier, err := notification.NewNotifier(&notification.MailSlurpConfig{
+		APIKey:   cfg.MailSlurpConfig.APIKey,
+		InboxID:  cfg.MailSlurpConfig.InboxID,
+		SMTPHost: cfg.MailSlurpConfig.SMTPHost,
+		SMTPPort: cfg.MailSlurpConfig.SMTPPort,
+		ToEmail:  cfg.MailSlurpConfig.ToEmail,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create notifier: %v", err)
 	}
 
-	motionDetector, err := motion.NewDetector(cfg, notifier)
+	motionDetector, err := motion.NewDetector(&cfg.MotionConfig, notifier) // Pass the MotionConfig directly
 	if err != nil {
 		return nil, fmt.Errorf("failed to create motion detector: %v", err)
 	}
 
-	videoRecorder := video.NewRecorder(&cfg.VideoConfig)
+	videoRecorder := video.NewRecorder(&video.VideoConfig{
+		Width:      cfg.VideoConfig.Width,
+		Height:     cfg.VideoConfig.Height,
+		Framerate:  cfg.VideoConfig.Framerate,
+		BitRate:    cfg.VideoConfig.BitRate,
+		OutputPath: cfg.VideoConfig.OutputPath,
+	})
 
 	return &Application{
 		config:         cfg,
@@ -93,19 +105,19 @@ func (app *Application) Initialize() error {
 		return fmt.Errorf("failed to connect to WebSocket server: %v", err)
 	}
 
-	webrtcManager, err := webrtc.NewManager(app.config, app.wsConnection)
+	webrtcManager, err := webrtc.NewManager(app.config, app.wsConnection, app.videoRecorder)
 	if err != nil {
 		return fmt.Errorf("failed to create WebRTC manager: %v", err)
 	}
 	app.webrtcManager = webrtcManager
 
 	// Select devices
-	ids, _, err := app.selectDevices()
+	camera, microphone, err := app.selectDevices()
 	if err != nil {
 		return fmt.Errorf("failed to select devices: %v", err)
 	}
 
-	if err := app.webrtcManager.SetupMediaTracks(ids); err != nil {
+	if err := app.webrtcManager.SetupMediaTracks(camera, microphone); err != nil {
 		return fmt.Errorf("failed to setup media tracks: %v", err)
 	}
 
@@ -129,7 +141,7 @@ func (app *Application) connectWebSocket() error {
 }
 
 // evaluates what devices are available and allows the user to select a camera and microphone
-func (app *Application) selectDevices() ([]string, []int, error) {
+func (app *Application) selectDevices() (camera, microphone mediadevices.MediaDeviceInfo, err error) {
 	// Enumerate available devices
 	devices := mediadevices.EnumerateDevices()
 
@@ -146,10 +158,10 @@ func (app *Application) selectDevices() ([]string, []int, error) {
 	}
 
 	if len(cameras) == 0 {
-		return nil, nil, fmt.Errorf("No camera devices found")
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{}, fmt.Errorf("No camera devices found")
 	}
 	if len(microphones) == 0 {
-		return nil, nil, fmt.Errorf("No microphone devices found")
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{}, fmt.Errorf("No microphone devices found")
 	}
 
 	// List available cameras
@@ -161,11 +173,11 @@ func (app *Application) selectDevices() ([]string, []int, error) {
 	// Select a camera
 	fmt.Print("Select a camera (0 for the first camera): ")
 	var cameraIndex int
-	_, err := fmt.Scan(&cameraIndex)
+	_, err = fmt.Scan(&cameraIndex)
 	if err != nil || cameraIndex < 0 || cameraIndex >= len(cameras) {
-		return nil, nil, fmt.Errorf("Invalid camera selection")
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{}, fmt.Errorf("Invalid camera selection")
 	}
-	camera := &cameras[cameraIndex]
+	camera = cameras[cameraIndex]
 
 	// List available microphones
 	fmt.Println("Available microphones:")
@@ -178,14 +190,11 @@ func (app *Application) selectDevices() ([]string, []int, error) {
 	var micIndex int
 	_, err = fmt.Scan(&micIndex)
 	if err != nil || micIndex < 0 || micIndex >= len(microphones) {
-		return nil, nil, fmt.Errorf("Invalid microphone selection")
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{}, fmt.Errorf("Invalid microphone selection")
 	}
-	microphone := &microphones[micIndex]
+	microphone = microphones[micIndex]
 
-	ids := []string{camera.DeviceID, microphone.DeviceID}
-	indices := []int{cameraIndex, micIndex}
-
-	return ids, indices, nil
+	return camera, microphone, err
 }
 
 func (app *Application) startProcessing() error {
@@ -195,9 +204,6 @@ func (app *Application) startProcessing() error {
 
 	// Start WebSocket message reader
 	go app.readMessages(done)
-
-	// Start video capture
-	go app.videoRecorder.CaptureVideo(frameChan)
 
 	// Start motion detection
 	go app.motionDetector.Detect(frameChan, motionChan)

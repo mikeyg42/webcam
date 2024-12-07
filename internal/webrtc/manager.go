@@ -10,12 +10,14 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pion/mediadevices"
 	"github.com/pion/mediadevices/pkg/codec/vpx"
+
 	"github.com/pion/mediadevices/pkg/frame"
 	"github.com/pion/mediadevices/pkg/prop"
 	"github.com/pion/webrtc/v3"
 	"github.com/sourcegraph/jsonrpc2"
 
-	"github.com/mikey42/webcam/internal/config"
+	"github.com/mikeyg42/webcam/internal/config"
+	"github.com/mikeyg42/webcam/internal/video"
 )
 
 // WebRTC related structs
@@ -57,10 +59,13 @@ type Manager struct {
 	peerConnection *webrtc.PeerConnection
 	connectionID   uint64
 	wsConnection   *websocket.Conn
-	mediaStream    *mediadevices.MediaStream
+	mediaStream    mediadevices.MediaStream
+	camera         mediadevices.MediaDeviceInfo
+	microphone     mediadevices.MediaDeviceInfo
+	recorder       *video.Recorder
 }
 
-func NewManager(config *config.Config, wsConn *websocket.Conn) (*Manager, error) {
+func NewManager(config *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
@@ -71,15 +76,14 @@ func NewManager(config *config.Config, wsConn *websocket.Conn) (*Manager, error)
 	return &Manager{
 		config:       config,
 		wsConnection: wsConn,
+		camera:       mediadevices.MediaDeviceInfo{},
+		microphone:   mediadevices.MediaDeviceInfo{},
+		recorder:     recorder,
 	}, nil
 }
 
 // Close handles cleanup of WebRTC resources
 func (m *Manager) Close() error {
-	if m.mediaStream != nil {
-		m.mediaStream.Close()
-	}
-
 	if m.peerConnection != nil {
 		if err := m.peerConnection.Close(); err != nil {
 			return fmt.Errorf("failed to close peer connection: %v", err)
@@ -88,34 +92,34 @@ func (m *Manager) Close() error {
 	return nil
 }
 
-// [Previous Initialize() method remains the same]
+func (m *Manager) SetupMediaTracks(camera, microphone mediadevices.MediaDeviceInfo) error {
+	m.camera = camera
+	m.microphone = microphone
 
-func (m *Manager) SetupMediaTracks(deviceIDs []string) error {
-	if len(deviceIDs) < 2 {
-		return fmt.Errorf("not enough device IDs provided, need both video and audio")
-	}
+	vpxParams := &vpx.VP8Params{}
+
+	vpxParams.BitRate = m.config.VideoConfig.BitRate
 
 	s, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
 		Video: func(c *mediadevices.MediaTrackConstraints) {
-			c.DeviceID = prop.String(deviceIDs[0])
+			c.DeviceID = prop.String(camera.DeviceID)
 			c.FrameFormat = prop.FrameFormat(frame.FormatYUY2)
 			c.Width = prop.Int(m.config.VideoConfig.Width)
 			c.Height = prop.Int(m.config.VideoConfig.Height)
 		},
 		Audio: func(a *mediadevices.MediaTrackConstraints) {
-			a.DeviceID = prop.String(deviceIDs[1])
+			a.DeviceID = prop.String(microphone.DeviceID)
 		},
 		Codec: mediadevices.NewCodecSelector(
-			mediadevices.WithVideoEncoders(&vpx.VP8Params{
-				BitRate: m.config.VideoConfig.BitRate,
-			}),
+			mediadevices.WithVideoEncoders(vpxParams),
 		),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to get user media: %v", err)
 	}
 
-	m.mediaStream = s // Save reference for cleanup
+	// Store the MediaStream interface
+	m.mediaStream = s
 
 	for _, track := range s.GetTracks() {
 		track.OnEnded(func(err error) {
@@ -132,8 +136,6 @@ func (m *Manager) SetupMediaTracks(deviceIDs []string) error {
 	}
 	return nil
 }
-
-// [Previous SetupSignaling() method remains the same]
 
 func (m *Manager) handleICECandidate(candidate *webrtc.ICECandidate) {
 	if candidate == nil {
@@ -167,10 +169,13 @@ func (m *Manager) sendMessage(message interface{}) error {
 		return fmt.Errorf("failed to encode message: %v", err)
 	}
 
-	return m.wsConnection.WriteMessage(
+	if err := m.wsConnection.WriteMessage(
 		websocket.TextMessage,
 		reqBodyBytes.Bytes(),
-	)
+	); err != nil {
+		return fmt.Errorf("failed to write websocket message: %v", err)
+	}
+	return nil
 }
 
 func (m *Manager) sendOffer() error {
@@ -298,18 +303,82 @@ func (m *Manager) handleTrickle(message []byte) error {
 	return nil
 }
 
-// Helper method to send websocket messages
-func (m *Manager) sendMessage(message interface{}) error {
-	reqBodyBytes := new(bytes.Buffer)
-	if err := json.NewEncoder(reqBodyBytes).Encode(message); err != nil {
-		return fmt.Errorf("failed to encode message: %v", err)
+func (m *Manager) SetupSignaling() error {
+	// Create and set local description
+	offer, err := m.peerConnection.CreateOffer(nil)
+	if err != nil {
+		return fmt.Errorf("failed to create offer: %v", err)
 	}
 
-	if err := m.wsConnection.WriteMessage(
-		websocket.TextMessage,
-		reqBodyBytes.Bytes(),
-	); err != nil {
-		return fmt.Errorf("failed to write websocket message: %v", err)
+	err = m.peerConnection.SetLocalDescription(offer)
+	if err != nil {
+		return fmt.Errorf("failed to set local description: %v", err)
 	}
+
+	// Setup ICE candidate handling exactly as in ION-SFU
+	m.peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate != nil {
+			m.handleICECandidate(candidate)
+		}
+	})
+
+	// Setup connection state change handler
+	m.peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+		log.Printf("Connection State has changed to %s\n", connectionState.String())
+	})
+
+	// Send the offer to ION-SFU
+	return m.sendOffer()
+}
+func (m *Manager) Initialize() error {
+	// Create WebRTC configuration exactly as in the ION-SFU example
+	config := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+		},
+		SDPSemantics: webrtc.SDPSemanticsUnifiedPlanWithFallback,
+	}
+
+	// Create MediaEngine and codec selector as per ION-SFU implementation
+	mediaEngine := webrtc.MediaEngine{}
+	vpxParams, err := vpx.NewVP8Params()
+	if err != nil {
+		return fmt.Errorf("failed to create VP8 params: %v", err)
+	}
+	vpxParams.BitRate = m.config.VideoConfig.BitRate
+
+	codecSelector := mediadevices.NewCodecSelector(
+		mediadevices.WithVideoEncoders(&vpxParams),
+	)
+
+	// Populate the MediaEngine with supported codecs
+	codecSelector.Populate(&mediaEngine)
+
+	// Create a new API instance with the configured MediaEngine
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(&mediaEngine))
+
+	// create peer connection
+	peerConnection, err := api.NewPeerConnection(config)
+	if err != nil {
+		return fmt.Errorf("failed to create peer connection: %v", err)
+	}
+
+	m.peerConnection = peerConnection
+	m.peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		if err := m.recorder.HandleTrack(track); err != nil {
+			log.Printf("Error handling track: %v", err)
+		}
+	})
+
 	return nil
+}
+
+func (m *Manager) GetCamera() mediadevices.MediaDeviceInfo {
+	return m.camera
+}
+
+func (m *Manager) GetMicrophone() mediadevices.MediaDeviceInfo {
+	return m.microphone
 }

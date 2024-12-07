@@ -1,12 +1,13 @@
 package config
 
+import "time"
+
 // Config holds all application configuration
 type Config struct {
 	WebSocketAddr   string
-	MinimumArea     int
-	FrameSkip       int
 	MailSlurpConfig MailSlurpConfig
 	VideoConfig     VideoConfig
+	MotionConfig    MotionConfig
 }
 
 type MailSlurpConfig struct {
@@ -25,18 +26,25 @@ type VideoConfig struct {
 	OutputPath string
 }
 
+type MotionConfig struct {
+	MinimumArea    int           // Minimum area size for motion detection
+	FrameSkip      int           // Process every nth frame
+	Threshold      float32       // Threshold for motion detection
+	DilationSize   int           // Size of dilation kernel
+	CooldownPeriod time.Duration // Minimum time between notifications
+	NoMotionDelay  time.Duration // Duration to wait before declaring no motion
+}
+
 // NewDefaultConfig returns a Config with default values
 func NewDefaultConfig() *Config {
 	return &Config{
 		WebSocketAddr: "localhost:7000",
-		MinimumArea:   3000,
-		FrameSkip:     5,
 		MailSlurpConfig: MailSlurpConfig{
 			SMTPHost: "mx.mailslurp.com",
 			SMTPPort: 2525,
-			APIKey:   "your-mailslurp-api-key", // Replace with your actual API key
-			InboxID:  "your-inbox-id",          // Replace with your actual inbox ID
-			ToEmail:  "your-email@example.com", // Replace with your actual email
+			APIKey:   "your-mailslurp-api-key",
+			InboxID:  "your-inbox-id",
+			ToEmail:  "your-email@example.com",
 		},
 		VideoConfig: VideoConfig{
 			Width:      640,
@@ -44,6 +52,14 @@ func NewDefaultConfig() *Config {
 			Framerate:  25,
 			BitRate:    500_000,
 			OutputPath: "recordings/",
+		},
+		MotionConfig: MotionConfig{
+			MinimumArea:    3000,
+			FrameSkip:      5,
+			Threshold:      25.0,
+			DilationSize:   3,
+			CooldownPeriod: 30 * time.Second,
+			NoMotionDelay:  10 * time.Second,
 		},
 	}
 }
