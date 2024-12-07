@@ -42,9 +42,9 @@ func NewDefaultConfig() *Config {
 		MailSlurpConfig: MailSlurpConfig{
 			SMTPHost: "mx.mailslurp.com",
 			SMTPPort: 2525,
-			APIKey:   "your-mailslurp-api-key",
-			InboxID:  "your-inbox-id",
-			ToEmail:  "your-email@example.com",
+			APIKey:   "4f6d68998fd08a2d051c71dbaeadca66558e5a69edbc102134af9c3e0ac867bc",
+			InboxID:  "f7c87f5b-54a1-43c5-91e6-6a3009d4e9a9",
+			ToEmail:  "user-f7c87f5b-54a1-43c5-91e6-6a3009d4e9a9@mailslurp.biz",
 		},
 		VideoConfig: VideoConfig{
 			Width:      640,
