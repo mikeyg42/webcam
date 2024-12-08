@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/pion/mediadevices"
+	"github.com/pion/mediadevices/pkg/codec/opus"
 	"github.com/pion/mediadevices/pkg/codec/vpx"
+	"github.com/pion/rtcp"
 
 	"github.com/pion/mediadevices/pkg/frame"
 	"github.com/pion/mediadevices/pkg/prop"
@@ -55,84 +58,219 @@ type Response struct {
 
 // Manager handles WebRTC connection and signaling
 type Manager struct {
-	config         *config.Config
-	peerConnection *webrtc.PeerConnection
-	connectionID   uint64
-	wsConnection   *websocket.Conn
-	mediaStream    mediadevices.MediaStream
-	camera         mediadevices.MediaDeviceInfo
-	microphone     mediadevices.MediaDeviceInfo
-	recorder       *video.Recorder
+	config          *config.Config
+	peerConnection  *webrtc.PeerConnection
+	connectionID    uint64
+	wsConnection    *websocket.Conn
+	mediaStream     mediadevices.MediaStream
+	camera          mediadevices.MediaDeviceInfo
+	microphone      mediadevices.MediaDeviceInfo
+	recorder        *video.Recorder
+	pcConfiguration webrtc.Configuration
 }
 
-func NewManager(config *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
-	if config == nil {
+func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
+	if myconfig == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
 	if wsConn == nil {
 		return nil, fmt.Errorf("websocket connection cannot be nil")
 	}
+	pcConfig := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+		},
+		SDPSemantics: webrtc.SDPSemanticsUnifiedPlanWithFallback,
+	}
 
 	return &Manager{
-		config:       config,
-		wsConnection: wsConn,
-		camera:       mediadevices.MediaDeviceInfo{},
-		microphone:   mediadevices.MediaDeviceInfo{},
-		recorder:     recorder,
+		config:          myconfig,
+		wsConnection:    wsConn,
+		camera:          mediadevices.MediaDeviceInfo{},
+		microphone:      mediadevices.MediaDeviceInfo{},
+		recorder:        recorder,
+		pcConfiguration: pcConfig,
 	}, nil
 }
 
-// Close handles cleanup of WebRTC resources
-func (m *Manager) Close() error {
-	if m.peerConnection != nil {
-		if err := m.peerConnection.Close(); err != nil {
-			return fmt.Errorf("failed to close peer connection: %v", err)
-		}
+func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
+
+	// Create MediaEngine
+	mediaEngine := webrtc.MediaEngine{}
+	// Register default codecs first
+	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
+		return nil, fmt.Errorf("failed to register default codecs: %v", err)
 	}
-	return nil
+
+	// Create VP8 parameters
+	vpxParams, err := vpx.NewVP8Params()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VP8 params: %v", err)
+	}
+	vpxParams.BitRate = 1_000_000
+	vpxParams.KeyFrameInterval = 30
+
+	// Create Opus parameters
+	opusParams, err := opus.NewParams()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Opus params: %v", err)
+	}
+	opusParams.BitRate = 96_000
+
+	// Create and store codec selector
+	codecSelector := mediadevices.NewCodecSelector(
+		mediadevices.WithVideoEncoders(&vpxParams),
+		mediadevices.WithAudioEncoders(&opusParams),
+	)
+
+	// Register codecs with the MediaEngine
+	codecSelector.Populate(&mediaEngine)
+
+	// Create API with MediaEngine
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(&mediaEngine))
+
+	// Create peer connection
+	peerConnection, err := api.NewPeerConnection(m.pcConfiguration)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create peer connection: %v", err)
+	}
+
+	m.peerConnection = peerConnection
+
+	// Set up handlers
+	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+		log.Printf("Connection State has changed to %s\n", connectionState.String())
+	})
+
+	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		log.Printf("Got track: %s (%s)", track.ID(), track.Kind())
+		if m.recorder != nil {
+			if err := m.recorder.HandleTrack(track); err != nil {
+				log.Printf("Error handling track: %v", err)
+			}
+		}
+	})
+
+	return codecSelector, nil
 }
 
-func (m *Manager) SetupMediaTracks(camera, microphone mediadevices.MediaDeviceInfo) error {
-	m.camera = camera
-	m.microphone = microphone
+func (m *Manager) SetupSignaling() error {
+	// Create and set local description
+	offer, err := m.peerConnection.CreateOffer(nil)
+	if err != nil {
+		return fmt.Errorf("failed to create offer: %v", err)
+	}
 
-	vpxParams := &vpx.VP8Params{}
+	// Create channel that is blocked until ICE Gathering is complete
+	gatherComplete := webrtc.GatheringCompletePromise(m.peerConnection)
 
-	vpxParams.BitRate = m.config.VideoConfig.BitRate
+	// Sets the LocalDescription, and starts our UDP listeners
+	err = m.peerConnection.SetLocalDescription(offer)
+	if err != nil {
+		return fmt.Errorf("failed to set local description: %v", err)
+	}
 
-	s, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
+	// Setup ICE candidate handling
+	m.peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate != nil {
+			m.handleICECandidate(candidate)
+		}
+	})
+
+	log.Println("Waiting for ICE gathering to complete...")
+	<-gatherComplete
+	log.Println("ICE gathering completed")
+
+	// Send the offer to ION-SFU
+	return m.sendOffer()
+}
+
+func (m *Manager) SetupMediaTracks(camera, microphone mediadevices.MediaDeviceInfo, codecSelector *mediadevices.CodecSelector) error {
+
+	// Set up the media stream with the same codec selector
+	stream, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
 		Video: func(c *mediadevices.MediaTrackConstraints) {
 			c.DeviceID = prop.String(camera.DeviceID)
-			c.FrameFormat = prop.FrameFormat(frame.FormatYUY2)
-			c.Width = prop.Int(m.config.VideoConfig.Width)
-			c.Height = prop.Int(m.config.VideoConfig.Height)
+			c.FrameFormat = prop.FrameFormat(frame.FormatI420)
+			c.Width = prop.Int(640)
+			c.Height = prop.Int(480)
+			c.FrameRate = prop.Float(30)
 		},
-		Audio: func(a *mediadevices.MediaTrackConstraints) {
-			a.DeviceID = prop.String(microphone.DeviceID)
+		Audio: func(c *mediadevices.MediaTrackConstraints) {
+			c.DeviceID = prop.String(microphone.DeviceID)
+			c.SampleRate = prop.Int(48000)
+			c.ChannelCount = prop.Int(2)
+			c.Latency = prop.Duration(20 * time.Millisecond)
 		},
-		Codec: mediadevices.NewCodecSelector(
-			mediadevices.WithVideoEncoders(vpxParams),
-		),
+		Codec: codecSelector,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to get user media: %v", err)
 	}
 
-	// Store the MediaStream interface
-	m.mediaStream = s
+	m.camera = camera
+	m.microphone = microphone
+	m.mediaStream = stream
 
-	for _, track := range s.GetTracks() {
+	// Add tracks to peer connection
+	for _, track := range stream.GetTracks() {
+		log.Printf("Adding track: %s", track.ID())
 		track.OnEnded(func(err error) {
 			log.Printf("Track (ID: %s) ended with error: %v\n", track.ID(), err)
 		})
-		_, err = m.peerConnection.AddTransceiverFromTrack(track,
+
+		transceiver, err := m.peerConnection.AddTransceiverFromTrack(track,
 			webrtc.RTPTransceiverInit{
 				Direction: webrtc.RTPTransceiverDirectionSendonly,
 			},
 		)
 		if err != nil {
-			return fmt.Errorf("failed to add track: %v", err)
+			return fmt.Errorf("failed to add track %s: %v", track.ID(), err)
 		}
+		log.Printf("Successfully added track %s with transceiver %s\n", track.ID(), transceiver.Mid())
+
+		// Add PLI handler for video tracks
+		if track.Kind() == webrtc.RTPCodecTypeVideo {
+			sender := transceiver.Sender()
+			if sender == nil {
+				continue
+			}
+
+			parameters := sender.GetParameters()
+			if len(parameters.Encodings) == 0 {
+				continue
+			}
+
+			ssrc := parameters.Encodings[0].SSRC
+			go func(ssrc webrtc.SSRC) {
+				ticker := time.NewTicker(3 * time.Second)
+				for range ticker.C {
+					if err := m.peerConnection.WriteRTCP([]rtcp.Packet{
+						&rtcp.PictureLossIndication{
+							MediaSSRC: uint32(ssrc),
+						},
+					}); err != nil {
+						log.Printf("Failed to send PLI: %v", err)
+					}
+				}
+			}(ssrc)
+		}
+	}
+	return nil
+}
+
+// Make sure Initialize is called before SetupMediaTracks
+func (m *Manager) Close() error {
+	if m.mediaStream != nil {
+		for _, track := range m.mediaStream.GetTracks() {
+			track.Close()
+		}
+	}
+
+	if m.peerConnection != nil {
+		return m.peerConnection.Close()
 	}
 	return nil
 }
@@ -300,78 +438,6 @@ func (m *Manager) handleTrickle(message []byte) error {
 	if err := m.peerConnection.AddICECandidate(*trickleResponse.Params.Candidate); err != nil {
 		return fmt.Errorf("failed to add ICE candidate: %v", err)
 	}
-	return nil
-}
-
-func (m *Manager) SetupSignaling() error {
-	// Create and set local description
-	offer, err := m.peerConnection.CreateOffer(nil)
-	if err != nil {
-		return fmt.Errorf("failed to create offer: %v", err)
-	}
-
-	err = m.peerConnection.SetLocalDescription(offer)
-	if err != nil {
-		return fmt.Errorf("failed to set local description: %v", err)
-	}
-
-	// Setup ICE candidate handling exactly as in ION-SFU
-	m.peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate != nil {
-			m.handleICECandidate(candidate)
-		}
-	})
-
-	// Setup connection state change handler
-	m.peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-		log.Printf("Connection State has changed to %s\n", connectionState.String())
-	})
-
-	// Send the offer to ION-SFU
-	return m.sendOffer()
-}
-func (m *Manager) Initialize() error {
-	// Create WebRTC configuration exactly as in the ION-SFU example
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
-			},
-		},
-		SDPSemantics: webrtc.SDPSemanticsUnifiedPlanWithFallback,
-	}
-
-	// Create MediaEngine and codec selector as per ION-SFU implementation
-	mediaEngine := webrtc.MediaEngine{}
-	vpxParams, err := vpx.NewVP8Params()
-	if err != nil {
-		return fmt.Errorf("failed to create VP8 params: %v", err)
-	}
-	vpxParams.BitRate = m.config.VideoConfig.BitRate
-
-	codecSelector := mediadevices.NewCodecSelector(
-		mediadevices.WithVideoEncoders(&vpxParams),
-	)
-
-	// Populate the MediaEngine with supported codecs
-	codecSelector.Populate(&mediaEngine)
-
-	// Create a new API instance with the configured MediaEngine
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(&mediaEngine))
-
-	// create peer connection
-	peerConnection, err := api.NewPeerConnection(config)
-	if err != nil {
-		return fmt.Errorf("failed to create peer connection: %v", err)
-	}
-
-	m.peerConnection = peerConnection
-	m.peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		if err := m.recorder.HandleTrack(track); err != nil {
-			log.Printf("Error handling track: %v", err)
-		}
-	})
-
 	return nil
 }
 

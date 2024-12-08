@@ -2,32 +2,49 @@
 <html lang="en">
 <head>
     <meta charset="utf-8"/>
-    <meta
-            name="viewport"
-            content="width=device-width, initial-scale=1, shrink-to-fit=no"
-    />
-
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no"/>
     <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        #remotes {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            min-height: 240px;
+        }
         #remotes video {
             width: 320px;
         }
+        #status {
+            padding: 10px;
+            margin-bottom: 10px;
+            background-color: #f0f0f0;
+        }
+        #debug {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f8f8f8;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
     </style>
-
-    <title>WebRTC test frontend</title>
+    <title>Security Camera Viewer</title>
 </head>
 <body>
-<div>
-    <div id="remotes">
-          <span
-                  style="position: absolute; margin-left: 5px; margin-top: 5px"
-                  class="badge badge-primary"
-          >Remotes</span
-          >
+    <div id="status">Connection Status: Initializing...</div>
+    <div>
+        <div id="remotes">
+            <span style="position: absolute; margin-left: 5px; margin-top: 5px">
+                Waiting for video stream...
+            </span>
+        </div>
     </div>
-</div>
+    <div id="debug">Debug Messages:</div>
 
-<script src="https://unpkg.com/ion-sdk-js@1.5.5/dist/ion-sdk.min.js"></script>
-<script src="https://unpkg.com/ion-sdk-js@1.5.5/dist/json-rpc.min.js"></script>
-<script src="index.js"></script>
+    <script src="https://unpkg.com/ion-sdk-js@1.5.5/dist/ion-sdk.min.js"></script>
+    <script src="https://unpkg.com/ion-sdk-js@1.5.5/dist/json-rpc.min.js"></script>
+    <script src="index.js"></script>
 </body>
 </html>

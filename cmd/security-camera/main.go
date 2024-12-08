@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/url"
-	"sync"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/mediadevices"
@@ -16,6 +15,10 @@ import (
 	"github.com/mikeyg42/webcam/internal/notification"
 	"github.com/mikeyg42/webcam/internal/video"
 	"github.com/mikeyg42/webcam/internal/webrtc"
+	_ "github.com/pion/mediadevices/pkg/driver/camera"     // This is required to register camera adapter
+	_ "github.com/pion/mediadevices/pkg/driver/microphone" // This is required to register microphone adapter
+	_ "github.com/pion/mediadevices/pkg/driver/screen"
+	"github.com/pion/mediadevices/pkg/prop"
 )
 
 // Application struct that holds all components
@@ -26,7 +29,11 @@ type Application struct {
 	videoRecorder  *video.Recorder
 	wsConnection   *websocket.Conn
 	notifier       *notification.Notifier
-	wg             sync.WaitGroup
+}
+type DeviceInfo struct {
+	Device     mediadevices.MediaDeviceInfo
+	IsWorking  bool
+	DeviceName string
 }
 
 func main() {
@@ -111,13 +118,20 @@ func (app *Application) Initialize() error {
 	}
 	app.webrtcManager = webrtcManager
 
+	var codecSelector *mediadevices.CodecSelector
+
+	// Initialize WebRTC first, generating the codec selector
+	if codecSelector, err = app.webrtcManager.Initialize(); err != nil {
+		return fmt.Errorf("failed to initialize WebRTC: %v", err)
+	}
+
 	// Select devices
 	camera, microphone, err := app.selectDevices()
 	if err != nil {
 		return fmt.Errorf("failed to select devices: %v", err)
 	}
 
-	if err := app.webrtcManager.SetupMediaTracks(camera, microphone); err != nil {
+	if err := app.webrtcManager.SetupMediaTracks(camera, microphone, codecSelector); err != nil {
 		return fmt.Errorf("failed to setup media tracks: %v", err)
 	}
 
@@ -139,62 +153,146 @@ func (app *Application) connectWebSocket() error {
 	app.wsConnection = conn
 	return nil
 }
+func (app *Application) testDevice(device mediadevices.MediaDeviceInfo, index int) (*DeviceInfo, error) {
+	info := &DeviceInfo{
+		Device: device,
+	}
 
-// evaluates what devices are available and allows the user to select a camera and microphone
+	switch device.Kind {
+	case mediadevices.VideoInput:
+		// For cameras, try using the index instead of DeviceID
+		if device.DeviceType == "camera" { // Only test actual cameras, not screen captures
+			webcam, err := gocv.OpenVideoCapture(index)
+			if err != nil {
+				return info, fmt.Errorf("failed to open camera: %v", err)
+			}
+			defer webcam.Close()
+
+			// Try to read a frame
+			img := gocv.NewMat()
+			defer img.Close()
+
+			if ok := webcam.Read(&img); !ok {
+				return info, fmt.Errorf("failed to read frame from camera")
+			}
+			if img.Empty() {
+				return info, fmt.Errorf("received empty frame from camera")
+			}
+
+			info.IsWorking = true
+			info.DeviceName = fmt.Sprintf("%s (Working Camera)", device.Label)
+		}
+
+	case mediadevices.AudioInput:
+		// Test audio devices using mediadevices
+		s, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
+			Audio: func(c *mediadevices.MediaTrackConstraints) {
+				c.DeviceID = prop.String(device.DeviceID)
+			},
+		})
+		if err != nil {
+			return info, fmt.Errorf("failed to test microphone: %v", err)
+		}
+		defer func() {
+			for _, track := range s.GetTracks() {
+				track.Close()
+			}
+		}()
+
+		tracks := s.GetTracks()
+		if len(tracks) > 0 {
+			info.IsWorking = true
+			info.DeviceName = fmt.Sprintf("%s (Working Microphone)", device.Label)
+		}
+	}
+
+	return info, nil
+}
+
 func (app *Application) selectDevices() (camera, microphone mediadevices.MediaDeviceInfo, err error) {
 	// Enumerate available devices
 	devices := mediadevices.EnumerateDevices()
 
-	var cameras []mediadevices.MediaDeviceInfo
-	var microphones []mediadevices.MediaDeviceInfo
+	var workingCameras []*DeviceInfo
+	var workingMicrophones []*DeviceInfo
 
-	for _, device := range devices {
-		switch device.Kind {
-		case mediadevices.VideoInput:
-			cameras = append(cameras, device)
-		case mediadevices.AudioInput:
-			microphones = append(microphones, device)
+	// Keep track of camera indices
+	cameraIndex := 0
+
+	// Test each device
+	for i, device := range devices {
+		// Skip screen capture devices
+		if device.DeviceType == "screen" {
+			continue
+		}
+
+		var info *DeviceInfo
+		var err error
+
+		if device.Kind == mediadevices.VideoInput {
+			info, err = app.testDevice(device, cameraIndex)
+			cameraIndex++
+		} else {
+			info, err = app.testDevice(device, i)
+		}
+
+		if err != nil {
+			log.Printf("Device %s failed testing: %v", device.Label, err)
+			continue
+		}
+
+		if info.IsWorking {
+			switch device.Kind {
+			case mediadevices.VideoInput:
+				workingCameras = append(workingCameras, info)
+			case mediadevices.AudioInput:
+				workingMicrophones = append(workingMicrophones, info)
+			}
 		}
 	}
 
-	if len(cameras) == 0 {
-		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{}, fmt.Errorf("No camera devices found")
+	if len(workingCameras) == 0 {
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
+			fmt.Errorf("no working cameras found")
 	}
-	if len(microphones) == 0 {
-		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{}, fmt.Errorf("No microphone devices found")
+	if len(workingMicrophones) == 0 {
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
+			fmt.Errorf("no working microphones found")
 	}
 
-	// List available cameras
-	fmt.Println("Available cameras:")
-	for i, device := range cameras {
-		fmt.Printf("%d: %s\n", i, device.Label)
+	// List available working cameras
+	fmt.Println("\nAvailable working cameras:")
+	for i, info := range workingCameras {
+		fmt.Printf("%d: %s\n", i, info.DeviceName)
 	}
 
 	// Select a camera
 	fmt.Print("Select a camera (0 for the first camera): ")
-	var cameraIndex int
-	_, err = fmt.Scan(&cameraIndex)
-	if err != nil || cameraIndex < 0 || cameraIndex >= len(cameras) {
-		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{}, fmt.Errorf("Invalid camera selection")
-	}
-	camera = cameras[cameraIndex]
 
-	// List available microphones
-	fmt.Println("Available microphones:")
-	for i, device := range microphones {
-		fmt.Printf("%d: %s\n", i, device.Label)
+	_, err = fmt.Scan(&cameraIndex)
+	if err != nil || cameraIndex < 0 || cameraIndex >= len(workingCameras) {
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
+			fmt.Errorf("invalid camera selection")
+	}
+	camera = workingCameras[cameraIndex].Device
+
+	// List available working microphones
+	fmt.Println("\nAvailable working microphones:")
+	for i, info := range workingMicrophones {
+		fmt.Printf("%d: %s\n", i, info.DeviceName)
 	}
 
 	// Select a microphone
 	fmt.Print("Select a microphone (0 for the first microphone): ")
 	var micIndex int
 	_, err = fmt.Scan(&micIndex)
-	if err != nil || micIndex < 0 || micIndex >= len(microphones) {
-		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{}, fmt.Errorf("Invalid microphone selection")
+	if err != nil || micIndex < 0 || micIndex >= len(workingMicrophones) {
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
+			fmt.Errorf("invalid microphone selection")
 	}
-	microphone = microphones[micIndex]
+	microphone = workingMicrophones[micIndex].Device
 
-	return camera, microphone, err
+	return camera, microphone, nil
 }
 
 func (app *Application) startProcessing() error {
