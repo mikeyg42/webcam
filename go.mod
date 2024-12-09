@@ -9,7 +9,6 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/mailslurp/mailslurp-client-go v0.0.0-20240603060551-5bc09baec5c5
 	github.com/pion/mediadevices v0.6.4
-	github.com/pion/rtcp v1.2.14
 	github.com/pion/webrtc/v3 v3.3.4
 	github.com/sourcegraph/jsonrpc2 v0.2.0
 	gocv.io/x/gocv v0.39.0
@@ -31,6 +30,7 @@ require (
 	github.com/pion/logging v0.2.2 // indirect
 	github.com/pion/mdns v0.0.12 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
+	github.com/pion/rtcp v1.2.14 // indirect
 	github.com/pion/rtp v1.8.7 // indirect
 	github.com/pion/sctp v1.8.19 // indirect
 	github.com/pion/sdp/v3 v3.0.9 // indirect

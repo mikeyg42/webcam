@@ -12,7 +12,6 @@ import (
 	"github.com/pion/mediadevices"
 	"github.com/pion/mediadevices/pkg/codec/opus"
 	"github.com/pion/mediadevices/pkg/codec/vpx"
-	"github.com/pion/rtcp"
 
 	"github.com/pion/mediadevices/pkg/frame"
 	"github.com/pion/mediadevices/pkg/prop"
@@ -186,20 +185,21 @@ func (m *Manager) SetupSignaling() error {
 	// Send the offer to ION-SFU
 	return m.sendOffer()
 }
+func (m *Manager) GenerateStream(codecSelector *mediadevices.CodecSelector) error {
+	if codecSelector == nil {
+		return fmt.Errorf("codec selector cannot be nil")
+	}
 
-func (m *Manager) SetupMediaTracks(camera, microphone mediadevices.MediaDeviceInfo, codecSelector *mediadevices.CodecSelector) error {
-
-	// Set up the media stream with the same codec selector
 	stream, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
 		Video: func(c *mediadevices.MediaTrackConstraints) {
-			c.DeviceID = prop.String(camera.DeviceID)
+			c.DeviceID = prop.String(m.camera.DeviceID)
 			c.FrameFormat = prop.FrameFormat(frame.FormatI420)
 			c.Width = prop.Int(640)
 			c.Height = prop.Int(480)
 			c.FrameRate = prop.Float(30)
 		},
 		Audio: func(c *mediadevices.MediaTrackConstraints) {
-			c.DeviceID = prop.String(microphone.DeviceID)
+			c.DeviceID = prop.String(m.microphone.DeviceID)
 			c.SampleRate = prop.Int(48000)
 			c.ChannelCount = prop.Int(2)
 			c.Latency = prop.Duration(20 * time.Millisecond)
@@ -210,54 +210,147 @@ func (m *Manager) SetupMediaTracks(camera, microphone mediadevices.MediaDeviceIn
 		return fmt.Errorf("failed to get user media: %v", err)
 	}
 
-	m.camera = camera
-	m.microphone = microphone
 	m.mediaStream = stream
+	return nil
+}
 
-	// Add tracks to peer connection
-	for _, track := range stream.GetTracks() {
-		log.Printf("Adding track: %s", track.ID())
-		track.OnEnded(func(err error) {
-			log.Printf("Track (ID: %s) ended with error: %v\n", track.ID(), err)
-		})
+func (m *Manager) setupVideoTrack() (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSender, error) {
+	videoCodec := webrtc.RTPCodecCapability{
+		MimeType:    webrtc.MimeTypeVP8,
+		ClockRate:   90000,
+		Channels:    0,
+		SDPFmtpLine: "",
+	}
 
-		transceiver, err := m.peerConnection.AddTransceiverFromTrack(track,
-			webrtc.RTPTransceiverInit{
-				Direction: webrtc.RTPTransceiverDirectionSendonly,
-			},
-		)
+	videoTrack, err := webrtc.NewTrackLocalStaticRTP(videoCodec, "video", "webcam-video")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create video track: %v", err)
+	}
+
+	videoRtpSender, err := m.peerConnection.AddTrack(videoTrack)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to add video track: %v", err)
+	}
+
+	return videoTrack, videoRtpSender, nil
+}
+
+func (m *Manager) setupAudioTrack() (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSender, error) {
+	audioCodec := webrtc.RTPCodecCapability{
+		MimeType:    webrtc.MimeTypeOpus,
+		ClockRate:   48000,
+		Channels:    1,
+		SDPFmtpLine: "minptime=10;useinbandfec=1",
+	}
+
+	audioTrack, err := webrtc.NewTrackLocalStaticRTP(audioCodec, "audio", "webcam-audio")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create audio track: %v", err)
+	}
+
+	audioRtpSender, err := m.peerConnection.AddTrack(audioTrack)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to add audio track: %v", err)
+	}
+
+	return audioTrack, audioRtpSender, nil
+}
+
+func (m *Manager) handleMediaPackets(track mediadevices.Track, localTrack *webrtc.TrackLocalStaticRTP, ssrc uint32, mtu int, isVideo bool) {
+	mediaType := "audio"
+	if isVideo {
+		mediaType = "video"
+	}
+
+	rtpReader, err := track.NewRTPReader(localTrack.Codec().MimeType, ssrc, mtu)
+	if err != nil {
+		log.Printf("Failed to create %s RTP reader: %v", mediaType, err)
+		return
+	}
+	defer rtpReader.Close()
+
+	for {
+		packets, _, err := rtpReader.Read()
 		if err != nil {
-			return fmt.Errorf("failed to add track %s: %v", track.ID(), err)
+			log.Printf("Error reading %s RTP packet: %v", mediaType, err)
+			return
 		}
-		log.Printf("Successfully added track %s with transceiver %s\n", track.ID(), transceiver.Mid())
 
-		// Add PLI handler for video tracks
-		if track.Kind() == webrtc.RTPCodecTypeVideo {
-			sender := transceiver.Sender()
-			if sender == nil {
-				continue
+		for _, packet := range packets {
+			if err := localTrack.WriteRTP(packet); err != nil {
+				log.Printf("Error writing %s RTP packet: %v", mediaType, err)
+				return
 			}
-
-			parameters := sender.GetParameters()
-			if len(parameters.Encodings) == 0 {
-				continue
-			}
-
-			ssrc := parameters.Encodings[0].SSRC
-			go func(ssrc webrtc.SSRC) {
-				ticker := time.NewTicker(3 * time.Second)
-				for range ticker.C {
-					if err := m.peerConnection.WriteRTCP([]rtcp.Packet{
-						&rtcp.PictureLossIndication{
-							MediaSSRC: uint32(ssrc),
-						},
-					}); err != nil {
-						log.Printf("Failed to send PLI: %v", err)
-					}
-				}
-			}(ssrc)
 		}
 	}
+}
+
+func (m *Manager) SetupMediaTracks(camera, microphone mediadevices.MediaDeviceInfo, codecSelector *mediadevices.CodecSelector) error {
+	if m.peerConnection == nil {
+		return fmt.Errorf("peer connection not initialized")
+	}
+
+	m.camera = camera
+	m.microphone = microphone
+
+	if err := m.GenerateStream(codecSelector); err != nil {
+		return fmt.Errorf("failed to generate media stream: %v", err)
+	}
+
+	// Setup video track
+	videoTrack, videoRtpSender, err := m.setupVideoTrack()
+	if err != nil {
+		return err
+	}
+
+	// Setup audio track
+	audioTrack, audioRtpSender, err := m.setupAudioTrack()
+	if err != nil {
+		return err
+	}
+
+	const mtu = 1200
+
+	// Handle video packets
+	go func() {
+		videoTracks := m.mediaStream.GetVideoTracks()
+		if len(videoTracks) == 0 {
+			log.Println("No video tracks available")
+			return
+		}
+
+		params := videoRtpSender.GetParameters()
+		if len(params.Encodings) == 0 || params.Encodings[0].SSRC == 0 {
+			log.Println("No valid SSRC found for video")
+			return
+		}
+
+		ssrc := uint32(params.Encodings[0].SSRC)
+		for _, track := range videoTracks {
+			go m.handleMediaPackets(track, videoTrack, ssrc, mtu, true)
+		}
+	}()
+
+	// Handle audio packets
+	go func() {
+		audioTracks := m.mediaStream.GetAudioTracks()
+		if len(audioTracks) == 0 {
+			log.Println("No audio tracks available")
+			return
+		}
+
+		params := audioRtpSender.GetParameters()
+		if len(params.Encodings) == 0 || params.Encodings[0].SSRC == 0 {
+			log.Println("No valid SSRC found for audio")
+			return
+		}
+
+		ssrc := uint32(params.Encodings[0].SSRC)
+		for _, track := range audioTracks {
+			go m.handleMediaPackets(track, audioTrack, ssrc, mtu, false)
+		}
+	}()
+
 	return nil
 }
 
