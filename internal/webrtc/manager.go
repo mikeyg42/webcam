@@ -3,7 +3,9 @@ package webrtc
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -78,7 +80,8 @@ type Manager struct {
 	cancel          context.CancelFunc
 	done            chan struct{}
 	dtlsFingerprint string
-	certificates    []webrtc.Certificate
+	dtlsConfig      *DTLSConfig
+	dtlsStateChan   chan webrtc.DTLSTransportState
 }
 
 func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
@@ -88,6 +91,13 @@ func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video
 	if wsConn == nil {
 		return nil, fmt.Errorf("websocket connection cannot be nil")
 	}
+
+	// Generate a certificate and private key to secure the connection
+	certificate, privKey, err := dtls.GenerateSelfSigned()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate self-signed certificate: %v", err)
+	}
+
 	pcConfig := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
@@ -95,7 +105,7 @@ func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video
 			},
 		},
 		SDPSemantics: webrtc.SDPSemanticsUnifiedPlanWithFallback,
-		
+		Certificates: []webrtc.Certificate{webrtc.CertificateFromX509(privKey, certificate)},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -116,20 +126,6 @@ func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video
 
 func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 
-	// Generate certificates for DTLS
-	config := &dtls.Config{
-		Certificate:         certificate,
-		PrivateKey:		  	  privKey,
-		InsecureSkipVerify:   false,
-		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
-	}
-
-	// Update peer connection configuration with DTLS settings
-	m.pcConfiguration.Certificates = []webrtc.Certificate{*certificate}
-	m.pcConfiguration.DTLSTransport = webrtc.DTLSTransportParameters{
-		Role:         webrtc.DTLSRoleAuto,
-		Fingerprints: []string{"sha-256"},
-	}
 	// Create MediaEngine
 	mediaEngine := webrtc.MediaEngine{}
 	// Register default codecs first
@@ -168,8 +164,23 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	// Register codecs with the MediaEngine
 	codecSelector.Populate(&mediaEngine)
 
+	// Setup DTLS
+	dtlsConfig, err := newDTLSConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create DTLS config: %v", err)
+	}
+	m.dtlsConfig = dtlsConfig
+	m.dtlsStateChan = make(chan webrtc.DTLSTransportState, 1)
+
+	// Create SettingEngine for DTLS configuration
+	settingEngine := webrtc.SettingEngine{}
+	//settingEngine.SetDTLSInsecureSkipVerify(!m.dtlsConfig.verifyPeerCert)
+
 	// Create API with MediaEngine
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(&mediaEngine))
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(&mediaEngine),
+		webrtc.WithSettingEngine(settingEngine),
+	)
 
 	// Create peer connection
 	peerConnection, err := api.NewPeerConnection(m.pcConfiguration)
@@ -281,15 +292,23 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 		}
 	})
 
-	m.peerConnection.OnDTLSTransportSetup(func(dtlsTransport *webrtc.DTLSTransport) {
-		fingerprint, err := dtlsTransport.GetRemoteParameters()
-		if err != nil {
-			log.Printf("Failed to get remote DTLS parameters: %v", err)
-			return
+	if sctp := m.peerConnection.SCTP(); sctp != nil {
+		dtlsTransport := sctp.Transport()
+		if dtlsTransport != nil {
+			dtlsTransport.OnStateChange(func(state webrtc.DTLSTransportState) {
+				log.Printf("DTLS Transport State changed to: %s", state)
+				if state == webrtc.DTLSTransportStateConnected {
+					// DTLS is connected, connection is secure
+					select {
+					case m.dtlsStateChan <- state:
+					default:
+						// Channel full or closed, log and continue
+						log.Printf("Could not send DTLS state update")
+					}
+				}
+			})
 		}
-		m.dtlsFingerprint = fingerprint.Fingerprints[0]
-		log.Printf("DTLS fingerprint verified: %s", m.dtlsFingerprint)
-	})
+	}
 
 	return codecSelector, nil
 }
@@ -725,29 +744,22 @@ func (m *Manager) handleTrickle(message []byte) error {
 	return nil
 }
 
-// Add these helper methods for connection state handling
 func (m *Manager) handleConnectionFailure() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Attempt to restart ICE
-	if err := m.peerConnection.RestartICE(); err != nil {
-		return fmt.Errorf("failed to restart ICE: %v", err)
-	}
-
-	// Create a new offer after ICE restart
+	// Create a new offer with ICE restart
 	offer, err := m.peerConnection.CreateOffer(&webrtc.OfferOptions{
 		ICERestart: true,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create offer after ICE restart: %v", err)
+		return fmt.Errorf("failed to create offer with ICE restart: %v", err)
 	}
 
 	if err := m.peerConnection.SetLocalDescription(offer); err != nil {
-		return fmt.Errorf("failed to set local description after ICE restart: %v", err)
+		return fmt.Errorf("failed to set local description: %v", err)
 	}
 
-	// Send the new offer through signaling
 	return m.sendOffer()
 }
 
@@ -755,21 +767,21 @@ func (m *Manager) handleDisconnection() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Wait for a short period before attempting reconnection
+	// Wait before reconnecting
 	time.Sleep(2 * time.Second)
 
-	// Re-initialize the application
-	if err := app.Initialize(); err != nil {
-		log.Fatalf("Failed to initialize application: %v", err)
-		return err
+	// Re-initialize
+	codecSelector, err := m.Initialize()
+	if err != nil {
+		return fmt.Errorf("failed to reinitialize: %v", err)
 	}
 
-	// Restart the main processing loop
-	if err := app.startProcessing(); err != nil {
-		log.Fatalf("Error during processing: %v", err)
-		return err
+	// Reconnect media
+	if err := m.SetupMediaTracks(m.camera, m.microphone, codecSelector); err != nil {
+		return fmt.Errorf("failed to setup media tracks: %v", err)
 	}
-	return nil
+
+	return m.SetupSignaling()
 }
 
 // SDP VALIDATION and DTLS Configuration
@@ -857,4 +869,67 @@ func validateSDP(sd *webrtc.SessionDescription) error {
 	}
 
 	return nil
+}
+
+type DTLSConfig struct {
+	fingerprint    string
+	certificate    *tls.Certificate
+	verifyPeerCert bool
+}
+
+func newDTLSConfig() (*DTLSConfig, error) {
+	// Generate certificate
+	cert, err := generateCertificate()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate certificate: %v", err)
+	}
+
+	// Calculate fingerprint
+	fingerprint, err := calculateFingerprint(cert)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate fingerprint: %v", err)
+	}
+
+	return &DTLSConfig{
+		certificate:    cert,
+		fingerprint:    fingerprint,
+		verifyPeerCert: true,
+	}, nil
+}
+
+func generateCertificate() (*tls.Certificate, error) {
+	certificate, privateKey, err := dtls.GenerateSelfSigned()
+	if err != nil {
+		return nil, err
+	}
+
+	tlsCert := &tls.Certificate{
+		Certificate: [][]byte{certificate.Raw},
+		PrivateKey:  privateKey,
+		Leaf:        certificate,
+	}
+
+	return tlsCert, nil
+}
+
+func calculateFingerprint(cert *tls.Certificate) (string, error) {
+	if cert == nil || len(cert.Certificate) == 0 {
+		return "", fmt.Errorf("invalid certificate")
+	}
+
+	// Calculate SHA-256 fingerprint
+	h := sha256.New()
+	h.Write(cert.Certificate[0])
+	fingerprint := hex.EncodeToString(h.Sum(nil))
+
+	// Format fingerprint with colons
+	var formatted strings.Builder
+	for i := 0; i < len(fingerprint); i += 2 {
+		if i > 0 {
+			formatted.WriteString(":")
+		}
+		formatted.WriteString(fingerprint[i : i+2])
+	}
+
+	return fmt.Sprintf("sha-256 %s", formatted.String()), nil
 }
