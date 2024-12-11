@@ -259,38 +259,47 @@ func (app *Application) selectDevices() (camera, microphone mediadevices.MediaDe
 		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
 			fmt.Errorf("no working microphones found")
 	}
+	if len(workingCameras) == 1 {
+		camera = workingCameras[0].Device
+		fmt.Printf("\nAutomatically selected camera: %s\n", workingCameras[0].DeviceName)
+	} else {
+		// List available working cameras
+		fmt.Println("\nAvailable working cameras:")
+		for i, info := range workingCameras {
+			fmt.Printf("%d: %s\n", i, info.DeviceName)
+		}
 
-	// List available working cameras
-	fmt.Println("\nAvailable working cameras:")
-	for i, info := range workingCameras {
-		fmt.Printf("%d: %s\n", i, info.DeviceName)
+		// Select a camera
+		fmt.Print("Select a camera (0 for the first camera): ")
+
+		_, err = fmt.Scan(&cameraIndex)
+		if err != nil || cameraIndex < 0 || cameraIndex >= len(workingCameras) {
+			return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
+				fmt.Errorf("invalid camera selection")
+		}
+		camera = workingCameras[cameraIndex].Device
 	}
-
-	// Select a camera
-	fmt.Print("Select a camera (0 for the first camera): ")
-
-	_, err = fmt.Scan(&cameraIndex)
-	if err != nil || cameraIndex < 0 || cameraIndex >= len(workingCameras) {
-		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
-			fmt.Errorf("invalid camera selection")
-	}
-	camera = workingCameras[cameraIndex].Device
 
 	// List available working microphones
-	fmt.Println("\nAvailable working microphones:")
-	for i, info := range workingMicrophones {
-		fmt.Printf("%d: %s\n", i, info.DeviceName)
-	}
+	if len(workingMicrophones) == 1 {
+		microphone = workingMicrophones[0].Device
+		fmt.Printf("\nAutomatically selected microphone: %s\n", workingMicrophones[0].DeviceName)
+	} else {
+		fmt.Println("\nAvailable working microphones:")
+		for i, info := range workingMicrophones {
+			fmt.Printf("%d: %s\n", i, info.DeviceName)
+		}
 
-	// Select a microphone
-	fmt.Print("Select a microphone (0 for the first microphone): ")
-	var micIndex int
-	_, err = fmt.Scan(&micIndex)
-	if err != nil || micIndex < 0 || micIndex >= len(workingMicrophones) {
-		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
-			fmt.Errorf("invalid microphone selection")
+		// Select a microphone
+		fmt.Print("Select a microphone (0 for the first microphone): ")
+		var micIndex int
+		_, err = fmt.Scan(&micIndex)
+		if err != nil || micIndex < 0 || micIndex >= len(workingMicrophones) {
+			return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
+				fmt.Errorf("invalid microphone selection")
+		}
+		microphone = workingMicrophones[micIndex].Device
 	}
-	microphone = workingMicrophones[micIndex].Device
 
 	return camera, microphone, nil
 }
