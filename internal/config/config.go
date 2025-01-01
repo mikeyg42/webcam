@@ -8,6 +8,7 @@ type Config struct {
 	MailSlurpConfig MailSlurpConfig
 	VideoConfig     VideoConfig
 	MotionConfig    MotionConfig
+	RecordVideo     bool
 }
 
 type MailSlurpConfig struct {
@@ -38,6 +39,7 @@ type MotionConfig struct {
 // NewDefaultConfig returns a Config with default values
 func NewDefaultConfig() *Config {
 	return &Config{
+		RecordVideo:   true,
 		WebSocketAddr: "localhost:7000",
 		MailSlurpConfig: MailSlurpConfig{
 			SMTPHost: "mx.mailslurp.com",

@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/at-wat/ebml-go/webm"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
+
+	"gocv.io/x/gocv"
 )
 
 type VideoConfig struct {
@@ -42,7 +44,7 @@ func NewRecorder(config *VideoConfig) *Recorder {
 	}
 }
 
-func (r *Recorder) StartRecording() error {
+func (r *Recorder) StartRecording(frameChan <-chan gocv.Mat) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
