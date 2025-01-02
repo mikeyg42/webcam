@@ -17,6 +17,7 @@ type MailSlurpConfig struct {
 	SMTPHost string
 	SMTPPort int
 	ToEmail  string
+	Debug    bool
 }
 
 type VideoConfig struct {
@@ -28,12 +29,16 @@ type VideoConfig struct {
 }
 
 type MotionConfig struct {
-	MinimumArea    int           // Minimum area size for motion detection
-	FrameSkip      int           // Process every nth frame
-	Threshold      float32       // Threshold for motion detection
-	DilationSize   int           // Size of dilation kernel
-	CooldownPeriod time.Duration // Minimum time between notifications
-	NoMotionDelay  time.Duration // Duration to wait before declaring no motion
+	MinimumArea          int           // Minimum area size for motion detection
+	FrameSkip            int           // Process every nth frame
+	LearningRate         float64       // Learning rate for background subtraction
+	Threshold            float32       // Threshold for motion detection
+	DilationSize         int           // Size of dilation kernel
+	BlurSize             int           // Size of Gaussian blur kernel
+	CooldownPeriod       time.Duration // Minimum time between notifications
+	NoMotionDelay        time.Duration // Duration to wait before declaring no motion
+	MaxConsecutiveFrames int           //
+	MinConsecutiveFrames int           //
 }
 
 // NewDefaultConfig returns a Config with default values

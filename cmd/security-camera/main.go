@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"net/url"
-	"strings"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -17,6 +19,7 @@ import (
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/motion"
 	"github.com/mikeyg42/webcam/internal/notification"
+	"github.com/mikeyg42/webcam/internal/validate"
 	"github.com/mikeyg42/webcam/internal/video"
 	"github.com/mikeyg42/webcam/internal/webrtc"
 	_ "github.com/pion/mediadevices/pkg/driver/camera"     // This is required to register camera adapter
@@ -37,13 +40,30 @@ type Application struct {
 	recordingManager    *RecordingManager
 	webSocketManager    *WebSocketManager
 	selectedCameraIndex int
+	state               ApplicationState
+	stateMu             sync.RWMutex
+	startTime           time.Time
+	ctx                 context.Context
+	cancel              context.CancelFunc
 }
+
+type ApplicationState int
+
+const (
+	StateInitializing ApplicationState = iota
+	StateRunning
+	StateShuttingDown
+	StateStopped
+)
+
 type FrameProducer struct {
 	camera      *gocv.VideoCapture
 	frameChan   chan gocv.Mat
-	stopChan    chan struct{}
 	deviceIndex int
+	ctx         context.Context    // Add context
+	cancel      context.CancelFunc // Add cancel function
 }
+
 type DeviceInfo struct {
 	Device     mediadevices.MediaDeviceInfo
 	IsWorking  bool
@@ -57,6 +77,8 @@ type RecordingManager struct {
 	mu             sync.Mutex
 	cooldownPeriod time.Duration
 	minRecordTime  time.Duration
+	ctx            context.Context
+	cancel         context.CancelFunc
 }
 
 type WebSocketManager struct {
@@ -68,22 +90,52 @@ type WebSocketManager struct {
 	mu              sync.RWMutex
 	stopChan        chan struct{}
 	messageChan     chan []byte
+	ctx             context.Context
+	cancel          context.CancelFunc
 }
 
-type ConfigValidator struct {
-	errors []string
+// application state
+func (app *Application) setState(state ApplicationState) {
+	app.stateMu.Lock()
+	defer app.stateMu.Unlock()
+	app.state = state
+}
+
+func (app *Application) GetState() ApplicationState {
+	app.stateMu.RLock()
+	defer app.stateMu.RUnlock()
+	return app.state
 }
 
 func main() {
+	// Create root context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Setup signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
 	// Load configuration
 	cfg := config.NewDefaultConfig()
 
+	// Validate configuration
+	if err := validate.ValidateConfig(cfg); err != nil {
+		log.Fatalf("Configuration validation failed: %v", err)
+	}
+
 	// Parse command line flags
 	flag.StringVar(&cfg.WebSocketAddr, "addr", cfg.WebSocketAddr, "WebSocket address to use")
+	var debugMode bool
+	flag.BoolVar(&debugMode, "debug", false, "Enable debug mode with startup notification")
+	flag.Parse()
+
+	cfg.MailSlurpConfig.Debug = debugMode
+
 	flag.Parse()
 
 	// Create new application instance
-	app, err := NewApplication(cfg)
+	app, err := NewApplication(ctx, cfg)
 	if err != nil {
 		log.Fatalf("Failed to create application: %v", err)
 	}
@@ -94,17 +146,37 @@ func main() {
 		log.Fatalf("Failed to initialize application: %v", err)
 	}
 
-	// Start the main processing loop
-	if err := app.startProcessing(); err != nil {
-		log.Fatalf("Error during processing: %v", err)
+	// Start application in goroutine
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- app.startProcessing()
+	}()
+
+	// Wait for either error, shutdown signal, or context cancellation
+	select {
+	case err := <-errChan:
+		if err != nil && err != context.Canceled {
+			log.Printf("Application error: %v", err)
+		}
+	case sig := <-sigChan:
+		log.Printf("Received signal: %v", sig)
+	case <-ctx.Done():
+		log.Printf("Context cancelled")
+	}
+
+	// Initiate graceful shutdown
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	if err := app.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Shutdown error: %v", err)
 	}
 }
 
-func NewApplication(cfg *config.Config) (*Application, error) {
-	if err := ValidateConfig(cfg); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %v", err)
-	}
+func NewApplication(ctx context.Context, cfg *config.Config) (*Application, error) {
+	appCtx, cancel := context.WithCancel(ctx)
 
+	// Setup signal handling
 	notifier, err := notification.NewNotifier(&notification.MailSlurpConfig{
 		APIKey:   cfg.MailSlurpConfig.APIKey,
 		InboxID:  cfg.MailSlurpConfig.InboxID,
@@ -113,11 +185,13 @@ func NewApplication(cfg *config.Config) (*Application, error) {
 		ToEmail:  cfg.MailSlurpConfig.ToEmail,
 	})
 	if err != nil {
+		cancel() // Clean up if we fail
 		return nil, fmt.Errorf("failed to create notifier: %v", err)
 	}
 
-	motionDetector, err := motion.NewDetector(&cfg.MotionConfig, notifier) // Pass the MotionConfig directly
+	motionDetector, err := motion.NewDetector(&cfg.MotionConfig, notifier)
 	if err != nil {
+		cancel() // Clean up if we fail
 		return nil, fmt.Errorf("failed to create motion detector: %v", err)
 	}
 
@@ -128,25 +202,39 @@ func NewApplication(cfg *config.Config) (*Application, error) {
 		BitRate:    cfg.VideoConfig.BitRate,
 		OutputPath: cfg.VideoConfig.OutputPath,
 	})
-	recordingManager := NewRecordingManager(videoRecorder, notifier)
+
+	recordingManager := NewRecordingManager(ctx, videoRecorder, notifier)
+
 	return &Application{
 		config:           cfg,
+		ctx:              appCtx,
+		cancel:           cancel,
 		motionDetector:   motionDetector,
 		videoRecorder:    videoRecorder,
 		notifier:         notifier,
 		recordingManager: recordingManager,
+		startTime:        time.Now(),
 	}, nil
 }
 
 func (app *Application) Cleanup() {
-	if app.wsConnection != nil {
-		app.wsConnection.Close()
+	app.cancel() // Cancel context to signal all goroutines to stop
+
+	// clean up resources in reverse order
+	if app.videoRecorder != nil {
+		app.videoRecorder.StopRecording()
 	}
 	if app.motionDetector != nil {
 		app.motionDetector.Close()
 	}
-	if app.videoRecorder != nil {
-		app.videoRecorder.StopRecording()
+	if app.webrtcManager != nil {
+		app.webrtcManager.Cleanup()
+	}
+	if app.frameProducer != nil {
+		app.frameProducer.Stop()
+	}
+	if app.wsConnection != nil {
+		app.wsConnection.Close()
 	}
 }
 
@@ -186,7 +274,8 @@ func (app *Application) Initialize() error {
 }
 
 func (app *Application) setupWebSocket() error {
-	wsManager, err := NewWebSocketManager(app.config.WebSocketAddr)
+
+	wsManager, err := NewWebSocketManager(app.ctx, app.config.WebSocketAddr)
 	if err != nil {
 		return fmt.Errorf("failed to create websocket manager: %v", err)
 	}
@@ -354,20 +443,22 @@ func (app *Application) selectDevices() (camera, microphone mediadevices.MediaDe
 }
 
 func (app *Application) startProcessing() error {
-	frameProducer, err := NewFrameProducer(app.selectedCameraIndex) // You'll need to store this during device selection
+	app.setState(StateRunning)
+	defer app.setState(StateStopped)
+
+	frameProducer, err := NewFrameProducer(app.ctx, app.selectedCameraIndex) // You'll need to store this during device selection
 	if err != nil {
 		return fmt.Errorf("failed to create frame producer: %v", err)
 	}
 	app.frameProducer = frameProducer
 
 	motionChan := make(chan bool)
-	done := make(chan struct{})
 
 	// Start frame producer
 	app.frameProducer.Start()
 
 	// Start WebSocket message reader
-	go app.readMessages(done)
+	go app.readMessages()
 
 	// Start motion detection
 	go app.motionDetector.Detect(app.frameProducer.frameChan, motionChan)
@@ -378,23 +469,27 @@ func (app *Application) startProcessing() error {
 	// Start recording handler
 	go app.handleRecording(motionChan, app.frameProducer.frameChan)
 
-	<-done
-	return nil
+	<-app.ctx.Done()
+	return app.ctx.Err()
 }
 
-func (app *Application) readMessages(done chan struct{}) {
-	defer close(done)
+func (app *Application) readMessages() {
 	for {
-		_, message, err := app.wsConnection.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket error: %v", err)
-			}
+		select {
+		case <-app.ctx.Done():
 			return
-		}
+		default:
+			_, message, err := app.wsConnection.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					log.Printf("WebSocket error: %v", err)
+				}
+				return
+			}
 
-		if err := app.webrtcManager.HandleIncomingMessage(message); err != nil {
-			log.Printf("Error handling message: %v", err)
+			if err := app.webrtcManager.HandleIncomingMessage(message); err != nil {
+				log.Printf("Error handling message: %v", err)
+			}
 		}
 	}
 }
@@ -417,6 +512,7 @@ func (app *Application) handleRecording(motionChan <-chan bool, frameChan <-chan
 }
 
 func (app *Application) Shutdown(ctx context.Context) error {
+	app.setState(StateShuttingDown)
 	// Create a channel to signal completion
 	done := make(chan struct{})
 
@@ -464,34 +560,43 @@ func (app *Application) Shutdown(ctx context.Context) error {
 
 // ....................
 
-func NewFrameProducer(deviceIndex int) (*FrameProducer, error) {
+func NewFrameProducer(ctx context.Context, deviceIndex int) (*FrameProducer, error) {
+	// Create child context
+	fpCtx, cancel := context.WithCancel(ctx)
+
 	camera, err := gocv.OpenVideoCapture(deviceIndex)
 	if err != nil {
+		cancel() // Clean up if we fail
 		return nil, fmt.Errorf("failed to open camera: %v", err)
 	}
 
 	return &FrameProducer{
 		camera:      camera,
-		frameChan:   make(chan gocv.Mat, 10), // Buffer size of 10
-		stopChan:    make(chan struct{}),
+		frameChan:   make(chan gocv.Mat, 10),
 		deviceIndex: deviceIndex,
+		ctx:         fpCtx,
+		cancel:      cancel,
 	}, nil
 }
 
 func (fp *FrameProducer) Start() {
 	go func() {
 		defer fp.camera.Close()
+		defer fp.cancel() // Ensure context is cancelled when we're done
 
 		for {
 			select {
-			case <-fp.stopChan:
+			case <-fp.ctx.Done():
 				return
 			default:
 				img := gocv.NewMat()
 				if ok := fp.camera.Read(&img); !ok {
 					img.Close()
 					log.Printf("Failed to read frame, attempting recovery...")
-					fp.attemptRecovery()
+					if err := fp.attemptRecovery(); err != nil {
+						log.Printf("Recovery failed: %v", err)
+						return
+					}
 					continue
 				}
 
@@ -504,6 +609,9 @@ func (fp *FrameProducer) Start() {
 				select {
 				case fp.frameChan <- img:
 					// Frame sent successfully
+				case <-fp.ctx.Done():
+					img.Close()
+					return
 				default:
 					// Channel full, drop frame
 					img.Close()
@@ -513,85 +621,133 @@ func (fp *FrameProducer) Start() {
 	}()
 }
 
-func (fp *FrameProducer) attemptRecovery() {
+func (fp *FrameProducer) attemptRecovery() error {
 	fp.camera.Close()
 	for i := 0; i < 3; i++ { // Try 3 times
-		time.Sleep(time.Second)
-		camera, err := gocv.OpenVideoCapture(fp.deviceIndex)
-		if err == nil {
-			fp.camera = camera
-			return
+		select {
+		case <-fp.ctx.Done():
+			return fmt.Errorf("context cancelled during recovery")
+		case <-time.After(time.Second):
+			camera, err := gocv.OpenVideoCapture(fp.deviceIndex)
+			if err == nil {
+				fp.camera = camera
+				return nil
+			}
+			log.Printf("Recovery attempt %d failed: %v", i+1, err)
 		}
 	}
-	log.Printf("Failed to recover camera after 3 attempts")
+	return fmt.Errorf("failed to recover camera after 3 attempts")
 }
 
 func (fp *FrameProducer) Stop() {
-	close(fp.stopChan)
+	fp.cancel()
 }
 
 // ....................
-func NewRecordingManager(recorder *video.Recorder, notifier *notification.Notifier) *RecordingManager {
+func NewRecordingManager(ctx context.Context, recorder *video.Recorder, notifier *notification.Notifier) *RecordingManager {
+	rmCtx, cancel := context.WithCancel(ctx)
+
 	return &RecordingManager{
 		recorder:       recorder,
 		notifier:       notifier,
 		cooldownPeriod: 30 * time.Second,
 		minRecordTime:  10 * time.Second,
+		ctx:            rmCtx,
+		cancel:         cancel,
 	}
 }
 
 func (rm *RecordingManager) handleMotion(motionChan <-chan bool, frameChan <-chan gocv.Mat) {
 	var recordingStartTime time.Time
 
-	for motion := range motionChan {
-		rm.mu.Lock()
+	for {
+		select {
+		case <-rm.ctx.Done():
+			rm.stopRecording()
+			return
 
-		if motion && !rm.isRecording {
-			if rm.cooldownTimer != nil && !rm.cooldownTimer.Stop() {
-				<-rm.cooldownTimer.C
+		case motion, ok := <-motionChan:
+			if !ok {
+				rm.stopRecording()
+				return
 			}
 
-			if err := rm.recorder.StartRecording(frameChan); err != nil {
-				log.Printf("Failed to start recording: %v", err)
-				rm.mu.Unlock()
-				continue
-			}
-
-			recordingStartTime = time.Now()
-			rm.isRecording = true
-
-			// Send notification
-			if err := rm.notifier.SendNotification(); err != nil {
-				log.Printf("Failed to send notification: %v", err)
-			}
-
-		} else if !motion && rm.isRecording {
-			// Check if minimum recording time has elapsed
-			if time.Since(recordingStartTime) < rm.minRecordTime {
-				rm.mu.Unlock()
-				continue
-			}
-
-			// Start cooldown timer
-			rm.cooldownTimer = time.AfterFunc(rm.cooldownPeriod, func() {
-				rm.mu.Lock()
-				if rm.isRecording {
-					if err := rm.recorder.StopRecording(); err != nil {
-						log.Printf("Failed to stop recording: %v", err)
-					}
-					rm.isRecording = false
+			rm.mu.Lock()
+			if motion && !rm.isRecording {
+				if rm.cooldownTimer != nil {
+					rm.cooldownTimer.Stop()
 				}
-				rm.mu.Unlock()
-			})
-		}
 
-		rm.mu.Unlock()
+				if err := rm.recorder.StartRecording(frameChan); err != nil {
+					log.Printf("Failed to start recording: %v", err)
+					rm.mu.Unlock()
+					continue
+				}
+
+				recordingStartTime = time.Now()
+				rm.isRecording = true
+
+				// Send notification with context
+				go func() {
+					if err := rm.notifier.SendNotification(); err != nil {
+						log.Printf("Failed to send notification: %v", err)
+					}
+				}()
+
+			} else if !motion && rm.isRecording {
+				// Check if minimum recording time has elapsed
+				if time.Since(recordingStartTime) < rm.minRecordTime {
+					rm.mu.Unlock()
+					continue
+				}
+
+				// Start cooldown timer with context awareness
+				rm.cooldownTimer = time.AfterFunc(rm.cooldownPeriod, func() {
+					select {
+					case <-rm.ctx.Done():
+						return
+					default:
+						rm.mu.Lock()
+						if rm.isRecording {
+							if err := rm.recorder.StopRecording(); err != nil {
+								log.Printf("Failed to stop recording: %v", err)
+							}
+							rm.isRecording = false
+						}
+						rm.mu.Unlock()
+					}
+				})
+			}
+			rm.mu.Unlock()
+		}
 	}
+}
+
+func (rm *RecordingManager) stopRecording() {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	if rm.isRecording {
+		if err := rm.recorder.StopRecording(); err != nil {
+			log.Printf("Failed to stop recording during shutdown: %v", err)
+		}
+		rm.isRecording = false
+	}
+
+	if rm.cooldownTimer != nil {
+		rm.cooldownTimer.Stop()
+	}
+}
+
+func (rm *RecordingManager) Stop() {
+	rm.cancel()
+	rm.stopRecording()
 }
 
 //....................
 
-func NewWebSocketManager(addr string) (*WebSocketManager, error) {
+func NewWebSocketManager(ctx context.Context, addr string) (*WebSocketManager, error) {
+	wsCtx, cancel := context.WithCancel(ctx)
 	u := url.URL{Scheme: "ws", Host: addr, Path: "/ws"}
 	return &WebSocketManager{
 		url:             u,
@@ -599,6 +755,8 @@ func NewWebSocketManager(addr string) (*WebSocketManager, error) {
 		maxRetries:      5,
 		stopChan:        make(chan struct{}),
 		messageChan:     make(chan []byte, 100), // Buffered channel for messages
+		ctx:             wsCtx,
+		cancel:          cancel,
 	}, nil
 }
 
@@ -708,55 +866,3 @@ func (wsm *WebSocketManager) Stop() {
 }
 
 //....................
-
-func (cv *ConfigValidator) addError(format string, args ...interface{}) {
-	cv.errors = append(cv.errors, fmt.Sprintf(format, args...))
-}
-
-func ValidateConfig(cfg *config.Config) error {
-	v := &ConfigValidator{}
-
-	// Validate VideoConfig
-	if cfg.VideoConfig.Width == 0 || cfg.VideoConfig.Height == 0 {
-		v.addError("invalid video dimensions: width=%d, height=%d",
-			cfg.VideoConfig.Width, cfg.VideoConfig.Height)
-	}
-	if cfg.VideoConfig.Framerate <= 0 {
-		v.addError("invalid framerate: %d", cfg.VideoConfig.Framerate)
-	}
-	if cfg.VideoConfig.BitRate <= 0 {
-		v.addError("invalid bitrate: %d", cfg.VideoConfig.BitRate)
-	}
-	if cfg.VideoConfig.OutputPath == "" {
-		v.addError("output path cannot be empty")
-	}
-
-	// Validate MailSlurpConfig
-	if cfg.MailSlurpConfig.APIKey == "" {
-		v.addError("MailSlurp API key cannot be empty")
-	}
-	if cfg.MailSlurpConfig.InboxID == "" {
-		v.addError("MailSlurp inbox ID cannot be empty")
-	}
-	if cfg.MailSlurpConfig.SMTPPort <= 0 || cfg.MailSlurpConfig.SMTPPort > 65535 {
-		v.addError("invalid SMTP port: %d", cfg.MailSlurpConfig.SMTPPort)
-	}
-	if cfg.MailSlurpConfig.ToEmail == "" {
-		v.addError("recipient email cannot be empty")
-	}
-
-	// Validate MotionConfig
-	if cfg.MotionConfig.Threshold <= 0 {
-		v.addError("invalid motion threshold: %f", cfg.MotionConfig.Threshold)
-	}
-	if cfg.MotionConfig.MinimumArea <= 0 {
-		v.addError("invalid minimum area: %d", cfg.MotionConfig.MinimumArea)
-	}
-
-	if len(v.errors) > 0 {
-		return fmt.Errorf("configuration validation failed:\n%s",
-			strings.Join(v.errors, "\n"))
-	}
-
-	return nil
-}

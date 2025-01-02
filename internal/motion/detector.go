@@ -14,12 +14,15 @@ import (
 
 // Detector handles motion detection using background subtraction
 type Detector struct {
-	config     *config.MotionConfig
-	notifier   Notifier
-	mog2       *gocv.BackgroundSubtractorMOG2
-	mu         sync.Mutex
-	isRunning  bool
-	frameCount int
+	config       *config.MotionConfig
+	notifier     Notifier
+	mog2         *gocv.BackgroundSubtractorMOG2
+	mu           sync.Mutex
+	isRunning    bool
+	frameCount   int
+	stats        MotionStats
+	motionBuffer []bool // Add this: circular buffer for motion detection
+	bufferIndex  int    // Add this: current position in circular buffer
 }
 
 // Notifier interface for sending notifications
@@ -28,15 +31,23 @@ type Notifier interface {
 }
 
 // Add this to the Config struct
-type Config struct {
-	MinimumArea    int
-	FrameSkip      int
-	LearningRate   float64
-	Threshold      float32
-	BlurSize       int
-	DilationSize   int
-	CooldownPeriod time.Duration
-	NoMotionDelay  time.Duration // Duration to wait before declaring no motion (e.g., 10 seconds)
+
+type MotionStats struct {
+	FramesProcessed   int64
+	MotionEvents      int64
+	LastMotionTime    time.Time
+	AverageMotionArea float64
+	MaxMotionArea     float64 // Add this
+	MinMotionArea     float64 // Add this
+	FalsePositives    int64
+	ProcessingTime    time.Duration
+	LastProcessedTime time.Time // Add this
+}
+
+func (d *Detector) GetStats() MotionStats {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.stats
 }
 
 // Detect processes incoming frames and detects motion
@@ -134,36 +145,54 @@ func NewDetector(config *config.MotionConfig, notifier Notifier) (*Detector, err
 	mog2 := gocv.NewBackgroundSubtractorMOG2()
 
 	return &Detector{
-		config:   config,
-		notifier: notifier,
-		mog2:     &mog2,
+		config:       config,
+		notifier:     notifier,
+		mog2:         &mog2,
+		stats:        MotionStats{},
+		motionBuffer: make([]bool, config.MaxConsecutiveFrames),
 	}, nil
 }
 
-// processFrame analyzes a single frame for motion
 func (d *Detector) processFrame(frame gocv.Mat) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	start := time.Now()
+	defer func() {
+		d.stats.ProcessingTime = time.Since(start)
+	}()
 
 	if !d.isRunning {
 		return false, nil
 	}
 
+	// Convert to grayscale if needed
+	var gray gocv.Mat
+	if frame.Channels() > 1 {
+		gray = gocv.NewMat()
+		defer gray.Close()
+		gocv.CvtColor(frame, &gray, gocv.ColorBGRToGray)
+	} else {
+		gray = frame
+	}
+
+	// Apply Gaussian blur to reduce noise
+	blurred := gocv.NewMat()
+	defer blurred.Close()
+	gocv.GaussianBlur(gray, &blurred, image.Point{X: d.config.BlurSize, Y: d.config.BlurSize}, 0, 0, gocv.BorderDefault)
+
 	// Create foreground mask using MOG2
 	fgMask := gocv.NewMat()
 	defer fgMask.Close()
+	d.mog2.Apply(blurred, &fgMask)
 
-	// Apply MOG2 background subtraction
-	d.mog2.Apply(frame, &fgMask)
-
-	// Apply threshold to clean up the mask
+	// Apply threshold
 	thresh := gocv.NewMat()
 	defer thresh.Close()
-	gocv.Threshold(fgMask, &thresh, d.config.Threshold, 255, gocv.ThresholdBinary)
+	gocv.Threshold(fgMask, &thresh, float32(d.config.Threshold), 255, gocv.ThresholdBinary)
 
-	// Apply dilation to connect nearby motion areas
-	kernel := gocv.GetStructuringElement(gocv.MorphRect,
-		image.Point{X: d.config.DilationSize, Y: d.config.DilationSize})
+	// Apply morphological operations
+	kernel := gocv.GetStructuringElement(gocv.MorphRect, image.Point{X: d.config.DilationSize, Y: d.config.DilationSize})
 	defer kernel.Close()
 
 	dilated := gocv.NewMat()
@@ -174,18 +203,70 @@ func (d *Detector) processFrame(frame gocv.Mat) (bool, error) {
 	contours := gocv.FindContours(dilated, gocv.RetrievalExternal, gocv.ChainApproxSimple)
 	defer contours.Close()
 
-	// Check for significant motion
+	// Analyze contours
+	var totalArea float64
+	motionDetected := false
 	for i := 0; i < contours.Size(); i++ {
 		area := gocv.ContourArea(contours.At(i))
+		totalArea += area
 		if area >= float64(d.config.MinimumArea) {
-			return true, nil
+			motionDetected = true
 		}
 	}
 
-	return false, nil
+	// Update stats
+	d.stats.FramesProcessed++
+	if motionDetected {
+		d.stats.MotionEvents++
+		d.stats.LastMotionTime = time.Now()
+		d.stats.AverageMotionArea = (d.stats.AverageMotionArea*float64(d.stats.MotionEvents-1) + totalArea) / float64(d.stats.MotionEvents)
+
+		// Update min/max areas
+		if totalArea > d.stats.MaxMotionArea {
+			d.stats.MaxMotionArea = totalArea
+		}
+		if d.stats.MinMotionArea == 0 || totalArea < d.stats.MinMotionArea {
+			d.stats.MinMotionArea = totalArea
+		}
+	}
+
+	d.stats.LastProcessedTime = time.Now()
+
+	d.motionBuffer = append(d.motionBuffer, motionDetected)
+	if len(d.motionBuffer) > d.config.MaxConsecutiveFrames {
+		d.motionBuffer = d.motionBuffer[1:]
+	}
+
+	// Count consecutive motion frames
+	consecutiveFrames := 0
+	for i := len(d.motionBuffer) - 1; i >= 0; i-- {
+		if !d.motionBuffer[i] {
+			break
+		}
+		consecutiveFrames++
+	}
+
+	// Return true only if we have enough consecutive frames with motion
+	return d.updateMotionBuffer(motionDetected), nil
 }
 
-// Start begins motion detection
+func (d *Detector) updateMotionBuffer(motion bool) bool {
+	// Add current motion state to buffer
+	d.motionBuffer[d.bufferIndex] = motion
+	d.bufferIndex = (d.bufferIndex + 1) % len(d.motionBuffer)
+
+	// Count consecutive motion frames
+	consecutiveFrames := 0
+	for i := 0; i < len(d.motionBuffer); i++ {
+		if d.motionBuffer[i] {
+			consecutiveFrames++
+		}
+	}
+
+	// Check if we have enough consecutive frames
+	return consecutiveFrames >= d.config.MinConsecutiveFrames
+}
+
 func (d *Detector) Start() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -194,9 +275,22 @@ func (d *Detector) Start() error {
 		return nil
 	}
 
-	d.isRunning = true
+	// Reset stats and counters
+	d.stats = MotionStats{}
 	d.frameCount = 0
+	d.bufferIndex = 0
+	for i := range d.motionBuffer {
+		d.motionBuffer[i] = false
+	}
+	d.isRunning = true
 	return nil
+}
+
+func (d *Detector) ResetStats() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stats = MotionStats{}
+	d.frameCount = 0
 }
 
 // Stop halts motion detection
@@ -214,11 +308,21 @@ func (d *Detector) Stop() error {
 
 // Close releases resources
 func (d *Detector) Close() error {
-	d.Stop()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if err := d.Stop(); err != nil {
+		return fmt.Errorf("error stopping detector: %v", err)
+	}
+
 	if d.mog2 != nil {
 		d.mog2.Close()
 		d.mog2 = nil
 	}
+
+	// Clear stats
+	d.stats = MotionStats{}
+	d.frameCount = 0
 	return nil
 }
 
