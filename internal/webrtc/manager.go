@@ -1,4 +1,4 @@
-package webrtc
+package rtcManager
 
 import (
 	"bytes"
@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -282,7 +283,6 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	m.peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		log.Printf("Received track: ID=%s, Kind=%s, SSRC=%d, codec=%s",
 			track.ID(), track.Kind(), track.SSRC(), track.Codec().MimeType)
-
 		m.handleTrack(track)
 
 		if m.recorder != nil {
@@ -296,9 +296,15 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 		log.Printf("ICE Gathering State changed to: %s", state.String())
 	})
 
-	// Add renegotiation handling
-	// Add renegotiation handling
+	// renegotiate handling with state check
+	var negotiating atomic.Bool
 	m.peerConnection.OnNegotiationNeeded(func() {
+		if !negotiating.CompareAndSwap(false, true) {
+			log.Println("Skipping negotiation, already in progress")
+			return
+		}
+		defer negotiating.Store(false)
+
 		m.mu.Lock()
 		defer m.mu.Unlock()
 
@@ -384,6 +390,17 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 }
 
 func (m *Manager) SetupSignaling() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check if we're in a valid state for new signaling
+	if m.peerConnection.SignalingState() != webrtc.SignalingStateStable {
+		// Wait for current negotiation to complete or reset connection
+		if err := m.waitForStableState(); err != nil {
+			return fmt.Errorf("failed to wait for stable state: %v", err)
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	defer cancel()
 
@@ -417,6 +434,28 @@ func (m *Manager) SetupSignaling() error {
 
 	log.Printf("Signaling setup completed, waiting for answer...")
 	return nil
+}
+
+func (m *Manager) waitForStableState() error {
+	stableChan := make(chan struct{})
+	var once sync.Once
+
+	// Set up temporary state change handler
+	m.peerConnection.OnSignalingStateChange(func(state webrtc.SignalingState) {
+		if state == webrtc.SignalingStateStable {
+			once.Do(func() {
+				close(stableChan)
+			})
+		}
+	})
+
+	// Wait for stable state with timeout
+	select {
+	case <-stableChan:
+		return nil
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("timeout waiting for stable state")
+	}
 }
 
 // Unified method for sending signaling messages
@@ -709,9 +748,10 @@ func (m *Manager) monitorTrackStats() {
 	}
 }
 
-func (m *Manager) GenerateStream(codecSelector *mediadevices.CodecSelector) error {
+func (m *Manager) GenerateStream(codecSelector *mediadevices.CodecSelector) (mediadevices.MediaStream, error) {
+	var stream mediadevices.MediaStream
 	if codecSelector == nil {
-		return fmt.Errorf("codec selector cannot be nil")
+		return stream, fmt.Errorf("codec selector cannot be nil")
 	}
 
 	stream, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
@@ -749,13 +789,21 @@ func (m *Manager) GenerateStream(codecSelector *mediadevices.CodecSelector) erro
 	})
 
 	if err != nil {
-		return fmt.Errorf("failed to get user media: %v", err)
+		return stream, fmt.Errorf("failed to get user media: %v", err)
 	}
+	return stream, nil
+}
 
-	m.mu.Lock()
-	m.mediaStream = stream
-	m.mu.Unlock()
-
+func (m *Manager) GenerateANDSetStream(codecSelector *mediadevices.CodecSelector) error {
+	stream, err := m.GenerateStream(codecSelector)
+	if err != nil {
+		log.Printf("Failed to generate media stream: %v", err)
+		return err
+	} else {
+		m.mu.Lock()
+		m.mediaStream = stream
+		m.mu.Unlock()
+	}
 	return nil
 }
 
@@ -858,10 +906,21 @@ func (m *Manager) SetupMediaTracks(camera, microphone mediadevices.MediaDeviceIn
 		return fmt.Errorf("peer connection not initialized")
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Clean up any existing tracks
+	if m.mediaStream != nil {
+		for _, track := range m.mediaStream.GetTracks() {
+			track.Close()
+		}
+	}
+
 	m.camera = camera
 	m.microphone = microphone
 
-	if err := m.GenerateStream(codecSelector); err != nil {
+	err := m.GenerateANDSetStream(codecSelector)
+	if err != nil {
 		return fmt.Errorf("failed to generate media stream: %v", err)
 	}
 
@@ -1859,4 +1918,17 @@ func (m *Manager) Cleanup() {
 	}
 
 	log.Println("Cleanup completed")
+}
+
+// these helper methods to Manager are mostly for the testDevices method of selectDervices
+func (m *Manager) SetCamera(device mediadevices.MediaDeviceInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.camera = device
+}
+
+func (m *Manager) SetMicrophone(device mediadevices.MediaDeviceInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.microphone = device
 }

@@ -61,12 +61,15 @@ func NewDefaultConfig() *Config {
 			OutputPath: "recordings/",
 		},
 		MotionConfig: MotionConfig{
-			MinimumArea:    3000,
-			FrameSkip:      5,
-			Threshold:      25.0,
-			DilationSize:   3,
-			CooldownPeriod: 30 * time.Second,
-			NoMotionDelay:  10 * time.Second,
+			MinimumArea:          3000,
+			FrameSkip:            5,
+			Threshold:            25.0,
+			DilationSize:         3,
+			CooldownPeriod:       30 * time.Second,
+			NoMotionDelay:        10 * time.Second,
+			BlurSize:             7,
+			MaxConsecutiveFrames: 45,
+			MinConsecutiveFrames: 3,
 		},
 	}
 }

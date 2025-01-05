@@ -8,30 +8,33 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/mediadevices"
+	"github.com/pion/mediadevices/pkg/driver"
+	"github.com/pion/webrtc/v4"
 	"gocv.io/x/gocv"
 
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/motion"
 	"github.com/mikeyg42/webcam/internal/notification"
+	"github.com/mikeyg42/webcam/internal/rtcManager"
 	"github.com/mikeyg42/webcam/internal/validate"
 	"github.com/mikeyg42/webcam/internal/video"
-	"github.com/mikeyg42/webcam/internal/webrtc"
+
 	_ "github.com/pion/mediadevices/pkg/driver/camera"     // This is required to register camera adapter
 	_ "github.com/pion/mediadevices/pkg/driver/microphone" // This is required to register microphone adapter
-	_ "github.com/pion/mediadevices/pkg/driver/screen"
-	"github.com/pion/mediadevices/pkg/prop"
+	//_ "github.com/pion/mediadevices/pkg/driver/screen"
 )
 
 // Application struct that holds all components
 type Application struct {
 	config              *config.Config
-	webrtcManager       *webrtc.Manager
+	webrtcManager       *rtcManager.Manager
 	motionDetector      *motion.Detector
 	videoRecorder       *video.Recorder
 	wsConnection        *websocket.Conn
@@ -68,7 +71,9 @@ type DeviceInfo struct {
 	Device     mediadevices.MediaDeviceInfo
 	IsWorking  bool
 	DeviceName string
+	DeviceType string
 }
+
 type RecordingManager struct {
 	recorder       *video.Recorder
 	notifier       *notification.Notifier
@@ -243,11 +248,51 @@ func (app *Application) Initialize() error {
 		return fmt.Errorf("failed to connect to WebSocket server: %v", err)
 	}
 
-	webrtcManager, err := webrtc.NewManager(app.config, app.wsConnection, app.videoRecorder)
+	webrtcManager, err := rtcManager.NewManager(app.config, app.wsConnection, app.videoRecorder)
 	if err != nil {
 		return fmt.Errorf("failed to create WebRTC manager: %v", err)
 	}
 	app.webrtcManager = webrtcManager
+
+	// Setup connection state callbacks
+	connectionStateChange := make(chan webrtc.PeerConnectionState)
+	app.webrtcManager.peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("PeerConnection State: %s", state.String())
+		select {
+		case connectionStateChange <- state:
+		default:
+			log.Printf("Warning: connectionStateChange channel full")
+		}
+
+		switch state {
+		case webrtc.PeerConnectionStateConnecting:
+			log.Println("PeerConnection is establishing...")
+		case webrtc.PeerConnectionStateConnected:
+			log.Println("PeerConnection established successfully!")
+		case webrtc.PeerConnectionStateDisconnected:
+			log.Println("PeerConnection disconnected - attempting to reconnect...")
+		case webrtc.PeerConnectionStateFailed:
+			log.Println("PeerConnection failed - need to restart")
+		case webrtc.PeerConnectionStateClosed:
+			log.Println("PeerConnection closed")
+		}
+	})
+
+	// Setup ICE connection state callbacks
+	app.webrtcManager.peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		log.Printf("ICE Connection State: %s", state.String())
+
+		switch state {
+		case webrtc.ICEConnectionStateChecking:
+			log.Println("ICE checking candidates...")
+		case webrtc.ICEConnectionStateConnected:
+			log.Println("ICE connection established!")
+		case webrtc.ICEConnectionStateFailed:
+			log.Println("ICE connection failed")
+		case webrtc.ICEConnectionStateDisconnected:
+			log.Println("ICE connection disconnected")
+		}
+	})
 
 	var codecSelector *mediadevices.CodecSelector
 
@@ -257,7 +302,7 @@ func (app *Application) Initialize() error {
 	}
 
 	// Select devices
-	camera, microphone, err := app.selectDevices()
+	camera, microphone, err := app.selectDevices(codecSelector)
 	if err != nil {
 		return fmt.Errorf("failed to select devices: %v", err)
 	}
@@ -270,7 +315,20 @@ func (app *Application) Initialize() error {
 		return fmt.Errorf("failed to setup signaling: %v", err)
 	}
 
-	return nil
+	// Wait for initial connection with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	select {
+	case state := <-connectionStateChange:
+		if state == webrtc.PeerConnectionStateConnected {
+			log.Println("Connection established successfully")
+			return nil
+		}
+		return fmt.Errorf("connection reached unexpected state: %s", state)
+	case <-ctx.Done():
+		return fmt.Errorf("connection timeout after 30 seconds")
+	}
 }
 
 func (app *Application) setupWebSocket() error {
@@ -289,91 +347,102 @@ func (app *Application) setupWebSocket() error {
 	return nil
 }
 
-func (app *Application) testDevice(device mediadevices.MediaDeviceInfo, index int) (*DeviceInfo, error) {
+func (app *Application) testDevice(device mediadevices.MediaDeviceInfo, codecSelector *mediadevices.CodecSelector) (*DeviceInfo, error) {
 	info := &DeviceInfo{
 		Device: device,
 	}
 
+	// Create temporary manager config for testing
+	tempManager := app.webrtcManager
+
 	switch device.Kind {
 	case mediadevices.VideoInput:
-		// For cameras, try using the index instead of DeviceID
-		if device.DeviceType == "camera" { // Only test actual cameras, not screen captures
-			webcam, err := gocv.OpenVideoCapture(index)
-			if err != nil {
-				return info, fmt.Errorf("failed to open camera: %v", err)
-			}
-			defer webcam.Close()
+		// Set the device in manager temporarily
+		tempManager.SetCamera(device)
 
-			// Try to read a frame
-			img := gocv.NewMat()
-			defer img.Close()
-
-			if ok := webcam.Read(&img); !ok {
-				return info, fmt.Errorf("failed to read frame from camera")
-			}
-			if img.Empty() {
-				return info, fmt.Errorf("received empty frame from camera")
-			}
-
-			info.IsWorking = true
-			info.DeviceName = fmt.Sprintf("%s (Working Camera)", device.Label)
-		}
-
-	case mediadevices.AudioInput:
-		// Test audio devices using mediadevices
-		s, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
-			Audio: func(c *mediadevices.MediaTrackConstraints) {
-				c.DeviceID = prop.String(device.DeviceID)
-			},
-		})
+		// Try to generate a stream with just video
+		stream, err := tempManager.GenerateStream(codecSelector)
 		if err != nil {
-			return info, fmt.Errorf("failed to test microphone: %v", err)
+			return info, fmt.Errorf("failed to generate video stream: %v", err)
 		}
 		defer func() {
-			for _, track := range s.GetTracks() {
+			for _, track := range stream.GetTracks() {
 				track.Close()
 			}
 		}()
 
-		tracks := s.GetTracks()
-		if len(tracks) > 0 {
-			info.IsWorking = true
-			info.DeviceName = fmt.Sprintf("%s (Working Microphone)", device.Label)
+		// Check if we got video tracks
+		videoTracks := stream.GetVideoTracks()
+		if len(videoTracks) == 0 {
+			return info, fmt.Errorf("no video tracks in stream")
 		}
+
+		info.IsWorking = true
+		info.DeviceName = fmt.Sprintf("%s (Working Camera)", device.Label)
+
+	case mediadevices.AudioInput:
+		// Set the device in manager temporarily
+		tempManager.SetMicrophone(device)
+
+		// Try to generate a stream with just audio
+		stream, err := tempManager.GenerateStream(codecSelector)
+		if err != nil {
+			return info, fmt.Errorf("failed to generate audio stream: %v", err)
+		}
+		defer func() {
+			for _, track := range stream.GetTracks() {
+				track.Close()
+			}
+		}()
+
+		// Check if we got audio tracks
+		audioTracks := stream.GetAudioTracks()
+		if len(audioTracks) == 0 {
+			return info, fmt.Errorf("no audio tracks in stream")
+		}
+
+		info.IsWorking = true
+		info.DeviceName = fmt.Sprintf("%s (Working Microphone)", device.Label)
 	}
 
 	return info, nil
 }
 
-func (app *Application) selectDevices() (camera, microphone mediadevices.MediaDeviceInfo, err error) {
+func (app *Application) selectDevices(codecSelector *mediadevices.CodecSelector) (camera, microphone mediadevices.MediaDeviceInfo, err error) {
 	// Enumerate available devices
 	devices := mediadevices.EnumerateDevices()
 
 	var workingCameras []*DeviceInfo
 	var workingMicrophones []*DeviceInfo
 
-	// Keep track of camera indices
-	cameraIndex := 0
+	log.Println("Available devices:")
+	for _, device := range devices {
+		log.Printf("ID: %s | Label: %s | Kind: %v | DeviceType: %v ||\n",
+			device.DeviceID,
+			device.Label,
+			device.Kind,       // e.g. VideoInput, AudioInput
+			device.DeviceType, // e.g. "camera", "microphone", "screen"
+		)
 
-	// Test each device
-	for i, device := range devices {
 		// Skip screen capture devices
-		if device.DeviceType == "screen" {
+		if device.DeviceType == driver.Screen {
+			log.Printf("Skipping screen device: %s", device.Label)
+			continue
+		}
+
+		// Skip specific device IDs (case insensitive)
+		if strings.Contains(strings.ToUpper(device.DeviceID), "3EB17E44") ||
+			strings.Contains(strings.ToUpper(device.Label), "3EB17E44") {
+			log.Printf("Skipping iPhone input: %s", device.Label)
 			continue
 		}
 
 		var info *DeviceInfo
 		var err error
 
-		if device.Kind == mediadevices.VideoInput {
-			info, err = app.testDevice(device, cameraIndex)
-			cameraIndex++
-		} else {
-			info, err = app.testDevice(device, i)
-		}
-
+		info, err = app.testDevice(device, codecSelector)
 		if err != nil {
-			log.Printf("Device %s failed testing: %v", device.Label, err)
+			log.Printf("Device '%s' failed testing: %v", device.Label, err)
 			continue
 		}
 
@@ -381,8 +450,10 @@ func (app *Application) selectDevices() (camera, microphone mediadevices.MediaDe
 			switch device.Kind {
 			case mediadevices.VideoInput:
 				workingCameras = append(workingCameras, info)
+				log.Printf("Added working camera: %s", info.DeviceName)
 			case mediadevices.AudioInput:
 				workingMicrophones = append(workingMicrophones, info)
+				log.Printf("Added working microphone: %s", info.DeviceName)
 			}
 		}
 	}
@@ -395,6 +466,7 @@ func (app *Application) selectDevices() (camera, microphone mediadevices.MediaDe
 		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
 			fmt.Errorf("no working microphones found")
 	}
+
 	if len(workingCameras) == 1 {
 		camera = workingCameras[0].Device
 		app.selectedCameraIndex = 0
@@ -408,7 +480,7 @@ func (app *Application) selectDevices() (camera, microphone mediadevices.MediaDe
 
 		// Select a camera
 		fmt.Print("Select a camera (0 for the first camera): ")
-
+		var cameraIndex int
 		_, err = fmt.Scan(&cameraIndex)
 		if err != nil || cameraIndex < 0 || cameraIndex >= len(workingCameras) {
 			return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
@@ -432,7 +504,7 @@ func (app *Application) selectDevices() (camera, microphone mediadevices.MediaDe
 		fmt.Print("Select a microphone (0 for the first microphone): ")
 		var micIndex int
 		_, err = fmt.Scan(&micIndex)
-		if err != nil || micIndex < 0 || micIndex >= len(workingMicrophones) {
+		if err != nil {
 			return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
 				fmt.Errorf("invalid microphone selection")
 		}
@@ -761,12 +833,29 @@ func NewWebSocketManager(ctx context.Context, addr string) (*WebSocketManager, e
 }
 
 func (wsm *WebSocketManager) Start() error {
-	if err := wsm.connect(); err != nil {
-		return err
+	// initial connection timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Try initial connection with timeout
+	connected := make(chan error, 1)
+	go func() {
+		connected <- wsm.connect()
+	}()
+
+	select {
+	case err := <-connected:
+		if err != nil {
+			return fmt.Errorf("initial connection failed: %v", err)
+		}
+	case <-ctx.Done():
+		return fmt.Errorf("connection timeout")
 	}
 
+	// Start read and reconnect loops
 	go wsm.readPump()
 	go wsm.reconnectLoop()
+
 	return nil
 }
 
@@ -774,16 +863,28 @@ func (wsm *WebSocketManager) connect() error {
 	wsm.mu.Lock()
 	defer wsm.mu.Unlock()
 
-	conn, _, err := websocket.DefaultDialer.Dial(wsm.url.String(), nil)
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+
+	conn, resp, err := dialer.Dial(wsm.url.String(), nil)
 	if err != nil {
+		if resp != nil {
+			log.Printf("WebSocket connection failed with status: %d", resp.StatusCode)
+		}
 		return fmt.Errorf("websocket dial failed: %v", err)
 	}
 
+	// Setup ping handler
+	conn.SetPingHandler(func(appData string) error {
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+	})
+
 	wsm.conn = conn
 	wsm.isConnected = true
+	log.Printf("Successfully connected to WebSocket server")
 	return nil
 }
-
 func (wsm *WebSocketManager) reconnectLoop() {
 	for {
 		select {
@@ -828,12 +929,22 @@ func (wsm *WebSocketManager) readPump() {
 				continue
 			}
 
-			_, message, err := conn.ReadMessage()
+			messageType, message, err := conn.ReadMessage()
 			if err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 					log.Printf("WebSocket read error: %v", err)
 				}
 				wsm.handleDisconnect()
+				// delay before retry prevents tight loop
+				time.Sleep(time.Second)
+				continue
+			}
+
+			// Handle ping/pong messages
+			if messageType == websocket.PingMessage {
+				if err := conn.WriteMessage(websocket.PongMessage, nil); err != nil {
+					log.Printf("Failed to send pong: %v", err)
+				}
 				continue
 			}
 
