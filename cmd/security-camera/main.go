@@ -25,6 +25,7 @@ import (
 	"github.com/mikeyg42/webcam/internal/rtcManager"
 	"github.com/mikeyg42/webcam/internal/validate"
 	"github.com/mikeyg42/webcam/internal/video"
+	"github.com/mikeyg42/webcam/pkg/servers"
 
 	_ "github.com/pion/mediadevices/pkg/driver/camera"     // This is required to register camera adapter
 	_ "github.com/pion/mediadevices/pkg/driver/microphone" // This is required to register microphone adapter
@@ -114,7 +115,7 @@ func (app *Application) GetState() ApplicationState {
 
 func main() {
 	// Initialize servers
-	serverManager, err := InitializeServers()
+	serverManager, err := servers.InitializeServers()
 	if err != nil {
 		log.Fatalf("Failed to initialize servers: %v", err)
 	}
