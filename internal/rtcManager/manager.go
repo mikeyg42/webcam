@@ -150,24 +150,32 @@ type DTLSConfig struct {
 
 // Manager handles WebRTC connection and signaling
 type Manager struct {
-	stats           *StatsCollector
-	config          *config.Config
-	peerConnection  *webrtc.PeerConnection
-	connectionID    uint64
-	wsConnection    *websocket.Conn
-	mediaStream     mediadevices.MediaStream
-	camera          mediadevices.MediaDeviceInfo
-	microphone      mediadevices.MediaDeviceInfo
-	recorder        *video.Recorder
-	pcConfiguration webrtc.Configuration
-	mu              *sync.RWMutex
-	ctx             context.Context
-	cancel          context.CancelFunc
-	done            chan struct{}
-	dtlsConfig      *DTLSConfig
-	dtlsStateChan   chan webrtc.DTLSTransportState
-	metrics         *CircularMetricsBuffer
-	metricsMutex    sync.RWMutex
+	stats                   *StatsCollector
+	config                  *config.Config
+	PeerConnection          *webrtc.PeerConnection
+	connectionID            uint64
+	wsConnection            *websocket.Conn
+	mediaStream             mediadevices.MediaStream
+	camera                  mediadevices.MediaDeviceInfo
+	microphone              mediadevices.MediaDeviceInfo
+	recorder                *video.Recorder
+	pcConfiguration         webrtc.Configuration
+	mu                      *sync.RWMutex
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	done                    chan struct{}
+	dtlsConfig              *DTLSConfig
+	dtlsStateChan           chan webrtc.DTLSTransportState
+	metrics                 *CircularMetricsBuffer
+	metricsMutex            sync.RWMutex
+	connectionStateHandlers map[int64]func(webrtc.PeerConnectionState)
+	handlersLock            sync.RWMutex
+	nextHandlerID           int64
+	connectionAttempts      int
+	isNegotiating           atomic.Bool
+	needsRenegotiation      atomic.Bool
+	pendingOperations       []func() error
+	lastCodecSelector       *mediadevices.CodecSelector
 }
 
 func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
@@ -189,19 +197,23 @@ func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video
 	ctx, cancel := context.WithCancel(context.Background())
 
 	m := &Manager{
-		config:          myconfig,
-		wsConnection:    wsConn,
-		camera:          mediadevices.MediaDeviceInfo{},
-		microphone:      mediadevices.MediaDeviceInfo{},
-		recorder:        recorder,
-		pcConfiguration: pcConfig,
-		connectionID:    1,
-		mu:              &sync.RWMutex{},
-		ctx:             ctx,
-		cancel:          cancel,
-		done:            make(chan struct{}),
-		metrics:         NewCircularMetricsBuffer(3600),
-		metricsMutex:    sync.RWMutex{},
+		config:                  myconfig,
+		wsConnection:            wsConn,
+		camera:                  mediadevices.MediaDeviceInfo{},
+		microphone:              mediadevices.MediaDeviceInfo{},
+		recorder:                recorder,
+		pcConfiguration:         pcConfig,
+		connectionID:            1,
+		mu:                      &sync.RWMutex{},
+		ctx:                     ctx,
+		cancel:                  cancel,
+		done:                    make(chan struct{}),
+		metrics:                 NewCircularMetricsBuffer(3600),
+		metricsMutex:            sync.RWMutex{},
+		connectionStateHandlers: make(map[int64]func(webrtc.PeerConnectionState)),
+		nextHandlerID:           0,
+		pendingOperations:       make([]func() error, 0),
+		handlersLock:            sync.RWMutex{},
 	}
 
 	return m, nil
@@ -215,6 +227,21 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("failed to register default codecs: %v", err)
 	}
+
+	// Enable TWCC for video
+	mediaEngine.RegisterFeedback(webrtc.RTCPFeedback{
+		Type: "transport-cc",
+	}, webrtc.RTPCodecTypeVideo)
+
+	// Register RTCP feedback for audio (Opus)
+	mediaEngine.RegisterFeedback(webrtc.RTCPFeedback{
+		Type: "transport-cc",
+	}, webrtc.RTPCodecTypeAudio)
+
+	// Additional Opus-specific feedback mechanisms
+	mediaEngine.RegisterFeedback(webrtc.RTCPFeedback{
+		Type: "nack",
+	}, webrtc.RTPCodecTypeAudio)
 
 	// Create VP8 parameters
 	vpxParams, err := vpx.NewVP8Params()
@@ -271,80 +298,36 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	if err != nil || peerConnection == nil {
 		return nil, fmt.Errorf("failed to create peer connection: %v", err)
 	}
+
+	// Add transceivers (TWCC will be automatically negotiated)
+	if _, err := peerConnection.AddTransceiverFromKind(
+		webrtc.RTPCodecTypeVideo,
+		webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionSendonly,
+		},
+	); err != nil {
+		return nil, fmt.Errorf("failed to add video transceiver: %v", err)
+	}
+
+	// Add audio transceiver
+	if _, err := peerConnection.AddTransceiverFromKind(
+		webrtc.RTPCodecTypeAudio,
+		webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionSendonly,
+		},
+	); err != nil {
+		return nil, fmt.Errorf("failed to add audio transceiver: %v", err)
+	}
+
 	// Store peer connection in Manager
-	m.peerConnection = peerConnection
+	m.PeerConnection = peerConnection
 	m.connectionID = uint64(uuid.New().ID())
 
-	// Set up ICE connection state change handler
-	m.peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("ICE connection state changed to: %v", state)
-	})
-
-	m.peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		log.Printf("Received track: ID=%s, Kind=%s, SSRC=%d, codec=%s",
-			track.ID(), track.Kind(), track.SSRC(), track.Codec().MimeType)
-		m.handleTrack(track)
-
-		if m.recorder != nil {
-			if err := m.recorder.HandleTrack(track); err != nil {
-				log.Printf("Error handling track: %v", err)
-			}
-		}
-	})
-
-	m.peerConnection.OnICEGatheringStateChange(func(state webrtc.ICEGatheringState) {
-		log.Printf("ICE Gathering State changed to: %s", state.String())
-	})
-
-	// renegotiate handling with state check
-	var negotiating atomic.Bool
-	m.peerConnection.OnNegotiationNeeded(func() {
-		if !negotiating.CompareAndSwap(false, true) {
-			log.Println("Skipping negotiation, already in progress")
-			return
-		}
-		defer negotiating.Store(false)
-
-		m.mu.Lock()
-		defer m.mu.Unlock()
-
-		log.Println("Negotiation needed, creating new offer")
-
-		// Check current signaling state
-		if m.peerConnection.SignalingState() != webrtc.SignalingStateStable {
-			log.Println("Skipping negotiation, signaling state not stable")
-			return
-		}
-
-		// Create a new offer
-		offer, err := m.peerConnection.CreateOffer(nil)
-		if err != nil {
-			log.Printf("Failed to create offer during renegotiation: %v", err)
-			return
-		}
-
-		// Set local description
-		err = m.peerConnection.SetLocalDescription(offer)
-		if err != nil {
-			log.Printf("Failed to set local description during renegotiation: %v", err)
-			return
-		}
-
-		// Send the offer through signaling
-		if err := m.sendSignalingMessage("offer", m.peerConnection.LocalDescription()); err != nil {
-			log.Printf("Failed to send offer during renegotiation: %v", err)
-			return
-		}
-
-		log.Println("Renegotiation offer sent successfully")
-	})
-
-	m.peerConnection.OnSignalingStateChange(func(state webrtc.SignalingState) {
-		log.Printf("Signaling state changed to: %s", state.String())
-	})
+	// Set up all callbacks in one place
+	m.setupCallbacks()
 
 	// Monitor DTLS transport state through SCTP association
-	if sctp := m.peerConnection.SCTP(); sctp != nil {
+	if sctp := m.PeerConnection.SCTP(); sctp != nil {
 		dtlsTransport := sctp.Transport()
 		if dtlsTransport != nil {
 			dtlsTransport.OnStateChange(func(state webrtc.DTLSTransportState) {
@@ -375,7 +358,7 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 
 	// Initialize stats collector with error handling
 	if m.stats == nil {
-		m.stats = NewStatsCollector(m.peerConnection)
+		m.stats = NewStatsCollector(m.PeerConnection)
 		if m.stats == nil {
 			return nil, fmt.Errorf("failed to initialize stats collector")
 		}
@@ -389,76 +372,318 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	return codecSelector, nil
 }
 
-func (m *Manager) SetupSignaling() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// AddConnectionStateHandler adds a new connection state handler and returns its ID
+func (m *Manager) AddConnectionStateHandler(handler func(webrtc.PeerConnectionState)) int64 {
+	m.handlersLock.Lock()
+	defer m.handlersLock.Unlock()
 
-	// Check if we're in a valid state for new signaling
-	if m.peerConnection.SignalingState() != webrtc.SignalingStateStable {
-		// Wait for current negotiation to complete or reset connection
-		if err := m.waitForStableState(); err != nil {
-			return fmt.Errorf("failed to wait for stable state: %v", err)
-		}
+	// Generate unique ID for this handler
+	handlerID := atomic.AddInt64(&m.nextHandlerID, 1)
+
+	// Store the handler
+	m.connectionStateHandlers[handlerID] = handler
+
+	// If PeerConnection already exists, update its callback
+	if m.PeerConnection != nil {
+		currentHandlers := m.connectionStateHandlers
+		m.PeerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+			m.handlersLock.RLock()
+			defer m.handlersLock.RUnlock()
+
+			// Call all registered handlers
+			for _, h := range currentHandlers {
+				h(state)
+			}
+		})
 	}
 
-	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
-	defer cancel()
-
-	// Create offer
-	offer, err := m.peerConnection.CreateOffer(nil)
-	if err != nil {
-		return fmt.Errorf("failed to create offer: %v", err)
-	}
-
-	// Set local description and gather ICE candidates
-	gatherComplete := webrtc.GatheringCompletePromise(m.peerConnection)
-	if err = m.peerConnection.SetLocalDescription(offer); err != nil {
-		return fmt.Errorf("failed to set local description: %v", err)
-	}
-
-	// Setup ICE handling
-	m.setupICEHandling()
-
-	// Wait for ICE gathering with timeout
-	select {
-	case <-gatherComplete:
-		log.Println("ICE gathering completed")
-	case <-ctx.Done():
-		return fmt.Errorf("ICE gathering timed out")
-	}
-
-	// Send the offer
-	if err := m.sendSignalingMessage("join", m.peerConnection.LocalDescription()); err != nil {
-		return fmt.Errorf("failed to send offer: %v", err)
-	}
-
-	log.Printf("Signaling setup completed, waiting for answer...")
-	return nil
+	return handlerID
 }
 
-func (m *Manager) waitForStableState() error {
-	stableChan := make(chan struct{})
-	var once sync.Once
+// RemoveConnectionStateHandler removes a connection state handler by its ID
+func (m *Manager) RemoveConnectionStateHandler(handlerID int64) {
+	m.handlersLock.Lock()
+	defer m.handlersLock.Unlock()
 
-	// Set up temporary state change handler
-	m.peerConnection.OnSignalingStateChange(func(state webrtc.SignalingState) {
-		if state == webrtc.SignalingStateStable {
-			once.Do(func() {
-				close(stableChan)
-			})
+	// Remove the handler
+	delete(m.connectionStateHandlers, handlerID)
+
+	// If PeerConnection exists, update its callback
+	if m.PeerConnection != nil {
+		currentHandlers := m.connectionStateHandlers
+		m.PeerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+			m.handlersLock.RLock()
+			defer m.handlersLock.RUnlock()
+
+			// Call remaining handlers
+			for _, h := range currentHandlers {
+				h(state)
+			}
+		})
+	}
+}
+
+// register all callbacks in one place
+func (m *Manager) setupCallbacks() {
+	// Connection State
+	m.PeerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("PeerConnection State changed to: %s", state)
+
+		// Call all registered handlers
+		m.handlersLock.RLock()
+		handlers := make([]func(webrtc.PeerConnectionState), 0, len(m.connectionStateHandlers))
+		for _, handler := range m.connectionStateHandlers {
+			handlers = append(handlers, handler)
+		}
+		m.handlersLock.RUnlock()
+
+		// Call handlers outside the lock
+		for _, handler := range handlers {
+			handler(state)
+		}
+
+		// Handle state changes
+		switch state {
+		case webrtc.PeerConnectionStateNew:
+			log.Println("PeerConnection is new")
+		case webrtc.PeerConnectionStateConnecting:
+			log.Println("PeerConnection is establishing...")
+		case webrtc.PeerConnectionStateConnected:
+			log.Println("PeerConnection established successfully!")
+			m.handleConnectionEstablished()
+		case webrtc.PeerConnectionStateDisconnected:
+			log.Println("PeerConnection disconnected")
+			m.handleTemporaryDisconnection()
+		case webrtc.PeerConnectionStateFailed:
+			log.Println("PeerConnection failed")
+			m.handleConnectionFailure()
+		case webrtc.PeerConnectionStateClosed:
+			log.Println("PeerConnection closed")
+			m.Cleanup()
 		}
 	})
 
-	// Wait for stable state with timeout
-	select {
-	case <-stableChan:
-		return nil
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("timeout waiting for stable state")
+	// ICE Connection State
+	m.PeerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		log.Printf("ICE Connection State changed to: %s", state)
+		switch state {
+		case webrtc.ICEConnectionStateNew:
+			log.Println("ICE connection is new")
+			// Start monitoring for potential stuck state
+			go func() {
+				timer := time.NewTimer(30 * time.Second)
+				defer timer.Stop()
+
+				select {
+				case <-timer.C:
+					if m.PeerConnection.ICEConnectionState() == webrtc.ICEConnectionStateNew {
+						log.Println("ICE connection stuck in new state, attempting restart")
+						if err := m.handleConnectionFailure(); err != nil {
+							log.Printf("Failed to handle stuck ICE state: %v", err)
+						}
+					}
+				case <-m.ctx.Done():
+					return
+				}
+			}()
+		case webrtc.ICEConnectionStateChecking:
+			log.Println("ICE checking candidates...")
+		case webrtc.ICEConnectionStateConnected:
+			log.Println("ICE connection established!")
+		case webrtc.ICEConnectionStateFailed:
+			log.Println("ICE connection failed")
+		case webrtc.ICEConnectionStateDisconnected:
+			log.Println("ICE connection disconnected")
+		}
+	})
+
+	// Signaling State
+	m.PeerConnection.OnSignalingStateChange(func(state webrtc.SignalingState) {
+		log.Printf("Signaling state changed to: %s", state.String())
+		if state == webrtc.SignalingStateStable {
+			m.handleStableState()
+		}
+	})
+
+	// Track handling
+	m.PeerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		log.Printf("Received track: ID=%s, Kind=%s, SSRC=%d, codec=%s",
+			track.ID(), track.Kind(), track.SSRC(), track.Codec().MimeType)
+		m.handleTrack(track)
+	})
+
+	// Negotiation
+	var negotiating atomic.Bool
+	m.PeerConnection.OnNegotiationNeeded(func() {
+		if !negotiating.CompareAndSwap(false, true) {
+			log.Println("Skipping negotiation, already in progress")
+			return
+		}
+		defer negotiating.Store(false)
+		m.handleNegotiationNeeded()
+	})
+
+	// ICE Candidate handling
+	m.PeerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		m.handleICECandidate(candidate)
+	})
+}
+
+func (m *Manager) handleConnectionEstablished() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Reset failure counters
+	m.connectionAttempts = 0
+
+	// Start stats collection if not already running
+	if m.stats != nil {
+		go m.StartMetricsCollection(m.stats)
+	}
+
+	// Verify media streams are properly set up
+	if m.mediaStream == nil {
+		log.Println("Warning: No media stream available after connection established")
+		if err := m.GenerateANDSetStream(m.lastCodecSelector); err != nil {
+			log.Printf("Failed to regenerate media stream: %v", err)
+		}
+	}
+
+	// Verify DTLS state
+	if sctp := m.PeerConnection.SCTP(); sctp != nil {
+		if transport := sctp.Transport(); transport != nil {
+			state := transport.State()
+			log.Printf("DTLS Transport state after connection: %s", state)
+			if state != webrtc.DTLSTransportStateConnected {
+				log.Println("Warning: DTLS transport not in connected state")
+			}
+		}
+	}
+
+	// Log connection quality baseline
+	if stats := m.stats.GetLastStats(); stats != nil {
+		log.Printf("Initial connection stats - RTT: %v, Jitter: %v",
+			stats.RoundTripTime, stats.Jitter)
 	}
 }
 
-// Unified method for sending signaling messages
+func (m *Manager) handleStableState() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Clear any pending negotiation flags
+	m.isNegotiating.Store(false)
+
+	// Check if we need to process any pending operations
+	if len(m.pendingOperations) > 0 {
+		log.Printf("Processing %d pending operations", len(m.pendingOperations))
+		for _, op := range m.pendingOperations {
+			if err := op(); err != nil {
+				log.Printf("Failed to process pending operation: %v", err)
+			}
+		}
+		m.pendingOperations = m.pendingOperations[:0]
+	}
+
+	// Verify local and remote descriptions are properly set
+	if m.PeerConnection.LocalDescription() == nil {
+		log.Println("Warning: No local description in stable state")
+	}
+	if m.PeerConnection.RemoteDescription() == nil {
+		log.Println("Warning: No remote description in stable state")
+	}
+
+	// Check if we need to renegotiate
+	if m.needsRenegotiation.Load() {
+		log.Println("Stable state reached, processing pending renegotiation")
+		m.needsRenegotiation.Store(false)
+		go func() {
+			if err := m.handleNegotiationNeeded(); err != nil {
+				log.Printf("Failed to handle pending renegotiation: %v", err)
+			}
+		}()
+	}
+}
+
+func (m *Manager) handleNegotiationNeeded() error {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.PeerConnection.SignalingState() != webrtc.SignalingStateStable {
+		log.Println("Skipping negotiation, signaling state not stable")
+		return fmt.Errorf("signaling state not stable -- skipping negotiation")
+	}
+
+	offer, err := m.PeerConnection.CreateOffer(nil)
+	if err != nil {
+		log.Printf("Failed to create offer: %v", err)
+		return err
+	}
+
+	if err := m.PeerConnection.SetLocalDescription(offer); err != nil {
+		log.Printf("Failed to set local description: %v", err)
+		return err
+	}
+
+	if err := m.sendSignalingMessage("offer", m.PeerConnection.LocalDescription()); err != nil {
+		log.Printf("Failed to send offer: %v", err)
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) handleICECandidate(candidate *webrtc.ICECandidate) {
+	candidateJSON, err := json.Marshal(&Candidate{
+		Candidate: candidate,
+		Target:    0,
+	})
+	if err != nil {
+		log.Printf("Failed to marshal ICE candidate: %v", err)
+		return
+	}
+
+	m.sendMessage(&jsonrpc2.Request{
+		Method: "trickle",
+		Params: (*json.RawMessage)(&candidateJSON),
+	})
+}
+
+// SETU SIGNALING WIHT THE SELECTIVE FORWARDING UNIT
+func (m *Manager) SetupSignaling() error {
+	log.Println("Starting signaling setup...")
+
+	// Create join message with proper room ID
+	joinMsg := &SendOffer{
+		SID:   "test room", // This should come from config
+		Offer: m.PeerConnection.LocalDescription(),
+	}
+
+	// Send join message
+	params, err := json.Marshal(joinMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal join message: %v", err)
+	}
+
+	// Send via JSON-RPC
+	rpcMsg := &jsonrpc2.Request{
+		Method: "join",
+		Params: (*json.RawMessage)(&params),
+		ID:     jsonrpc2.ID{Num: uint64(uuid.New().ID())},
+	}
+
+	if err := m.sendMessage(rpcMsg); err != nil {
+		return fmt.Errorf("failed to send join message: %v", err)
+	}
+
+	log.Println("Join message sent, waiting for response...")
+	return nil
+}
+
+// ---- Unified method for sending signaling messages
 func (m *Manager) sendSignalingMessage(method string, sd *webrtc.SessionDescription) error {
 	var message interface{}
 
@@ -491,31 +716,11 @@ func (m *Manager) sendSignalingMessage(method string, sd *webrtc.SessionDescript
 	return m.sendMessage(rpcMsg)
 }
 
-// Simplified ICE candidate handling
-func (m *Manager) setupICEHandling() {
-	m.peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate == nil {
-			return
-		}
-
-		candidateJSON, err := json.Marshal(&Candidate{
-			Candidate: candidate,
-			Target:    0,
-		})
-		if err != nil {
-			log.Printf("Failed to marshal ICE candidate: %v", err)
-			return
-		}
-
-		m.sendMessage(&jsonrpc2.Request{
-			Method: "trickle",
-			Params: (*json.RawMessage)(&candidateJSON),
-		})
-	})
-}
-
+// ---- INCOMING MESSAGE HANDLING
 // Simplified incoming message handler
 func (m *Manager) HandleIncomingMessage(message []byte) error {
+	log.Printf("Received message from SFU: %s", string(message))
+
 	var response Response
 	if err := json.Unmarshal(message, &response); err != nil {
 		return fmt.Errorf("failed to unmarshal message: %v", err)
@@ -523,11 +728,17 @@ func (m *Manager) HandleIncomingMessage(message []byte) error {
 
 	switch response.Method {
 	case "offer":
+		// SFU is sending us an offer (usually after join)
 		return m.handleIncomingOffer(&response)
 	case "answer":
+		// SFU is responding to our offer
 		return m.handleIncomingAnswer(&response)
 	case "trickle":
+		// SFU is sending ICE candidates
 		return m.handleTrickle(message)
+	case "error":
+		log.Printf("Received error from SFU: %v", response)
+		return fmt.Errorf("SFU error: %v", response)
 	default:
 		return fmt.Errorf("unknown message method: %s", response.Method)
 	}
@@ -543,26 +754,48 @@ func (m *Manager) handleIncomingAnswer(response *Response) error {
 		return fmt.Errorf("invalid answer SDP: %v", err)
 	}
 
-	return m.peerConnection.SetRemoteDescription(*response.Result)
+	return m.PeerConnection.SetRemoteDescription(*response.Result)
 }
 
 // Simplified offer handling
 func (m *Manager) handleIncomingOffer(response *Response) error {
-	if err := m.peerConnection.SetRemoteDescription(*response.Params); err != nil {
+	if err := m.PeerConnection.SetRemoteDescription(*response.Params); err != nil {
 		return fmt.Errorf("failed to set remote description: %v", err)
 	}
 
-	answer, err := m.peerConnection.CreateAnswer(nil)
+	answer, err := m.PeerConnection.CreateAnswer(nil)
 	if err != nil {
 		return fmt.Errorf("failed to create answer: %v", err)
 	}
 
-	if err := m.peerConnection.SetLocalDescription(answer); err != nil {
+	if err := m.PeerConnection.SetLocalDescription(answer); err != nil {
 		return fmt.Errorf("failed to set local description: %v", err)
 	}
 
-	return m.sendSignalingMessage("answer", m.peerConnection.LocalDescription())
+	return m.sendSignalingMessage("answer", m.PeerConnection.LocalDescription())
 }
+
+func (m *Manager) handleTrickle(message []byte) error {
+	var trickleResponse TrickleResponse
+	if err := json.Unmarshal(message, &trickleResponse); err != nil {
+		return fmt.Errorf("failed to unmarshal trickle: %v", err)
+	}
+
+	if trickleResponse.Params.Candidate == nil {
+		return fmt.Errorf("received nil ICE candidate")
+	}
+
+	log.Printf("Adding ICE candidate: %v", trickleResponse.Params.Candidate)
+
+	if err := m.PeerConnection.AddICECandidate(*trickleResponse.Params.Candidate); err != nil {
+		return fmt.Errorf("failed to add ICE candidate: %v", err)
+	}
+	return nil
+}
+
+// END incoming message handling
+
+// TRACK AND STREAM LOGIC
 func (m *Manager) handleTrack(track *webrtc.TrackRemote) {
 	log.Printf("Received track: ID=%s, Kind=%s, SSRC=%d", track.ID(), track.Kind(), track.SSRC())
 
@@ -600,7 +833,7 @@ func (m *Manager) handleVideoStream(track *webrtc.TrackRemote) {
 	}
 
 	// Add the track to the PeerConnection
-	rtpSender, err := m.peerConnection.AddTrack(localTrack)
+	rtpSender, err := m.PeerConnection.AddTrack(localTrack)
 	if err != nil {
 		log.Printf("Failed to add local track: %v", err)
 		return
@@ -667,7 +900,7 @@ func (m *Manager) handleAudioStream(track *webrtc.TrackRemote) {
 	}
 
 	// Add the track to the PeerConnection
-	rtpSender, err := m.peerConnection.AddTrack(localTrack)
+	rtpSender, err := m.PeerConnection.AddTrack(localTrack)
 	if err != nil {
 		log.Printf("Failed to add local audio track: %v", err)
 		return
@@ -723,7 +956,7 @@ func (m *Manager) monitorTrackStats() {
 		case <-m.ctx.Done():
 			return
 		case <-ticker.C:
-			stats := m.peerConnection.GetStats()
+			stats := m.PeerConnection.GetStats()
 			for _, s := range stats {
 				if inboundStats, ok := s.(*webrtc.InboundRTPStreamStats); ok {
 					// Check for warning conditions
@@ -820,7 +1053,7 @@ func (m *Manager) setupVideoTrack() (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSen
 		return nil, nil, fmt.Errorf("failed to create video track: %v", err)
 	}
 
-	videoRtpSender, err := m.peerConnection.AddTrack(videoTrack)
+	videoRtpSender, err := m.PeerConnection.AddTrack(videoTrack)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to add video track: %v", err)
 	}
@@ -841,7 +1074,7 @@ func (m *Manager) setupAudioTrack() (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSen
 		return nil, nil, fmt.Errorf("failed to create audio track: %v", err)
 	}
 
-	audioRtpSender, err := m.peerConnection.AddTrack(audioTrack)
+	audioRtpSender, err := m.PeerConnection.AddTrack(audioTrack)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to add audio track: %v", err)
 	}
@@ -902,7 +1135,7 @@ func (m *Manager) handleMediaPackets(track mediadevices.Track, localTrack *webrt
 }
 
 func (m *Manager) SetupMediaTracks(camera, microphone mediadevices.MediaDeviceInfo, codecSelector *mediadevices.CodecSelector) error {
-	if m.peerConnection == nil {
+	if m.PeerConnection == nil {
 		return fmt.Errorf("peer connection not initialized")
 	}
 
@@ -1005,30 +1238,12 @@ func (m *Manager) sendMessage(message interface{}) error {
 	return nil
 }
 
-func (m *Manager) handleTrickle(message []byte) error {
-	var trickleResponse TrickleResponse
-	if err := json.Unmarshal(message, &trickleResponse); err != nil {
-		return fmt.Errorf("failed to unmarshal trickle: %v", err)
-	}
-
-	if trickleResponse.Params.Candidate == nil {
-		return fmt.Errorf("received nil ICE candidate")
-	}
-
-	log.Printf("Adding ICE candidate: %v", trickleResponse.Params.Candidate)
-
-	if err := m.peerConnection.AddICECandidate(*trickleResponse.Params.Candidate); err != nil {
-		return fmt.Errorf("failed to add ICE candidate: %v", err)
-	}
-	return nil
-}
-
 func (m *Manager) handleConnectionFailure() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	// Create offer with ICE restart
-	offer, err := m.peerConnection.CreateOffer(&webrtc.OfferOptions{
+	offer, err := m.PeerConnection.CreateOffer(&webrtc.OfferOptions{
 		ICERestart: true,
 	})
 	if err != nil {
@@ -1036,8 +1251,8 @@ func (m *Manager) handleConnectionFailure() error {
 	}
 
 	// Set local description and gather ICE candidates
-	gatherComplete := webrtc.GatheringCompletePromise(m.peerConnection)
-	if err = m.peerConnection.SetLocalDescription(offer); err != nil {
+	gatherComplete := webrtc.GatheringCompletePromise(m.PeerConnection)
+	if err = m.PeerConnection.SetLocalDescription(offer); err != nil {
 		return fmt.Errorf("failed to set local description: %v", err)
 	}
 
@@ -1049,7 +1264,7 @@ func (m *Manager) handleConnectionFailure() error {
 		return fmt.Errorf("ICE gathering timed out during restart")
 	}
 
-	return m.sendSignalingMessage("offer", m.peerConnection.LocalDescription())
+	return m.sendSignalingMessage("offer", m.PeerConnection.LocalDescription())
 }
 
 func (m *Manager) handleDisconnection() error {
@@ -1067,9 +1282,9 @@ func (m *Manager) handleDisconnection() error {
 		m.mediaStream = nil
 	}
 
-	if m.peerConnection != nil {
-		m.peerConnection.Close()
-		m.peerConnection = nil
+	if m.PeerConnection != nil {
+		m.PeerConnection.Close()
+		m.PeerConnection = nil
 	}
 
 	// Wait before reconnecting
@@ -1089,6 +1304,7 @@ func (m *Manager) handleDisconnection() error {
 	return m.SetupSignaling()
 }
 
+//----------------------
 // SDP VALIDATION and DTLS Configuration
 
 func (e *SDPValidationError) Error() string {
@@ -1169,6 +1385,28 @@ func validateSDP(sd *webrtc.SessionDescription) error {
 		return &SDPValidationError{Field: "Media", Message: "neither audio nor video tracks found"}
 	}
 
+	// Check for RTCP feedback mechanisms
+	var (
+		hasVideoTWCC bool
+		hasAudioTWCC bool
+		hasAudioNACK bool
+	)
+
+	for _, line := range strings.Split(sd.SDP, "\n") {
+		switch {
+		case strings.Contains(line, "transport-cc") && strings.Contains(line, "video"):
+			hasVideoTWCC = true
+		case strings.Contains(line, "transport-cc") && strings.Contains(line, "audio"):
+			hasAudioTWCC = true
+		case strings.Contains(line, "nack") && strings.Contains(line, "audio"):
+			hasAudioNACK = true
+		}
+	}
+
+	// Log feedback mechanism status
+	log.Printf("SDP Feedback mechanisms - Video TWCC: %v, Audio TWCC: %v, Audio NACK: %v",
+		hasVideoTWCC, hasAudioTWCC, hasAudioNACK)
+
 	return nil
 }
 
@@ -1236,7 +1474,7 @@ func (m *Manager) handleCriticalIssues(issues []string) {
 	}
 
 	// Check connection state and attempt recovery
-	switch m.peerConnection.ConnectionState() {
+	switch m.PeerConnection.ConnectionState() {
 	case webrtc.PeerConnectionStateFailed:
 		log.Println("Attempting ICE restart due to connection failure")
 		if err := m.handleConnectionFailure(); err != nil {
@@ -1375,7 +1613,7 @@ func (m *Manager) handleWarnings(warnings []string) {
 	}
 
 	// Only adjust constraints if connection is stable
-	if m.peerConnection.ConnectionState() == webrtc.PeerConnectionStateConnected {
+	if m.PeerConnection.ConnectionState() == webrtc.PeerConnectionStateConnected {
 		m.adjustMediaConstraints(false)
 	}
 }
@@ -1393,8 +1631,8 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		}
 
 		// Close peer connection
-		if m.peerConnection != nil {
-			m.peerConnection.Close()
+		if m.PeerConnection != nil {
+			m.PeerConnection.Close()
 		}
 
 		// Cancel context and close channels
@@ -1555,7 +1793,7 @@ func (m *Manager) monitorConnection(sc *StatsCollector) error {
 }
 
 func (m *Manager) checkICEConnectionState(consecutiveFailures *int, timeInNewState *time.Time) {
-	iceState := m.peerConnection.ICEConnectionState()
+	iceState := m.PeerConnection.ICEConnectionState()
 	log.Printf("Checking ICE Connection State: %s", iceState)
 
 	switch iceState {
@@ -1593,7 +1831,7 @@ func (m *Manager) checkICEConnectionState(consecutiveFailures *int, timeInNewSta
 }
 
 func (m *Manager) checkPeerConnectionState(consecutiveFailures *int, timeInNewState *time.Time) {
-	peerState := m.peerConnection.ConnectionState()
+	peerState := m.PeerConnection.ConnectionState()
 	log.Printf("Checking Peer Connection State: %s", peerState)
 
 	switch peerState {
@@ -1708,7 +1946,7 @@ func (m *Manager) analyzeConnectionQuality(stats *ConnectionStats, consecutiveFa
 	m.metrics.Add(currentMetrics)
 }
 
-// handleQualityChange handlesd both metrics
+// handleQualityChange handled both metrics
 func (m *Manager) handleQualityChange(old, new QualityMetrics) {
 	log.Printf("Quality change detected:")
 	log.Printf("  Framerate: %.2f -> %.2f", old.Framerate, new.Framerate)
@@ -1738,22 +1976,22 @@ func (m *Manager) handleTemporaryDisconnection() error {
 	time.Sleep(2 * time.Second)
 
 	// Check if we're still disconnected
-	if m.peerConnection.ConnectionState() == webrtc.PeerConnectionStateDisconnected {
+	if m.PeerConnection.ConnectionState() == webrtc.PeerConnectionStateDisconnected {
 		log.Println("Connection still disconnected, attempting to restore...")
 
 		// Try to restore ICE connection
-		offer, err := m.peerConnection.CreateOffer(&webrtc.OfferOptions{
+		offer, err := m.PeerConnection.CreateOffer(&webrtc.OfferOptions{
 			ICERestart: true,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create offer for reconnection: %v", err)
 		}
 
-		if err := m.peerConnection.SetLocalDescription(offer); err != nil {
+		if err := m.PeerConnection.SetLocalDescription(offer); err != nil {
 			return fmt.Errorf("failed to set local description for reconnection: %v", err)
 		}
 
-		return m.sendSignalingMessage("offer", m.peerConnection.LocalDescription())
+		return m.sendSignalingMessage("offer", m.PeerConnection.LocalDescription())
 	}
 
 	return nil
@@ -1806,7 +2044,7 @@ func (m *Manager) StartMetricsCollection(sc *StatsCollector) {
 				return
 
 			case <-metricsTicker.C:
-				if m.peerConnection != nil {
+				if m.PeerConnection != nil {
 					// Get the latest stats from the StatsCollector
 					currentStats := sc.lastStats
 					if currentStats == nil {
@@ -1904,8 +2142,8 @@ func (m *Manager) Cleanup() {
 	}
 
 	// Close peer connection
-	if m.peerConnection != nil {
-		m.peerConnection.Close()
+	if m.PeerConnection != nil {
+		m.PeerConnection.Close()
 	}
 
 	// Cancel context

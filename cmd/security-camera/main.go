@@ -254,50 +254,9 @@ func (app *Application) Initialize() error {
 	}
 	app.webrtcManager = webrtcManager
 
-	// Setup connection state callbacks
-	connectionStateChange := make(chan webrtc.PeerConnectionState)
-	app.webrtcManager.peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("PeerConnection State: %s", state.String())
-		select {
-		case connectionStateChange <- state:
-		default:
-			log.Printf("Warning: connectionStateChange channel full")
-		}
-
-		switch state {
-		case webrtc.PeerConnectionStateConnecting:
-			log.Println("PeerConnection is establishing...")
-		case webrtc.PeerConnectionStateConnected:
-			log.Println("PeerConnection established successfully!")
-		case webrtc.PeerConnectionStateDisconnected:
-			log.Println("PeerConnection disconnected - attempting to reconnect...")
-		case webrtc.PeerConnectionStateFailed:
-			log.Println("PeerConnection failed - need to restart")
-		case webrtc.PeerConnectionStateClosed:
-			log.Println("PeerConnection closed")
-		}
-	})
-
-	// Setup ICE connection state callbacks
-	app.webrtcManager.peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("ICE Connection State: %s", state.String())
-
-		switch state {
-		case webrtc.ICEConnectionStateChecking:
-			log.Println("ICE checking candidates...")
-		case webrtc.ICEConnectionStateConnected:
-			log.Println("ICE connection established!")
-		case webrtc.ICEConnectionStateFailed:
-			log.Println("ICE connection failed")
-		case webrtc.ICEConnectionStateDisconnected:
-			log.Println("ICE connection disconnected")
-		}
-	})
-
-	var codecSelector *mediadevices.CodecSelector
-
-	// Initialize WebRTC first, generating the codec selector
-	if codecSelector, err = app.webrtcManager.Initialize(); err != nil {
+	// Initialize WebRTC
+	codecSelector, err := app.webrtcManager.Initialize()
+	if err != nil {
 		return fmt.Errorf("failed to initialize WebRTC: %v", err)
 	}
 
@@ -315,19 +274,40 @@ func (app *Application) Initialize() error {
 		return fmt.Errorf("failed to setup signaling: %v", err)
 	}
 
-	// Wait for initial connection with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return app.waitForConnection(30 * time.Second)
+}
+
+// Block until PeerConnectionStateConnected occurs, or time out after 30 seconds.
+// If connected, return nil; otherwise, return a timeout error.”
+func (app *Application) waitForConnection(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	select {
-	case state := <-connectionStateChange:
+	// Create a channel to receive connection state
+	connected := make(chan struct{})
+
+	// Set up one-time connection check
+	var once sync.Once
+
+	checkFunc := func(state webrtc.PeerConnectionState) {
 		if state == webrtc.PeerConnectionStateConnected {
-			log.Println("Connection established successfully")
-			return nil
+			once.Do(func() {
+				close(connected)
+			})
 		}
-		return fmt.Errorf("connection reached unexpected state: %s", state)
+	}
+
+	// Add temp connection state handler that registers a callback for Pion’s OnConnectionStateChange internally
+	handlerID := app.webrtcManager.AddConnectionStateHandler(checkFunc)
+
+	// this will remove the handler after the function returns
+	defer app.webrtcManager.RemoveConnectionStateHandler(handlerID)
+
+	select {
+	case <-connected:
+		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("connection timeout after 30 seconds")
+		return fmt.Errorf("connection timeout after %v", timeout)
 	}
 }
 
@@ -352,7 +332,7 @@ func (app *Application) testDevice(device mediadevices.MediaDeviceInfo, codecSel
 		Device: device,
 	}
 
-	// Create temporary manager config for testing
+	// Create a copy of the manager config just for testing
 	tempManager := app.webrtcManager
 
 	switch device.Kind {
@@ -885,6 +865,7 @@ func (wsm *WebSocketManager) connect() error {
 	log.Printf("Successfully connected to WebSocket server")
 	return nil
 }
+
 func (wsm *WebSocketManager) reconnectLoop() {
 	for {
 		select {
