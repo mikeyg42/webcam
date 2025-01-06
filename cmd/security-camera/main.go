@@ -113,6 +113,13 @@ func (app *Application) GetState() ApplicationState {
 }
 
 func main() {
+	// Initialize servers
+	serverManager, err := InitializeServers()
+	if err != nil {
+		log.Fatalf("Failed to initialize servers: %v", err)
+	}
+	defer serverManager.Cleanup()
+
 	// Create root context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
