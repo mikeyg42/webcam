@@ -10,6 +10,7 @@ require (
 	github.com/mailslurp/mailslurp-client-go v0.0.0-20240603060551-5bc09baec5c5
 	github.com/pion/dtls v1.5.4
 	github.com/pion/mediadevices v0.7.0
+	github.com/pion/stun/v3 v3.0.0
 	github.com/pion/webrtc/v4 v4.0.7
 	github.com/sourcegraph/jsonrpc2 v0.2.0
 	gocv.io/x/gocv v0.39.0
@@ -18,7 +19,6 @@ require (
 require (
 	github.com/blackjack/webcam v0.6.1 // indirect
 	github.com/gen2brain/malgo v0.11.23 // indirect
-	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/pion/datachannel v1.5.10 // indirect
 	github.com/pion/dtls/v3 v3.0.4 // indirect
 	github.com/pion/ice/v4 v4.0.3 // indirect
@@ -31,7 +31,6 @@ require (
 	github.com/pion/sctp v1.8.35 // indirect
 	github.com/pion/sdp/v3 v3.0.9 // indirect
 	github.com/pion/srtp/v3 v3.0.4 // indirect
-	github.com/pion/stun/v3 v3.0.0 // indirect
 	github.com/pion/transport/v3 v3.0.7 // indirect
 	github.com/pion/turn/v4 v4.0.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
@@ -39,8 +38,5 @@ require (
 	golang.org/x/image v0.23.0 // indirect
 	golang.org/x/net v0.34.0 // indirect
 	golang.org/x/oauth2 v0.25.0 // indirect
-	golang.org/x/sync v0.10.0 // indirect
 	golang.org/x/sys v0.29.0 // indirect
-	google.golang.org/appengine v1.6.8 // indirect
-	google.golang.org/protobuf v1.33.0 // indirect
 )

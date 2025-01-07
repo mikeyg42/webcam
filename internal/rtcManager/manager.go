@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/pion/mediadevices/pkg/codec/vpx"
 	"github.com/pion/mediadevices/pkg/frame"
 	"github.com/pion/mediadevices/pkg/prop"
+	"github.com/pion/stun/v3"
 
 	_ "github.com/pion/mediadevices/pkg/driver/camera"     // This is required to register camera adapter - DON'T REMOVE
 	_ "github.com/pion/mediadevices/pkg/driver/microphone" // This is required to register microphone adapter  - DON'T REMOVE
@@ -176,6 +178,7 @@ type Manager struct {
 	needsRenegotiation      atomic.Bool
 	pendingOperations       []func() error
 	lastCodecSelector       *mediadevices.CodecSelector
+	stunServer              *STUNServer
 }
 
 func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
@@ -189,9 +192,16 @@ func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video
 	pcConfig := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
+				URLs: []string{
+					"stun:stun.l.google.com:19302",
+					"stun:stun1.l.google.com:19302",
+					"stun:stun2.l.google.com:19302",
+					"stun:stun3.l.google.com:19302",
+					"stun:stun4.l.google.com:19302",
+				},
 			},
 		},
+		ICETransportPolicy: webrtc.ICETransportPolicyAll,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -220,9 +230,30 @@ func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video
 }
 
 func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
+	// Start STUN server
+	stunServer, err := NewSTUNServer(3478) // Standard STUN port
+	if err != nil {
+		return nil, fmt.Errorf("failed to create STUN server: %v", err)
+	}
+
+	if err := stunServer.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start STUN server: %v", err)
+	}
+
+	m.stunServer = stunServer
+
+	// Update ICE servers configuration to use your STUN server
+	m.pcConfiguration.ICEServers = []webrtc.ICEServer{
+		{
+			URLs: []string{
+				fmt.Sprintf("stun:%s:%d", m.stunServer.publicIP, m.stunServer.port),
+			},
+		},
+	}
 
 	// Create MediaEngine
 	mediaEngine := webrtc.MediaEngine{}
+
 	// Register default codecs first
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("failed to register default codecs: %v", err)
@@ -293,6 +324,22 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 		webrtc.WithSettingEngine(settingEngine),
 	)
 
+	if err := m.validateICEConfiguration(); err != nil {
+		return nil, fmt.Errorf("ICE configuration validation failed: %v", err)
+	}
+
+	// Add ICE transport policy
+	m.pcConfiguration.ICETransportPolicy = webrtc.ICETransportPolicyAll
+
+	// Enable ICE-lite if your SFU supports it
+	settingEngine.SetLite(true)
+
+	// Set ICE candidate timeout
+	settingEngine.SetICETimeouts(
+		5*time.Second,  // disconnected timeout
+		10*time.Second, // failed timeout
+		30*time.Second, // keep-alive interval
+	)
 	// Create peer connection
 	peerConnection, err := api.NewPeerConnection(m.pcConfiguration)
 	if err != nil || peerConnection == nil {
@@ -326,36 +373,6 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	// Set up all callbacks in one place
 	m.setupCallbacks()
 
-	// Monitor DTLS transport state through SCTP association
-	if sctp := m.PeerConnection.SCTP(); sctp != nil {
-		dtlsTransport := sctp.Transport()
-		if dtlsTransport != nil {
-			dtlsTransport.OnStateChange(func(state webrtc.DTLSTransportState) {
-				log.Printf("DTLS Transport State changed to: %s", state)
-
-				switch state {
-				case webrtc.DTLSTransportStateConnected:
-					// DTLS is connected, connection is secure
-					select {
-					case m.dtlsStateChan <- state:
-						log.Println("DTLS connection secured successfully")
-					default:
-						// Channel full or closed, log and continue
-						log.Printf("Could not send DTLS state update: channel full or closed")
-					}
-				case webrtc.DTLSTransportStateFailed:
-					log.Printf("DTLS connection failed, may need to restart connection")
-				case webrtc.DTLSTransportStateClosed:
-					log.Printf("DTLS connection closed")
-				}
-			})
-		} else {
-			log.Printf("Warning: SCTP transport is nil, DTLS state monitoring unavailable")
-		}
-	} else {
-		log.Printf("Warning: SCTP association not available, DTLS state monitoring unavailable")
-	}
-
 	// Initialize stats collector with error handling
 	if m.stats == nil {
 		m.stats = NewStatsCollector(m.PeerConnection)
@@ -366,10 +383,37 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 
 	// Start monitoring
 	go func() {
-		m.monitorConnection(m.stats)
+		if err := m.monitorConnection(m.stats); err != nil {
+			log.Printf("Failed to start connection monitoring: %v", err)
+		}
 	}()
 
+	go m.monitorSTUNHealth()
+
 	return codecSelector, nil
+}
+
+func (m *Manager) validateICEConfiguration() error {
+	if len(m.pcConfiguration.ICEServers) == 0 {
+		return fmt.Errorf("no ICE servers configured")
+	}
+
+	// Test STUN server connectivity
+	for _, server := range m.pcConfiguration.ICEServers {
+		for _, url := range server.URLs {
+			if strings.HasPrefix(url, "stun:") {
+				log.Printf("Testing STUN server: %s", url)
+				conn, err := net.Dial("udp", strings.TrimPrefix(url, "stun:"))
+				if err != nil {
+					log.Printf("WARNING: Failed to connect to STUN server %s: %v", url, err)
+				} else {
+					conn.Close()
+					log.Printf("Successfully connected to STUN server: %s", url)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // AddConnectionStateHandler adds a new connection state handler and returns its ID
@@ -464,36 +508,43 @@ func (m *Manager) setupCallbacks() {
 	})
 
 	// ICE Connection State
+	// Add this to setupCallbacks()
 	m.PeerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		log.Printf("ICE Connection State changed to: %s", state)
+
+		// Add detailed logging for ICE state transitions
 		switch state {
 		case webrtc.ICEConnectionStateNew:
-			log.Println("ICE connection is new")
-			// Start monitoring for potential stuck state
+			log.Println("ICE new - waiting for candidates")
+			// Start a timeout monitor
 			go func() {
-				timer := time.NewTimer(30 * time.Second)
-				defer timer.Stop()
-
 				select {
-				case <-timer.C:
+				case <-time.After(10 * time.Second):
 					if m.PeerConnection.ICEConnectionState() == webrtc.ICEConnectionStateNew {
-						log.Println("ICE connection stuck in new state, attempting restart")
-						if err := m.handleConnectionFailure(); err != nil {
-							log.Printf("Failed to handle stuck ICE state: %v", err)
+						log.Println("WARNING: ICE stuck in 'new' state for 10 seconds")
+						// Log current ICE candidates
+						if m.PeerConnection.SCTP() != nil {
+							transport := m.PeerConnection.SCTP().Transport()
+							if transport != nil {
+								x, _ := transport.GetLocalParameters()
+								log.Printf("Current ICE candidates: %+v", x)
+							}
 						}
 					}
 				case <-m.ctx.Done():
 					return
 				}
 			}()
+
 		case webrtc.ICEConnectionStateChecking:
-			log.Println("ICE checking candidates...")
-		case webrtc.ICEConnectionStateConnected:
-			log.Println("ICE connection established!")
+			dtlsparams, _ := m.PeerConnection.SCTP().Transport().GetLocalParameters()
+			log.Printf("ICE checking - gathered candidates: %s", dtlsparams.Role.String())
+
 		case webrtc.ICEConnectionStateFailed:
-			log.Println("ICE connection failed")
-		case webrtc.ICEConnectionStateDisconnected:
-			log.Println("ICE connection disconnected")
+			log.Println("ICE failed - attempting restart")
+			if err := m.handleConnectionFailure(); err != nil {
+				log.Printf("Failed to handle ICE failure: %v", err)
+			}
 		}
 	})
 
@@ -637,22 +688,39 @@ func (m *Manager) handleNegotiationNeeded() error {
 }
 
 func (m *Manager) handleICECandidate(candidate *webrtc.ICECandidate) {
+	if candidate == nil {
+		log.Println("Received nil ICE candidate - this is normal at gathering completion")
+		return
+	}
+
+	log.Printf("New ICE candidate: %s", candidate.String())
+
 	candidateJSON, err := json.Marshal(&Candidate{
 		Candidate: candidate,
-		Target:    0,
+		Target:    0, // Make sure this matches what your SFU expects
 	})
 	if err != nil {
 		log.Printf("Failed to marshal ICE candidate: %v", err)
 		return
 	}
 
-	m.sendMessage(&jsonrpc2.Request{
-		Method: "trickle",
-		Params: (*json.RawMessage)(&candidateJSON),
-	})
+	// Add retry logic for sending candidates
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		err := m.sendMessage(&jsonrpc2.Request{
+			Method: "trickle",
+			Params: (*json.RawMessage)(&candidateJSON),
+		})
+		if err == nil {
+			log.Printf("Successfully sent ICE candidate: %s", candidate.String())
+			return
+		}
+		log.Printf("Failed to send ICE candidate (attempt %d/%d): %v", i+1, maxRetries, err)
+		time.Sleep(time.Second * time.Duration(i+1))
+	}
 }
 
-// SETU SIGNALING WIHT THE SELECTIVE FORWARDING UNIT
+// SETUP SIGNALING WITH THE SELECTIVE FORWARDING UNIT
 func (m *Manager) SetupSignaling() error {
 	log.Println("Starting signaling setup...")
 
@@ -789,6 +857,8 @@ func (m *Manager) handleTrickle(message []byte) error {
 
 	if err := m.PeerConnection.AddICECandidate(*trickleResponse.Params.Candidate); err != nil {
 		return fmt.Errorf("failed to add ICE candidate: %v", err)
+	} else {
+		fmt.Println("ICE Candidate added successfully")
 	}
 	return nil
 }
@@ -1619,6 +1689,12 @@ func (m *Manager) handleWarnings(warnings []string) {
 }
 
 func (m *Manager) Shutdown(ctx context.Context) error {
+	if m.stunServer != nil {
+		if err := m.stunServer.Stop(); err != nil {
+			log.Printf("Failed to stop STUN server: %v", err)
+		}
+	}
+
 	// Create a channel to signal completion
 	shutdownComplete := make(chan struct{})
 
@@ -1735,7 +1811,6 @@ func (sc *StatsCollector) gatherStats() *ConnectionStats {
 
 	return currentStats
 }
-
 func (m *Manager) monitorConnection(sc *StatsCollector) error {
 	if sc == nil {
 		return fmt.Errorf("stats collector cannot be nil")
@@ -1749,21 +1824,24 @@ func (m *Manager) monitorConnection(sc *StatsCollector) error {
 	state := &connectionState{}
 	stateMutex := &sync.Mutex{}
 
+	// Calculate delays for staggered monitoring
 	now := time.Now()
 	nextMinute := now.Truncate(time.Minute).Add(time.Minute)
 	delay1 := time.Until(nextMinute)
-	delay2 := delay1 + 1*time.Minute
+	delay2 := delay1 + 20*time.Second // 20 seconds after first check
+	delay3 := delay2 + 20*time.Second // 20 seconds after second check
 
+	// Monitor ICE Connection State
 	time.AfterFunc(delay1, func() {
-		ticker := time.NewTicker(2 * time.Minute)
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
 		go func() {
-			defer ticker.Stop()
 			for {
 				select {
 				case <-m.ctx.Done():
 					return
 				case <-ticker.C:
-					// Every 2 minutes, check ICE connection state
 					stateMutex.Lock()
 					m.checkICEConnectionState(&state.consecutiveFailures, &state.timeInNewState)
 					stateMutex.Unlock()
@@ -1772,16 +1850,17 @@ func (m *Manager) monitorConnection(sc *StatsCollector) error {
 		}()
 	})
 
+	// Monitor Peer Connection State
 	time.AfterFunc(delay2, func() {
-		ticker2 := time.NewTicker(2 * time.Minute)
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
 		go func() {
-			defer ticker2.Stop()
 			for {
 				select {
 				case <-m.ctx.Done():
 					return
-				case <-ticker2.C:
-					// Every 2 minutes, check PeerConnection state
+				case <-ticker.C:
 					stateMutex.Lock()
 					m.checkPeerConnectionState(&state.consecutiveFailures, &state.timeInNewState)
 					stateMutex.Unlock()
@@ -1789,7 +1868,87 @@ func (m *Manager) monitorConnection(sc *StatsCollector) error {
 			}
 		}()
 	})
+
+	// Monitor DTLS Transport State
+	time.AfterFunc(delay3, func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
+		go func() {
+			for {
+				select {
+				case <-m.ctx.Done():
+					return
+				case <-ticker.C:
+					m.checkDTLSTransportState()
+				}
+			}
+		}()
+	})
+
 	return nil
+}
+
+// Separate method for DTLS state checking
+func (m *Manager) checkDTLSTransportState() {
+	if m.PeerConnection == nil {
+		log.Println("Warning: PeerConnection is nil during DTLS check")
+		return
+	}
+
+	sctp := m.PeerConnection.SCTP()
+	if sctp == nil {
+		log.Println("Warning: SCTP association not available")
+		return
+	}
+
+	pcTransport := sctp.Transport()
+	if pcTransport == nil {
+		log.Println("Warning: PC transport is nil")
+		return
+	}
+
+	// Get and log ICE parameters
+	params, err := pcTransport.GetLocalParameters()
+	if err == nil {
+		log.Printf("Local ICE parameters: %+v", params)
+	} else {
+		log.Printf("Failed to get local ICE parameters: %v", err)
+	}
+
+	dtlsTransport := sctp.Transport()
+	if dtlsTransport == nil {
+		log.Println("Warning: DTLS transport is nil")
+		return
+	}
+
+	// Set up DTLS state change handler
+	currentState := dtlsTransport.State()
+	log.Printf("Current DTLS Transport State: %s", currentState)
+
+	dtlsTransport.OnStateChange(func(state webrtc.DTLSTransportState) {
+		log.Printf("DTLS Transport State changed to: %s", state)
+
+		switch state {
+		case webrtc.DTLSTransportStateConnected:
+			select {
+			case m.dtlsStateChan <- state:
+				log.Println("DTLS connection secured successfully")
+			default:
+				log.Printf("Could not send DTLS state update: channel full or closed")
+			}
+
+		case webrtc.DTLSTransportStateFailed:
+			log.Printf("DTLS connection failed, attempting restart...")
+			// Trigger connection restart
+			if err := m.handleConnectionFailure(); err != nil {
+				log.Printf("Failed to handle DTLS failure: %v", err)
+			}
+
+		case webrtc.DTLSTransportStateClosed:
+			log.Printf("DTLS connection closed")
+		}
+	})
 }
 
 func (m *Manager) checkICEConnectionState(consecutiveFailures *int, timeInNewState *time.Time) {
@@ -2169,4 +2328,54 @@ func (m *Manager) SetMicrophone(device mediadevices.MediaDeviceInfo) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.microphone = device
+}
+
+func (m *Manager) monitorSTUNHealth() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			for _, server := range m.pcConfiguration.ICEServers {
+				for _, url := range server.URLs {
+					if strings.HasPrefix(url, "stun:") {
+						addr := strings.TrimPrefix(url, "stun:")
+						conn, err := net.Dial("udp", addr)
+						if err != nil {
+							log.Printf("STUN server %s is unreachable: %v", addr, err)
+							continue
+						}
+						conn.Close()
+
+						// Test STUN binding request
+						c, err := stun.Dial("udp", addr)
+						if err != nil {
+							log.Printf("Failed to connect to STUN server %s: %v", addr, err)
+							continue
+						}
+
+						message := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
+						if err := c.Do(message, func(res stun.Event) {
+							if res.Error != nil {
+								log.Printf("Failed STUN binding request to %s: %v", addr, res.Error)
+								return
+							}
+							var xorAddr stun.XORMappedAddress
+							if err := xorAddr.GetFrom(res.Message); err != nil {
+								log.Printf("Failed to get address from STUN response: %v", err)
+								return
+							}
+							log.Printf("STUN server %s responded with mapped address: %s", addr, xorAddr.String())
+						}); err != nil {
+							log.Printf("STUN binding request failed: %v", err)
+						}
+						c.Close()
+					}
+				}
+			}
+		}
+	}
 }
