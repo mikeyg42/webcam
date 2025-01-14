@@ -13,17 +13,21 @@ import (
 
 // ServerManager handles the lifecycle of our servers
 type ServerManager struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	cmd    *exec.Cmd
+	ctx         context.Context
+	cancel      context.CancelFunc
+	cmd         *exec.Cmd
+	shutdownCh  chan struct{}
+	cleanupDone chan struct{}
 }
 
-// NewServerManager creates a new server manager
-func NewServerManager() *ServerManager {
-	ctx, cancel := context.WithCancel(context.Background())
+func NewServerManager(ctx context.Context) *ServerManager {
+	ctx, cancel := context.WithCancel(ctx)
+
 	return &ServerManager{
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:         ctx,
+		cancel:      cancel,
+		shutdownCh:  make(chan struct{}),
+		cleanupDone: make(chan struct{}),
 	}
 }
 
@@ -109,7 +113,21 @@ func (sm *ServerManager) waitForServers() error {
 }
 
 func (sm *ServerManager) Cleanup() {
+
+	// Prevent multiple cleanup calls
+	select {
+	case <-sm.shutdownCh:
+		return
+	default:
+		close(sm.shutdownCh)
+	}
+
 	sm.cancel() // Cancel context
+
+	// Stop Docker containers
+	if err := exec.Command("docker", "ps", "-q", "--filter", "ancestor=pionwebrtc/ion-sfu:latest-jsonrpc").Run(); err == nil {
+		exec.Command("docker", "stop", "$(docker ps -q --filter ancestor=pionwebrtc/ion-sfu:latest-jsonrpc)").Run()
+	}
 
 	if sm.cmd != nil && sm.cmd.Process != nil {
 		// Try graceful shutdown first
@@ -136,13 +154,16 @@ func (sm *ServerManager) Cleanup() {
 			}
 		case <-timeout:
 			log.Printf("Timeout waiting for process to exit")
+			sm.cmd.Process.Kill()
 		}
 	}
+	close(sm.cleanupDone)
+	log.Println("Cleanup complete")
 }
 
 // InitializeServers starts and monitors the servers
-func InitializeServers() (*ServerManager, error) {
-	sm := NewServerManager()
+func InitializeServers(ctx context.Context) (*ServerManager, error) {
+	sm := NewServerManager(ctx)
 
 	if err := sm.startServers(); err != nil {
 		sm.Cleanup()

@@ -1,153 +1,253 @@
 package rtcManager
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
+	"regexp"
+	"runtime/debug"
 	"sync"
+	"syscall"
 
-	"github.com/pion/stun/v3"
+	"time"
+
+	"github.com/pion/turn/v4"
+	"golang.org/x/sys/unix"
+
+	"github.com/mikeyg42/webcam/internal/config"
 )
 
-type STUNServer struct {
-	listener  net.PacketConn
-	port      int
-	publicIP  string
+type TURNServer struct {
+	Server    *turn.Server
+	Realm     string
+	PublicIP  string
+	Port      int
 	mu        sync.RWMutex
+	ctx       context.Context
+	cancel    context.CancelFunc
 	isRunning bool
-	done      chan struct{}
+	done      chan struct{} // Missing channel for cleanup signaling
+	configs   *config.TURNConfigs
 }
 
-func NewSTUNServer(port int) (*STUNServer, error) {
-	// Get public IP (you might want to implement a more robust method)
-	publicIP, err := getPublicIP()
+func (t *TURNServer) NewTURNServer(ctx context.Context) {
+	TURNConfigs := t.configs
+
+	addr, err := net.ResolveUDPAddr("udp", "0.0.0.0:"+fmt.Sprintf("%s", TURNConfigs.Port))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get public IP: %v", err)
+		log.Fatalf("Failed to parse server address: %s", err)
 	}
 
-	return &STUNServer{
-		port:     port,
-		publicIP: publicIP,
-		done:     make(chan struct{}),
-	}, nil
+	//Cache -users flag for easy lookup later
+	usersMap := map[string][]byte{}
+	for _, kv := range regexp.MustCompile(`(\w+)=(\w+)`).FindAllStringSubmatch(TURNConfigs.Users, -1) {
+		usersMap[kv[1]] = turn.GenerateAuthKey(kv[1], TURNConfigs.Realm, kv[2])
+	}
+	// Create `numThreads` UDP listeners to pass into pion/turn
+	// UDP listeners share the same local address:port with setting SO_REUSEPORT and the kernel
+	// will load-balance received packets per the IP 5-tuple
+	listenerConfig := &net.ListenConfig{
+		Control: func(network, address string, conn syscall.RawConn) error {
+			var operr error
+			if err = conn.Control(func(fd uintptr) {
+				operr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			}); err != nil {
+				return err
+			}
+
+			return operr
+		},
+	}
+
+	relayAddressGenerator := &turn.RelayAddressGeneratorPortRange{
+		RelayAddress: net.ParseIP(TURNConfigs.PublicIP), // Claim that we are listening on IP passed by user
+		Address:      "0.0.0.0",                         // But actually be listening on every interface
+		MinPort:      49152,
+		MaxPort:      65535,
+	}
+
+	if err := relayAddressGenerator.Validate(); err != nil {
+		log.Fatalf("Failed to validate relay address generator: %s", err)
+	}
+
+	packetConnConfigs := make([]turn.PacketConnConfig, TURNConfigs.ThreadNum)
+	for i := 0; i < TURNConfigs.ThreadNum; i++ {
+		conn, listErr := listenerConfig.ListenPacket(ctx, addr.Network(), addr.String())
+		if listErr != nil {
+			log.Fatalf("Failed to allocate UDP listener at %s:%s", addr.Network(), addr.String())
+		}
+
+		packetConnConfigs[i] = turn.PacketConnConfig{
+			PacketConn:            conn,
+			RelayAddressGenerator: relayAddressGenerator,
+		}
+
+		log.Printf("Server %d listening on %s\n", i, conn.LocalAddr().String())
+	}
+
+	s, err := turn.NewServer(turn.ServerConfig{
+		Realm: TURNConfigs.Realm,
+		// Set AuthHandler callback,, called every time a user tries to authenticate
+		// Return the key for that user, or false when no user is found
+		AuthHandler: func(username string, realm string, srcAddr net.Addr) ([]byte, bool) {
+			if key, ok := usersMap[username]; ok {
+				return key, true
+			}
+			return nil, false
+		},
+		// PacketConnConfigs is a list of UDP Listeners and the configuration around them
+		PacketConnConfigs: packetConnConfigs,
+	})
+	if err != nil {
+		log.Panicf("Failed to create TURN server: %s", err)
+	}
+
+	t.Server = s
+
+	if err = s.Close(); err != nil {
+		log.Panic("Failed to close TURN server")
+	} else {
+		return
+	}
 }
 
-func (s *STUNServer) Start() error {
-	s.mu.Lock()
-	if s.isRunning {
-		s.mu.Unlock()
-		return fmt.Errorf("STUN server is already running")
+func CreateTURNServer(ctx context.Context) (t *TURNServer) {
+	TURNctx, cancel := context.WithCancel(ctx)
+	TURNConfigs := config.GetTurnConfigs()
+
+	t = &TURNServer{
+		isRunning: false,
+		Port:      TURNConfigs.Port,
+		Realm:     TURNConfigs.Realm,
+		PublicIP:  TURNConfigs.PublicIP,
+		ctx:       TURNctx,
+		cancel:    cancel,
+		mu:        sync.RWMutex{},
+		done:      make(chan struct{}), // Initialize the done channel
+		configs:   TURNConfigs,
 	}
 
-	addr := fmt.Sprintf(":%d", s.port)
-	listener, err := net.ListenPacket("udp4", addr)
-	if err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("failed to start STUN server: %v", err)
+	return t
+}
+func (t *TURNServer) Start() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.NewTURNServer(t.ctx)
+
+	if t.isRunning {
+		return fmt.Errorf("TURN server is already running")
 	}
 
-	s.listener = listener
-	s.isRunning = true
-	s.mu.Unlock()
+	// Start the server in a goroutine
+	go func() {
+		defer close(t.done) // Signal completion when the goroutine exits
+		t.serve()
+	}()
 
-	log.Printf("STUN server listening on %s", addr)
-
-	go s.serve()
+	t.isRunning = true
+	log.Printf("TURN server started on port %d", t.Port)
 	return nil
 }
 
-func (s *STUNServer) serve() {
-	buffer := make([]byte, 1500)
-	for {
-		select {
-		case <-s.done:
-			return
-		default:
-			n, addr, err := s.listener.ReadFrom(buffer)
-			if err != nil {
-				log.Printf("Error reading from connection: %v", err)
-				continue
-			}
+func (t *TURNServer) Stop() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-			message := buffer[:n]
-			if !stun.IsMessage(message) {
-				continue
-			}
-
-			var msg stun.Message
-			if err := stun.Decode(message, &msg); err != nil {
-				log.Printf("Failed to decode STUN message: %v", err)
-				continue
-			}
-
-			if msg.Type != stun.BindingRequest {
-				continue
-			}
-
-			// Create STUN response
-			resp := &stun.Message{
-				Type: stun.BindingSuccess,
-			}
-
-			// Add XOR-MAPPED-ADDRESS attribute
-			clientIP, clientPort, err := net.SplitHostPort(addr.String())
-			if err != nil {
-				log.Printf("Failed to parse client address: %v", err)
-				continue
-			}
-
-			port, _ := net.LookupPort("udp", clientPort)
-			xorAddr := &stun.XORMappedAddress{
-				IP:   net.ParseIP(clientIP),
-				Port: port,
-			}
-
-			if err := resp.Build(
-				stun.BindingSuccess,
-				stun.NewTransactionIDSetter(msg.TransactionID),
-				xorAddr,
-				stun.NewSoftware("pion-stun"),
-				stun.Fingerprint,
-			); err != nil {
-				log.Printf("Failed to build STUN response: %v", err)
-				continue
-			}
-
-			if _, err := s.listener.WriteTo(resp.Raw, addr); err != nil {
-				log.Printf("Failed to send STUN response: %v", err)
-			}
-		}
-	}
-}
-
-func (s *STUNServer) Stop() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.isRunning {
+	if !t.isRunning {
 		return nil
 	}
 
-	close(s.done)
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
-			return fmt.Errorf("failed to close listener: %v", err)
+	log.Println("Stopping TURN server...")
+
+	// Cancel the context first to stop accepting new connections
+	t.cancel()
+
+	// Close the server
+	if t.Server != nil {
+		if err := t.Server.Close(); err != nil {
+			return fmt.Errorf("failed to close TURN server: %v", err)
 		}
 	}
 
-	s.isRunning = false
+	t.isRunning = false
+
+	// Wait for serve goroutine to complete with timeout
+	select {
+	case <-t.done:
+		log.Println("TURN server stopped successfully")
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("timeout waiting for TURN server to stop")
+	}
+
 	return nil
 }
 
-// Helper function to get public IP
-func getPublicIP() (string, error) {
-	// You might want to use a more reliable service or method
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "", err
-	}
-	defer conn.Close()
+func (t *TURNServer) serve() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in TURN server: %v", r)
+			debug.PrintStack()
+		}
+	}()
 
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String(), nil
+	// Create channel for monitoring server health
+	healthCheck := time.NewTicker(30 * time.Second)
+	defer healthCheck.Stop()
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			log.Println("TURN server context cancelled, shutting down...")
+			return
+
+		case <-healthCheck.C:
+			t.mu.RLock()
+			if !t.isRunning {
+				t.mu.RUnlock()
+				continue
+			}
+
+			// Check ports
+			if t.Server != nil {
+				// Check for any blocked ports
+				if err := t.checkPorts(); err != nil {
+					log.Printf("Port check failed: %v", err)
+				}
+			}
+			t.mu.RUnlock()
+		}
+	}
+}
+
+// Helper method to check if required ports are accessible
+func (t *TURNServer) checkPorts() error {
+	// Check UDP port
+	udpAddr := fmt.Sprintf(":%d", t.Port)
+	conn, err := net.ListenPacket("udp", udpAddr)
+	if err != nil {
+		return fmt.Errorf("UDP port %d is not available: %v", t.Port, err)
+	}
+	conn.Close()
+
+	return nil
+}
+
+// Check if the server is currently running
+func (t *TURNServer) IsRunning() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.isRunning
+}
+
+// Get the current number of active connections
+func (t *TURNServer) GetActiveConnections() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.Server != nil {
+		return t.Server.AllocationCount()
+	}
+	return 0
 }

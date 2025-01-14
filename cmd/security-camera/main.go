@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -10,8 +11,11 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/mediadevices"
@@ -19,11 +23,12 @@ import (
 	"github.com/pion/webrtc/v4"
 	"gocv.io/x/gocv"
 
+	"github.com/sourcegraph/jsonrpc2"
+
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/motion"
 	"github.com/mikeyg42/webcam/internal/notification"
 	"github.com/mikeyg42/webcam/internal/rtcManager"
-	"github.com/mikeyg42/webcam/internal/servers"
 	"github.com/mikeyg42/webcam/internal/validate"
 	"github.com/mikeyg42/webcam/internal/video"
 
@@ -98,6 +103,14 @@ type WebSocketManager struct {
 	messageChan     chan []byte
 	ctx             context.Context
 	cancel          context.CancelFunc
+
+	// fields specific to ION-SFU
+	sessionID       string
+	pingInterval    time.Duration
+	writeTimeout    time.Duration
+	readTimeout     time.Duration
+	pendingRequests sync.Map      // Track pending RPC requests
+	messageID       atomic.Uint64 // For generating unique message IDs
 }
 
 // application state
@@ -114,22 +127,15 @@ func (app *Application) GetState() ApplicationState {
 }
 
 func main() {
-	// Initialize servers
-	serverManager, err := servers.InitializeServers()
-	if err != nil {
-		log.Fatalf("Failed to initialize servers: %v", err)
-	}
-	defer serverManager.Cleanup()
-
 	// Create root context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Setup signal handling
+	// Setup signal handling for command line graceful shutd0own
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	// Load configuration
+	// Load configuration - a file with some default values and general configuration settings
 	cfg := config.NewDefaultConfig()
 
 	// Validate configuration
@@ -139,13 +145,12 @@ func main() {
 
 	// Parse command line flags
 	flag.StringVar(&cfg.WebSocketAddr, "addr", cfg.WebSocketAddr, "WebSocket address to use")
+
+	// debug mode for the mailSlurpConfig simlpy sends us a test email upon loggin in when true
 	var debugMode bool
 	flag.BoolVar(&debugMode, "debug", false, "Enable debug mode with startup notification")
 	flag.Parse()
-
 	cfg.MailSlurpConfig.Debug = debugMode
-
-	flag.Parse()
 
 	// Create new application instance
 	app, err := NewApplication(ctx, cfg)
@@ -252,6 +257,8 @@ func (app *Application) Cleanup() {
 }
 
 func (app *Application) Initialize() error {
+
+	// initialize connection with SFU-ION server for WebRTC
 	if err := app.setupWebSocket(); err != nil {
 		return fmt.Errorf("failed to connect to WebSocket server: %v", err)
 	}
@@ -808,99 +815,104 @@ func (rm *RecordingManager) Stop() {
 
 func NewWebSocketManager(ctx context.Context, addr string) (*WebSocketManager, error) {
 	wsCtx, cancel := context.WithCancel(ctx)
+
+	// Parse and validate the address
 	u := url.URL{Scheme: "ws", Host: addr, Path: "/ws"}
+	if !strings.Contains(addr, ":") {
+		u.Host = addr + ":7000" // Default ION-SFU port
+	}
+
 	return &WebSocketManager{
 		url:             u,
 		reconnectPeriod: 5 * time.Second,
 		maxRetries:      5,
 		stopChan:        make(chan struct{}),
-		messageChan:     make(chan []byte, 100), // Buffered channel for messages
+		messageChan:     make(chan []byte, 100),
 		ctx:             wsCtx,
 		cancel:          cancel,
+		sessionID:       uuid.New().String(),
+		pingInterval:    15 * time.Second,
+		writeTimeout:    10 * time.Second,
+		readTimeout:     30 * time.Second,
 	}, nil
 }
 
-func (wsm *WebSocketManager) Start() error {
-	// initial connection timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Try initial connection with timeout
-	connected := make(chan error, 1)
-	go func() {
-		connected <- wsm.connect()
-	}()
-
-	select {
-	case err := <-connected:
-		if err != nil {
-			return fmt.Errorf("initial connection failed: %v", err)
-		}
-	case <-ctx.Done():
-		return fmt.Errorf("connection timeout")
-	}
-
-	// Start read and reconnect loops
-	go wsm.readPump()
-	go wsm.reconnectLoop()
-
-	return nil
-}
-
-func (wsm *WebSocketManager) connect() error {
-	wsm.mu.Lock()
-	defer wsm.mu.Unlock()
-
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-	}
-
-	conn, resp, err := dialer.Dial(wsm.url.String(), nil)
-	if err != nil {
-		if resp != nil {
-			log.Printf("WebSocket connection failed with status: %d", resp.StatusCode)
-		}
-		return fmt.Errorf("websocket dial failed: %v", err)
-	}
-
-	// Setup ping handler
-	conn.SetPingHandler(func(appData string) error {
-		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
-	})
-
-	wsm.conn = conn
-	wsm.isConnected = true
-	log.Printf("Successfully connected to WebSocket server")
-	return nil
-}
-
-func (wsm *WebSocketManager) reconnectLoop() {
-	for {
-		select {
-		case <-wsm.stopChan:
+func (h *rtcHandler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) {
+	switch req.Method {
+	case "offer":
+		var sd webrtc.SessionDescription
+		if err := req.Params.UnmarshalTo(&sd); err != nil {
+			conn.ReplyWithError(ctx, req.ID, &jsonrpc2.Error{
+				Code:    jsonrpc2.CodeParseError,
+				Message: fmt.Sprintf("failed to parse offer: %v", err),
+			})
 			return
-		default:
-			wsm.mu.RLock()
-			if !wsm.isConnected {
-				wsm.mu.RUnlock()
-				retries := 0
-				for retries < wsm.maxRetries {
-					log.Printf("Attempting to reconnect... (attempt %d/%d)", retries+1, wsm.maxRetries)
-					if err := wsm.connect(); err == nil {
-						break
-					}
-					retries++
-					time.Sleep(wsm.reconnectPeriod)
-				}
-				if retries == wsm.maxRetries {
-					log.Printf("Failed to reconnect after %d attempts", wsm.maxRetries)
-				}
-			} else {
-				wsm.mu.RUnlock()
-			}
-			time.Sleep(wsm.reconnectPeriod)
 		}
+		if err := h.manager.handleOffer(ctx, &sd); err != nil {
+			conn.ReplyWithError(ctx, req.ID, &jsonrpc2.Error{
+				Code:    jsonrpc2.CodeInternalError,
+				Message: fmt.Sprintf("failed to handle offer: %v", err),
+			})
+			return
+		}
+		conn.Reply(ctx, req.ID, nil)
+
+	case "trickle":
+		var candidate struct {
+			Target    int                      `json:"target"`
+			Candidate *webrtc.ICECandidateInit `json:"candidate"`
+		}
+		if err := req.Params.UnmarshalTo(&candidate); err != nil {
+			log.Printf("Failed to parse ICE candidate: %v", err)
+			return
+		}
+		h.manager.handleICECandidate(candidate.Candidate)
 	}
+}
+
+// SendRequest sends a JSON-RPC request and waits for the response
+func (wsm *WebSocketManager) SendRequest(method string, params interface{}) (*jsonrpc2.Response, error) {
+	id := jsonrpc2.ID{Num: wsm.messageID.Add(1)}
+
+	// Create response channel
+	responseChan := make(chan *jsonrpc2.Response, 1)
+	wsm.pendingRequests.Store(id, responseChan)
+	defer wsm.pendingRequests.Delete(id)
+
+	// Create request
+	rawParams := (*jsonrpc2.RawMessage)(&params)
+	request := &jsonrpc2.Request{
+		Method: method,
+		Params: rawParams,
+		ID:     id,
+	}
+
+	// Send request
+	if err := wsm.writeRequest(request); err != nil {
+		return nil, err
+	}
+
+	// Wait for response with timeout
+	select {
+	case response := <-responseChan:
+		return response, nil
+	case <-time.After(wsm.writeTimeout):
+		return nil, fmt.Errorf("request timeout")
+	case <-wsm.ctx.Done():
+		return nil, fmt.Errorf("context cancelled")
+	}
+}
+
+func (wsm *WebSocketManager) writeRequest(req *jsonrpc2.Request) error {
+	wsm.mu.RLock()
+	conn := wsm.conn
+	wsm.mu.RUnlock()
+
+	if conn == nil {
+		return fmt.Errorf("connection is nil")
+	}
+
+	return conn.WriteJSON(req)
 }
 
 func (wsm *WebSocketManager) readPump() {
@@ -918,51 +930,150 @@ func (wsm *WebSocketManager) readPump() {
 				continue
 			}
 
-			messageType, message, err := conn.ReadMessage()
+			conn.SetReadDeadline(time.Now().Add(wsm.readTimeout))
+
+			_, message, err := conn.ReadMessage()
 			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				if websocket.IsUnexpectedCloseError(err,
+					websocket.CloseGoingAway,
+					websocket.CloseAbnormalClosure) {
 					log.Printf("WebSocket read error: %v", err)
 				}
 				wsm.handleDisconnect()
-				// delay before retry prevents tight loop
 				time.Sleep(time.Second)
 				continue
 			}
 
-			// Handle ping/pong messages
-			if messageType == websocket.PingMessage {
-				if err := conn.WriteMessage(websocket.PongMessage, nil); err != nil {
-					log.Printf("Failed to send pong: %v", err)
+			// Parse message using jsonrpc2
+			msg := (*json.RawMessage)(&message)
+
+			// Try to parse as Request
+			if req, err := json.ParseRequest(msg); err == nil {
+				select {
+				case wsm.messageChan <- req:
+				default:
+					log.Printf("Message channel full, dropping request: %s", req.Method)
 				}
 				continue
 			}
 
-			select {
-			case wsm.messageChan <- message:
-			default:
-				log.Printf("Message channel full, dropping message")
+			// Try to parse as Response
+			if resp, err := jsonrpc2.ParseResponse(msg); err == nil {
+				if ch, ok := wsm.pendingRequests.Load(resp.ID); ok {
+					if respChan, ok := ch.(chan *jsonrpc2.Response); ok {
+						select {
+						case respChan <- resp:
+						default:
+							log.Printf("Response channel full for ID: %v", resp.ID)
+						}
+					}
+				}
+				continue
 			}
+
+			log.Printf("Received message that is neither request nor response")
 		}
 	}
 }
 
-func (wsm *WebSocketManager) handleDisconnect() {
-	wsm.mu.Lock()
-	defer wsm.mu.Unlock()
-
-	if wsm.conn != nil {
-		wsm.conn.Close()
+func (wsm *WebSocketManager) JoinRoom(roomID string) error {
+	params := &jsonrpc2.RawMessage{
+		Raw: []byte(fmt.Sprintf(`{"sid":"%s"}`, roomID)),
 	}
-	wsm.isConnected = false
+
+	resp, err := wsm.SendRequest("join", params)
+	if err != nil {
+		return fmt.Errorf("join request failed: %v", err)
+	}
+
+	if resp.Error != nil {
+		return fmt.Errorf("join failed: %v", resp.Error)
+	}
+
+	return nil
 }
 
-func (wsm *WebSocketManager) Stop() {
-	close(wsm.stopChan)
-	wsm.mu.Lock()
-	defer wsm.mu.Unlock()
-	if wsm.conn != nil {
-		wsm.conn.Close()
+func (wsm *WebSocketManager) SendOffer(offer interface{}) error {
+	// Convert offer to jsonrpc2.RawMessage
+	params := &jsonrpc2.RawMessage{
+		Raw: []byte(fmt.Sprintf(`{"sdp":"%s","type":"%s"}`,
+			offer.SDP, offer.Type.String())),
 	}
+
+	resp, err := wsm.SendRequest("offer", params)
+	if err != nil {
+		return fmt.Errorf("offer request failed: %v", err)
+	}
+
+	if resp.Error != nil {
+		return fmt.Errorf("offer rejected: %v", resp.Error)
+	}
+
+	return nil
 }
 
-//....................
+// Helper function to convert structs to jsonrpc2.RawMessage
+func toRawMessage(v interface{}) (*jsonrpc2.JSONRPC2
+	.RawMessage, error) {
+	raw, err := jsonrpc2.EncodeObject(v)
+	if err != nil {
+		return nil, err
+	}
+	return (*jsonrpc2.RawMessage)(&raw), nil
+}
+
+// Handler type for processing incoming requests
+type RequestHandler func(*jsonrpc2.Request) error
+
+/*
+// Register a handler for specific message types
+func (wsm *WebSocketManager) HandleRequests(handler RequestHandler) {
+	go func() {
+		for {
+			select {
+			case <-wsm.ctx.Done():
+				return
+			case req := <-wsm.messageChan:
+				if err := handler(req); err != nil {
+					log.Printf("Error handling request %s: %v", req.Method, err)
+				}
+			}
+		}
+	}()
+}
+
+wsManager, err := NewWebSocketManager(ctx, "localhost:7000")
+if err != nil {
+    log.Fatal(err)
+}
+
+if err := wsManager.Start(); err != nil {
+    log.Fatal(err)
+}
+
+// Handle incoming requests
+wsManager.HandleRequests(func(req *jsonrpc2.Request) error {
+    switch req.Method {
+    case "trickle":
+        // Handle ICE candidate
+        var candidate Candidate
+        if err := json.Unmarshal(*req.Params, &candidate); err != nil {
+            return fmt.Errorf("failed to parse trickle candidate: %v", err)
+        }
+        // Process candidate...
+
+    case "answer":
+        // Handle SDP answer
+        var answer webrtc.SessionDescription
+        if err := json.Unmarshal(*req.Params, &answer); err != nil {
+            return fmt.Errorf("failed to parse answer: %v", err)
+        }
+        // Process answer...
+    }
+    return nil
+})
+
+// Join room
+if err := wsManager.JoinRoom("test-room"); err != nil {
+    log.Printf("Failed to join room: %v", err)
+}*/

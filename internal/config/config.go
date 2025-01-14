@@ -9,6 +9,7 @@ type Config struct {
 	VideoConfig     VideoConfig
 	MotionConfig    MotionConfig
 	RecordVideo     bool
+	WebrtcAuth      WebRTCAuth
 }
 
 type MailSlurpConfig struct {
@@ -41,6 +42,18 @@ type MotionConfig struct {
 	MinConsecutiveFrames int           //
 }
 
+type TURNConfigs struct {
+	PublicIP  string
+	Port      int
+	Users     string //"user=pass,user=pass, ..."
+	Realm     string
+	ThreadNum int
+}
+type WebRTCAuth struct {
+	Username string
+	Password string
+}
+
 // NewDefaultConfig returns a Config with default values
 func NewDefaultConfig() *Config {
 	return &Config{
@@ -71,5 +84,24 @@ func NewDefaultConfig() *Config {
 			MaxConsecutiveFrames: 45,
 			MinConsecutiveFrames: 3,
 		},
+		WebrtcAuth: WebRTCAuth{
+			Username: "awsome",
+			Password: "awsome",
+		},
 	}
 }
+
+func GetTurnConfigs() *TURNConfigs {
+	return &TURNConfigs{
+		PublicIP:  "192.168.1.143",
+		Port:      3478,
+		Users:     "user1=pass1,user2=pass2,pion=ion,pion2=ion2",
+		Realm:     "pion.ly",
+		ThreadNum: 4,
+	}
+}
+
+const (
+	MinBitrate = 100000  // 100 kbps
+	MaxBitrate = 2000000 // 2 Mbps
+)
