@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -15,15 +14,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/gorilla/websocket"
 	"github.com/pion/mediadevices"
 	"github.com/pion/mediadevices/pkg/driver"
 	"github.com/pion/webrtc/v4"
 	"gocv.io/x/gocv"
-
-	"github.com/sourcegraph/jsonrpc2"
 
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/motion"
@@ -47,7 +42,6 @@ type Application struct {
 	notifier            *notification.Notifier
 	frameProducer       *FrameProducer
 	recordingManager    *RecordingManager
-	webSocketManager    *WebSocketManager
 	selectedCameraIndex int
 	state               ApplicationState
 	stateMu             sync.RWMutex
@@ -223,6 +217,21 @@ func NewApplication(ctx context.Context, cfg *config.Config) (*Application, erro
 
 	recordingManager := NewRecordingManager(ctx, videoRecorder, notifier)
 
+	// Connect to WebSocket
+	wsConn, _, err := websocket.DefaultDialer.Dial("ws://your-sfu:7000/ws", nil)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to connect to WebSocket: %v", err)
+	}
+
+	// Create WebRTC manager with the WebSocket connection
+	webrtcManager, err := rtcManager.NewManager(appCtx, cfg, wsConn, videoRecorder)
+	if err != nil {
+		cancel()
+		wsConn.Close()
+		return nil, fmt.Errorf("failed to create WebRTC manager: %v", err)
+	}
+
 	return &Application{
 		config:           cfg,
 		ctx:              appCtx,
@@ -232,6 +241,8 @@ func NewApplication(ctx context.Context, cfg *config.Config) (*Application, erro
 		notifier:         notifier,
 		recordingManager: recordingManager,
 		startTime:        time.Now(),
+		wsConnection:     wsConn,
+		webrtcManager:    webrtcManager,
 	}, nil
 }
 
@@ -257,17 +268,6 @@ func (app *Application) Cleanup() {
 }
 
 func (app *Application) Initialize() error {
-
-	// initialize connection with SFU-ION server for WebRTC
-	if err := app.setupWebSocket(); err != nil {
-		return fmt.Errorf("failed to connect to WebSocket server: %v", err)
-	}
-
-	webrtcManager, err := rtcManager.NewManager(app.config, app.wsConnection, app.videoRecorder)
-	if err != nil {
-		return fmt.Errorf("failed to create WebRTC manager: %v", err)
-	}
-	app.webrtcManager = webrtcManager
 
 	// Initialize WebRTC
 	codecSelector, err := app.webrtcManager.Initialize()
@@ -324,22 +324,6 @@ func (app *Application) waitForConnection(timeout time.Duration) error {
 	case <-ctx.Done():
 		return fmt.Errorf("connection timeout after %v", timeout)
 	}
-}
-
-func (app *Application) setupWebSocket() error {
-
-	wsManager, err := NewWebSocketManager(app.ctx, app.config.WebSocketAddr)
-	if err != nil {
-		return fmt.Errorf("failed to create websocket manager: %v", err)
-	}
-
-	if err := wsManager.Start(); err != nil {
-		return fmt.Errorf("failed to start websocket manager: %v", err)
-	}
-
-	app.webSocketManager = wsManager
-	app.wsConnection = wsManager.conn // Keep this for compatibility
-	return nil
 }
 
 func (app *Application) testDevice(device mediadevices.MediaDeviceInfo, codecSelector *mediadevices.CodecSelector) (*DeviceInfo, error) {
@@ -524,9 +508,6 @@ func (app *Application) startProcessing() error {
 	// Start frame producer
 	app.frameProducer.Start()
 
-	// Start WebSocket message reader
-	go app.readMessages()
-
 	// Start motion detection
 	go app.motionDetector.Detect(app.frameProducer.frameChan, motionChan)
 
@@ -536,29 +517,10 @@ func (app *Application) startProcessing() error {
 	// Start recording handler
 	go app.handleRecording(motionChan, app.frameProducer.frameChan)
 
+	go app.webrtcManager.ConnectionDoctor.StartStatsCollection(app.config.StatsCollectionInterval)
+
 	<-app.ctx.Done()
 	return app.ctx.Err()
-}
-
-func (app *Application) readMessages() {
-	for {
-		select {
-		case <-app.ctx.Done():
-			return
-		default:
-			_, message, err := app.wsConnection.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Printf("WebSocket error: %v", err)
-				}
-				return
-			}
-
-			if err := app.webrtcManager.HandleIncomingMessage(message); err != nil {
-				log.Printf("Error handling message: %v", err)
-			}
-		}
-	}
 }
 
 func (app *Application) handleRecording(motionChan <-chan bool, frameChan <-chan gocv.Mat) {
@@ -810,270 +772,3 @@ func (rm *RecordingManager) Stop() {
 	rm.cancel()
 	rm.stopRecording()
 }
-
-//....................
-
-func NewWebSocketManager(ctx context.Context, addr string) (*WebSocketManager, error) {
-	wsCtx, cancel := context.WithCancel(ctx)
-
-	// Parse and validate the address
-	u := url.URL{Scheme: "ws", Host: addr, Path: "/ws"}
-	if !strings.Contains(addr, ":") {
-		u.Host = addr + ":7000" // Default ION-SFU port
-	}
-
-	return &WebSocketManager{
-		url:             u,
-		reconnectPeriod: 5 * time.Second,
-		maxRetries:      5,
-		stopChan:        make(chan struct{}),
-		messageChan:     make(chan []byte, 100),
-		ctx:             wsCtx,
-		cancel:          cancel,
-		sessionID:       uuid.New().String(),
-		pingInterval:    15 * time.Second,
-		writeTimeout:    10 * time.Second,
-		readTimeout:     30 * time.Second,
-	}, nil
-}
-
-func (h *rtcHandler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) {
-	switch req.Method {
-	case "offer":
-		var sd webrtc.SessionDescription
-		if err := req.Params.UnmarshalTo(&sd); err != nil {
-			conn.ReplyWithError(ctx, req.ID, &jsonrpc2.Error{
-				Code:    jsonrpc2.CodeParseError,
-				Message: fmt.Sprintf("failed to parse offer: %v", err),
-			})
-			return
-		}
-		if err := h.manager.handleOffer(ctx, &sd); err != nil {
-			conn.ReplyWithError(ctx, req.ID, &jsonrpc2.Error{
-				Code:    jsonrpc2.CodeInternalError,
-				Message: fmt.Sprintf("failed to handle offer: %v", err),
-			})
-			return
-		}
-		conn.Reply(ctx, req.ID, nil)
-
-	case "trickle":
-		var candidate struct {
-			Target    int                      `json:"target"`
-			Candidate *webrtc.ICECandidateInit `json:"candidate"`
-		}
-		if err := req.Params.UnmarshalTo(&candidate); err != nil {
-			log.Printf("Failed to parse ICE candidate: %v", err)
-			return
-		}
-		h.manager.handleICECandidate(candidate.Candidate)
-	}
-}
-
-// SendRequest sends a JSON-RPC request and waits for the response
-func (wsm *WebSocketManager) SendRequest(method string, params interface{}) (*jsonrpc2.Response, error) {
-	id := jsonrpc2.ID{Num: wsm.messageID.Add(1)}
-
-	// Create response channel
-	responseChan := make(chan *jsonrpc2.Response, 1)
-	wsm.pendingRequests.Store(id, responseChan)
-	defer wsm.pendingRequests.Delete(id)
-
-	// Create request
-	rawParams := (*jsonrpc2.RawMessage)(&params)
-	request := &jsonrpc2.Request{
-		Method: method,
-		Params: rawParams,
-		ID:     id,
-	}
-
-	// Send request
-	if err := wsm.writeRequest(request); err != nil {
-		return nil, err
-	}
-
-	// Wait for response with timeout
-	select {
-	case response := <-responseChan:
-		return response, nil
-	case <-time.After(wsm.writeTimeout):
-		return nil, fmt.Errorf("request timeout")
-	case <-wsm.ctx.Done():
-		return nil, fmt.Errorf("context cancelled")
-	}
-}
-
-func (wsm *WebSocketManager) writeRequest(req *jsonrpc2.Request) error {
-	wsm.mu.RLock()
-	conn := wsm.conn
-	wsm.mu.RUnlock()
-
-	if conn == nil {
-		return fmt.Errorf("connection is nil")
-	}
-
-	return conn.WriteJSON(req)
-}
-
-func (wsm *WebSocketManager) readPump() {
-	for {
-		select {
-		case <-wsm.stopChan:
-			return
-		default:
-			wsm.mu.RLock()
-			conn := wsm.conn
-			wsm.mu.RUnlock()
-
-			if conn == nil {
-				time.Sleep(time.Second)
-				continue
-			}
-
-			conn.SetReadDeadline(time.Now().Add(wsm.readTimeout))
-
-			_, message, err := conn.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err,
-					websocket.CloseGoingAway,
-					websocket.CloseAbnormalClosure) {
-					log.Printf("WebSocket read error: %v", err)
-				}
-				wsm.handleDisconnect()
-				time.Sleep(time.Second)
-				continue
-			}
-
-			// Parse message using jsonrpc2
-			msg := (*json.RawMessage)(&message)
-
-			// Try to parse as Request
-			if req, err := json.ParseRequest(msg); err == nil {
-				select {
-				case wsm.messageChan <- req:
-				default:
-					log.Printf("Message channel full, dropping request: %s", req.Method)
-				}
-				continue
-			}
-
-			// Try to parse as Response
-			if resp, err := jsonrpc2.ParseResponse(msg); err == nil {
-				if ch, ok := wsm.pendingRequests.Load(resp.ID); ok {
-					if respChan, ok := ch.(chan *jsonrpc2.Response); ok {
-						select {
-						case respChan <- resp:
-						default:
-							log.Printf("Response channel full for ID: %v", resp.ID)
-						}
-					}
-				}
-				continue
-			}
-
-			log.Printf("Received message that is neither request nor response")
-		}
-	}
-}
-
-func (wsm *WebSocketManager) JoinRoom(roomID string) error {
-	params := &jsonrpc2.RawMessage{
-		Raw: []byte(fmt.Sprintf(`{"sid":"%s"}`, roomID)),
-	}
-
-	resp, err := wsm.SendRequest("join", params)
-	if err != nil {
-		return fmt.Errorf("join request failed: %v", err)
-	}
-
-	if resp.Error != nil {
-		return fmt.Errorf("join failed: %v", resp.Error)
-	}
-
-	return nil
-}
-
-func (wsm *WebSocketManager) SendOffer(offer interface{}) error {
-	// Convert offer to jsonrpc2.RawMessage
-	params := &jsonrpc2.RawMessage{
-		Raw: []byte(fmt.Sprintf(`{"sdp":"%s","type":"%s"}`,
-			offer.SDP, offer.Type.String())),
-	}
-
-	resp, err := wsm.SendRequest("offer", params)
-	if err != nil {
-		return fmt.Errorf("offer request failed: %v", err)
-	}
-
-	if resp.Error != nil {
-		return fmt.Errorf("offer rejected: %v", resp.Error)
-	}
-
-	return nil
-}
-
-// Helper function to convert structs to jsonrpc2.RawMessage
-func toRawMessage(v interface{}) (*jsonrpc2.JSONRPC2
-	.RawMessage, error) {
-	raw, err := jsonrpc2.EncodeObject(v)
-	if err != nil {
-		return nil, err
-	}
-	return (*jsonrpc2.RawMessage)(&raw), nil
-}
-
-// Handler type for processing incoming requests
-type RequestHandler func(*jsonrpc2.Request) error
-
-/*
-// Register a handler for specific message types
-func (wsm *WebSocketManager) HandleRequests(handler RequestHandler) {
-	go func() {
-		for {
-			select {
-			case <-wsm.ctx.Done():
-				return
-			case req := <-wsm.messageChan:
-				if err := handler(req); err != nil {
-					log.Printf("Error handling request %s: %v", req.Method, err)
-				}
-			}
-		}
-	}()
-}
-
-wsManager, err := NewWebSocketManager(ctx, "localhost:7000")
-if err != nil {
-    log.Fatal(err)
-}
-
-if err := wsManager.Start(); err != nil {
-    log.Fatal(err)
-}
-
-// Handle incoming requests
-wsManager.HandleRequests(func(req *jsonrpc2.Request) error {
-    switch req.Method {
-    case "trickle":
-        // Handle ICE candidate
-        var candidate Candidate
-        if err := json.Unmarshal(*req.Params, &candidate); err != nil {
-            return fmt.Errorf("failed to parse trickle candidate: %v", err)
-        }
-        // Process candidate...
-
-    case "answer":
-        // Handle SDP answer
-        var answer webrtc.SessionDescription
-        if err := json.Unmarshal(*req.Params, &answer); err != nil {
-            return fmt.Errorf("failed to parse answer: %v", err)
-        }
-        // Process answer...
-    }
-    return nil
-})
-
-// Join room
-if err := wsManager.JoinRoom("test-room"); err != nil {
-    log.Printf("Failed to join room: %v", err)
-}*/

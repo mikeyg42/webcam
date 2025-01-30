@@ -4,12 +4,13 @@ import "time"
 
 // Config holds all application configuration
 type Config struct {
-	WebSocketAddr   string
-	MailSlurpConfig MailSlurpConfig
-	VideoConfig     VideoConfig
-	MotionConfig    MotionConfig
-	RecordVideo     bool
-	WebrtcAuth      WebRTCAuth
+	WebSocketAddr           string
+	MailSlurpConfig         MailSlurpConfig
+	VideoConfig             VideoConfig
+	MotionConfig            MotionConfig
+	RecordVideo             bool
+	WebrtcAuth              WebRTCAuth
+	StatsCollectionInterval time.Duration
 }
 
 type MailSlurpConfig struct {
@@ -88,6 +89,7 @@ func NewDefaultConfig() *Config {
 			Username: "awsome",
 			Password: "awsome",
 		},
+		StatsCollectionInterval: 5 * time.Second,
 	}
 }
 

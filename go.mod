@@ -8,7 +8,6 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/mailslurp/mailslurp-client-go v0.0.0-20240603060551-5bc09baec5c5
-	github.com/pion/dtls v1.5.4
 	github.com/pion/mediadevices v0.7.0
 	github.com/pion/rtp v1.8.10
 	github.com/pion/turn/v4 v4.0.0
@@ -33,7 +32,6 @@ require (
 	github.com/pion/sdp/v3 v3.0.9 // indirect
 	github.com/pion/srtp/v3 v3.0.4 // indirect
 	github.com/pion/stun/v3 v3.0.0 // indirect
-	github.com/pion/transport v0.14.1 // indirect
 	github.com/pion/transport/v3 v3.0.7 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.32.0 // indirect

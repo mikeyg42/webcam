@@ -29,14 +29,21 @@ type TURNServer struct {
 	isRunning bool
 	done      chan struct{} // Missing channel for cleanup signaling
 	configs   *config.TURNConfigs
+	startTime time.Time
 }
 
-func (t *TURNServer) NewTURNServer(ctx context.Context) {
+type TURNStats struct {
+	ActiveAllocations int
+	Uptime            time.Duration
+	CurrentState      string
+}
+
+func (t *TURNServer) NewTURNServer(ctx context.Context) error {
 	TURNConfigs := t.configs
 
-	addr, err := net.ResolveUDPAddr("udp", "0.0.0.0:"+fmt.Sprintf("%s", TURNConfigs.Port))
+	addr, err := net.ResolveUDPAddr("udp", "0.0.0.0:"+fmt.Sprintf("%d", TURNConfigs.Port))
 	if err != nil {
-		log.Fatalf("Failed to parse server address: %s", err)
+		return fmt.Errorf("failed to parse server address: %s", err)
 	}
 
 	//Cache -users flag for easy lookup later
@@ -96,20 +103,16 @@ func (t *TURNServer) NewTURNServer(ctx context.Context) {
 			}
 			return nil, false
 		},
+
 		// PacketConnConfigs is a list of UDP Listeners and the configuration around them
 		PacketConnConfigs: packetConnConfigs,
 	})
 	if err != nil {
-		log.Panicf("Failed to create TURN server: %s", err)
+		return fmt.Errorf("failed to create TURN server: %s", err)
 	}
 
 	t.Server = s
-
-	if err = s.Close(); err != nil {
-		log.Panic("Failed to close TURN server")
-	} else {
-		return
-	}
+	return nil
 }
 
 func CreateTURNServer(ctx context.Context) (t *TURNServer) {
@@ -126,6 +129,7 @@ func CreateTURNServer(ctx context.Context) (t *TURNServer) {
 		mu:        sync.RWMutex{},
 		done:      make(chan struct{}), // Initialize the done channel
 		configs:   TURNConfigs,
+		startTime: time.Time{},
 	}
 
 	return t
@@ -134,12 +138,15 @@ func (t *TURNServer) Start() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.NewTURNServer(t.ctx)
-
 	if t.isRunning {
 		return fmt.Errorf("TURN server is already running")
 	}
 
+	if err := t.NewTURNServer(t.ctx); err != nil {
+		return fmt.Errorf("failed to initialize TURN server: %v", err)
+	}
+
+	t.startTime = time.Now()
 	// Start the server in a goroutine
 	go func() {
 		defer close(t.done) // Signal completion when the goroutine exits
@@ -241,13 +248,44 @@ func (t *TURNServer) IsRunning() bool {
 	return t.isRunning
 }
 
-// Get the current number of active connections
-func (t *TURNServer) GetActiveConnections() int {
+// GetState returns the current state of the TURN server
+func (t *TURNServer) GetState() string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	if t.Server != nil {
-		return t.Server.AllocationCount()
+	if t.Server == nil {
+		return "uninitialized"
 	}
-	return 0
+
+	if !t.isRunning {
+		return "stopped"
+	}
+
+	// Check if server is actually responding
+	if err := t.checkPorts(); err != nil {
+		return "degraded"
+	}
+
+	// Check allocation count to ensure server is accepting connections
+	if t.Server.AllocationCount() > 0 {
+		return "active"
+	}
+
+	return "idle"
+}
+
+// GetStats returns detailed statistics about the TURN server
+func (t *TURNServer) GetStats() TURNStats {
+
+	stats := TURNStats{
+		ActiveAllocations: 0,
+		Uptime:            time.Since(t.startTime),
+		CurrentState:      t.GetState(),
+	}
+
+	if t.Server != nil {
+		stats.ActiveAllocations = t.Server.AllocationCount()
+	}
+
+	return stats
 }

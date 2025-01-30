@@ -47,11 +47,6 @@ type ResponseCandidate struct {
 	Candidate *webrtc.ICECandidateInit `json:"candidate"`
 }
 
-type SendOffer struct {
-	SID   string                     `json:"sid"`
-	Offer *webrtc.SessionDescription `json:"offer"`
-}
-
 type SendAnswer struct {
 	SID    string                     `json:"sid"`
 	Answer *webrtc.SessionDescription `json:"answer"`
@@ -91,32 +86,53 @@ type DTLSConfig struct {
 
 // Manager handles WebRTC connection and signaling
 type Manager struct {
-	config                  *config.Config // from config package
-	PeerConnection          *webrtc.PeerConnection
-	connectionID            uint64
-	wsConnection            *websocket.Conn
-	mediaStream             mediadevices.MediaStream
-	camera                  mediadevices.MediaDeviceInfo
-	microphone              mediadevices.MediaDeviceInfo
-	recorder                *video.Recorder
-	pcConfiguration         webrtc.Configuration
-	mu                      *sync.RWMutex
-	ctx                     context.Context
-	cancel                  context.CancelFunc
-	done                    chan struct{}
-	dtlsConfig              *DTLSConfig
-	dtlsStateChan           chan webrtc.DTLSTransportState
-	connectionStateHandlers map[int64]func(webrtc.PeerConnectionState)
-	handlersLock            sync.RWMutex
-	nextHandlerID           int64
-	connectionAttempts      int
-	isNegotiating           atomic.Bool
-	needsRenegotiation      atomic.Bool
-	pendingOperations       []func() error
-	lastCodecSelector       *mediadevices.CodecSelector
-	turnServer              *TURNServer
-	rpcConn                 *jsonrpc2.Conn
-	handler                 *rtcHandler
+	config                   *config.Config // from config package
+	PeerConnection           *webrtc.PeerConnection
+	connectionID             uint64
+	wsConnection             *websocket.Conn
+	mediaStream              mediadevices.MediaStream
+	camera                   mediadevices.MediaDeviceInfo
+	microphone               mediadevices.MediaDeviceInfo
+	recorder                 *video.Recorder
+	pcConfiguration          webrtc.Configuration
+	mu                       *sync.RWMutex
+	ctx                      context.Context
+	cancel                   context.CancelFunc
+	done                     chan struct{}
+	dtlsConfig               *DTLSConfig
+	dtlsStateChan            chan webrtc.DTLSTransportState
+	connectionStateHandlers  map[int64]func(webrtc.PeerConnectionState)
+	handlersLock             sync.RWMutex
+	nextHandlerID            int64
+	connectionAttempts       int
+	isNegotiating            atomic.Bool
+	needsRenegotiation       atomic.Bool
+	pendingOperations        []func() error
+	lastCodecSelector        *mediadevices.CodecSelector
+	turnServer               *TURNServer
+	rpcConn                  *jsonrpc2.Conn
+	handler                  *rtcHandler
+	ConnectionDoctor         *ConnectionDoctor
+	MediaMode                string // "base", "moderate", or "aggressive"
+	LastConstraintChangeTime time.Time
+	MediaConstraints         struct {
+		base       MediaConstraints
+		moderate   MediaConstraints
+		aggressive MediaConstraints
+	}
+}
+type MediaConstraints struct {
+	Video struct {
+		Width     int
+		Height    int
+		FrameRate float32
+		BitRate   uint
+	}
+	Audio struct {
+		SampleRate   int
+		ChannelCount int
+		BitRate      uint
+	}
 }
 
 // ====================
@@ -166,14 +182,20 @@ func (h *rtcHandler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonr
 			return
 		}
 		h.manager.PeerConnection.AddICECandidate(candidate)
+	default:
+		conn.ReplyWithError(ctx, req.ID, &jsonrpc2.Error{
+			Code:    jsonrpc2.CodeMethodNotFound,
+			Message: fmt.Sprintf("method %s not found", req.Method),
+		})
 	}
+
 }
 
 //================
 
 // Initialize both TURN server and RPC connection
-func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
+	ctx, cancel := context.WithCancel(appCtx)
 
 	// Initialize TURN server first
 	turnServer := CreateTURNServer(ctx)
@@ -215,6 +237,8 @@ func NewManager(myconfig *config.Config, wsConn *websocket.Conn, recorder *video
 	m.handler = &rtcHandler{manager: m}
 	stream := jsonrpc2.NewBufferedStream(wsConn.UnderlyingConn(), jsonrpc2.VSCodeObjectCodec{})
 	m.rpcConn = jsonrpc2.NewConn(ctx, stream, m.handler)
+
+	m.ConnectionDoctor = m.NewConnectionDoctor(ctx)
 
 	return m, nil
 }
@@ -602,7 +626,7 @@ func (m *Manager) handleNegotiationNeeded() error {
 	}
 
 	log.Println("[handleNegotiationNeeded] Negotiation offer created and local description set")
-	return m.rpcConn.Call(m.ctx, "offer", offer, nil)
+	return m.SendOffer(&offer)
 }
 
 func (m *Manager) SendICECandidate(candidate *webrtc.ICECandidate) error {
@@ -1189,146 +1213,6 @@ func validateSDP(sd *webrtc.SessionDescription) error {
 	return nil
 }
 
-func (m *Manager) handleCriticalIssues(issues []string) {
-	// Log all issues
-	for _, issue := range issues {
-		log.Printf("Critical issue: %s", issue)
-	}
-
-	// Check connection state and attempt recovery
-	switch m.PeerConnection.ConnectionState() {
-	case webrtc.PeerConnectionStateFailed:
-		log.Println("Attempting ICE restart due to connection failure")
-		if err := m.handleConnectionFailure(); err != nil {
-			log.Printf("Failed to handle connection failure: %v", err)
-		}
-	case webrtc.PeerConnectionStateDisconnected:
-		log.Println("Connection disconnected, attempting to reconnect")
-		if err := m.handleDisconnection(); err != nil {
-			log.Printf("Failed to handle disconnection: %v", err)
-		}
-	default:
-		// If connection is still alive, adjust media constraints
-		m.adjustMediaConstraints(true)
-	}
-}
-
-func (m *Manager) adjustMediaConstraints(aggressive bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Define constraint values based on aggressive mode
-	videoConstraints := struct {
-		width     int
-		height    int
-		frameRate float32
-		bitRate   uint
-	}{}
-	// Set values based on aggressive mode
-	if aggressive {
-		videoConstraints.width = 320
-		videoConstraints.height = 240
-		videoConstraints.frameRate = 15
-		videoConstraints.bitRate = 150_000
-	} else {
-		videoConstraints.width = 480
-		videoConstraints.height = 360
-		videoConstraints.frameRate = 20
-		videoConstraints.bitRate = 500_000
-	}
-
-	audioConstraints := struct {
-		sampleRate   int
-		channelCount int
-		bitRate      uint
-	}{}
-
-	// Set audio constraints based on aggressive mode
-	if aggressive {
-		audioConstraints.sampleRate = 8000
-		audioConstraints.bitRate = 16000
-	} else {
-		audioConstraints.sampleRate = 16000
-		audioConstraints.bitRate = 32000
-	}
-	audioConstraints.channelCount = 1 // Always mono
-
-	// Create VP8 parameters
-	vpxParams, err := vpx.NewVP8Params()
-	if err != nil {
-		log.Printf("Failed to create VP8 params: %v", err)
-		return
-	}
-	vpxParams.BitRate = int(videoConstraints.bitRate)
-	if aggressive {
-		vpxParams.KeyFrameInterval = 30
-	} else {
-		vpxParams.KeyFrameInterval = 15
-	}
-
-	vpxParams.RateControlEndUsage = vpx.RateControlVBR
-
-	// Create Opus parameters
-	opusParams, err := opus.NewParams()
-	if err != nil {
-		log.Printf("Failed to create Opus params: %v", err)
-		return
-	}
-	opusParams.BitRate = int(audioConstraints.bitRate)
-	opusParams.Latency = opus.Latency20ms
-
-	// Create codec selector
-	codecSelector := mediadevices.NewCodecSelector(
-		mediadevices.WithVideoEncoders(&vpxParams),
-		mediadevices.WithAudioEncoders(&opusParams),
-	)
-
-	constraints := mediadevices.MediaStreamConstraints{
-		Video: func(c *mediadevices.MediaTrackConstraints) {
-			c.DeviceID = prop.String(m.camera.DeviceID)
-			c.FrameFormat = prop.FrameFormat(frame.FormatYUY2)
-			c.Width = prop.Int(videoConstraints.width)
-			c.Height = prop.Int(videoConstraints.height)
-			c.FrameRate = prop.Float(videoConstraints.frameRate)
-			c.DiscardFramesOlderThan = 500 * time.Millisecond
-		},
-		Audio: func(c *mediadevices.MediaTrackConstraints) {
-			c.DeviceID = prop.String(m.microphone.DeviceID)
-			c.SampleRate = prop.Int(audioConstraints.sampleRate)
-			c.ChannelCount = prop.Int(audioConstraints.channelCount)
-			c.Latency = prop.Duration(time.Millisecond * 50)
-		},
-		Codec: codecSelector,
-	}
-
-	// Get new media stream
-	stream, err := mediadevices.GetUserMedia(constraints)
-	if err != nil {
-		log.Printf("Failed to get user media with adjusted constraints: %v", err)
-		return
-	}
-
-	// Gracefully close old stream
-	if m.mediaStream != nil {
-		for _, track := range m.mediaStream.GetTracks() {
-			track.Close()
-		}
-	}
-
-	// Update stream and log changes
-	m.mediaStream = stream
-	log.Printf("Media constraints adjusted - Aggressive mode: %v", aggressive)
-	log.Printf("Video: %dx%d @%dfps, BitRate: %d",
-		videoConstraints.width,
-		videoConstraints.height,
-		int(videoConstraints.frameRate),
-		videoConstraints.bitRate)
-	log.Printf("Audio: %dHz, Channels: %d, BitRate: %d",
-		audioConstraints.sampleRate,
-		audioConstraints.channelCount,
-		audioConstraints.bitRate)
-}
-
 func (m *Manager) Shutdown(ctx context.Context) error {
 	if m.turnServer != nil {
 		if err := m.turnServer.Stop(); err != nil {
@@ -1410,4 +1294,21 @@ func (m *Manager) SetMicrophone(device mediadevices.MediaDeviceInfo) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.microphone = device
+}
+
+func (m *Manager) SendOffer(offer *webrtc.SessionDescription) error {
+	params := struct {
+		SDP  string `json:"sdp"`
+		Type string `json:"type"`
+	}{
+		SDP:  offer.SDP,
+		Type: offer.Type.String(),
+	}
+
+	var result interface{}
+	if err := m.rpcConn.Call(m.ctx, "offer", params, &result); err != nil {
+		return fmt.Errorf("offer request failed: %v", err)
+	}
+
+	return nil
 }
