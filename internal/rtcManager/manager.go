@@ -448,7 +448,18 @@ func (m *Manager) setupCallbacks() {
 			m.handleDisconnection()
 		case webrtc.PeerConnectionStateFailed:
 			log.Println("PeerConnection failed")
-			m.handleConnectionFailure()
+			select {
+			case m.ConnectionDoctor.warnings <- Warning{
+				Timestamp: time.Now().Format("15:04:05.000"),
+				Level:     CriticalLevel,
+				Type:      ConnWarning,
+				Message:   fmt.Sprintln("Peer Connection Failed! "),
+			}:
+			default:
+				log.Println("Warning channel ful")
+				m.handleDisconnection()
+			}
+
 		case webrtc.PeerConnectionStateClosed:
 			log.Println("PeerConnection closed")
 			m.Cleanup()
@@ -786,7 +797,7 @@ func (m *Manager) setupAudioTrack() (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSen
 	return audioTrack, audioRtpSender, nil
 }
 
-func (m *Manager) handleMediaPackets(srcTrack mediadevices.Track, localTrack *webrtc.TrackLocalStaticRTP, ssrc uint32, mtu int, isVideo bool) {
+func (m *Manager) handleMediaPackets(srcTrack mediadevices.Track, localTrack *webrtc.TrackLocalStaticRTP, ssrc uint32, mtu int) {
 	const maxBufferSize = 25 // Maximum number of packets to buffer
 	pktBuffer := make(chan []*rtp.Packet, maxBufferSize)
 	// We need the "codec name" for calling NewRTPReader, which generally is safe to assume is the second part of the MIME type
@@ -952,7 +963,7 @@ func (m *Manager) attachMediaKind(
 	// For each captured track from mediadevices, spawn a goroutine to handle its packets.
 	const mtu = 1200
 	for _, track := range mediaTracks {
-		go m.handleMediaPackets(track, localTrack, ssrc, mtu, isVideo)
+		go m.handleMediaPackets(track, localTrack, ssrc, mtu)
 	}
 }
 

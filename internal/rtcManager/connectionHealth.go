@@ -80,6 +80,7 @@ const (
 	ICEWarning
 	TURNWarning
 	SignalingWarning
+	ConnWarning
 )
 
 type RTCPFeedbackStats struct {
@@ -246,7 +247,6 @@ func (m *Manager) RespondToDoctorsWarnings() {
 	}
 }
 
-// Add this method to WarningTracker
 func (wt *WarningTracker) GetWarningCount(warningType WarningType, duration time.Duration) int {
 	wt.mu.RLock()
 	defer wt.mu.RUnlock()
@@ -622,11 +622,15 @@ func (cd *ConnectionDoctor) AccumulateNewStats() QualityMetrics {
 		case *webrtc.DataChannelStats:
 			// Monitor data channel health
 			if stat.State != webrtc.DataChannelStateOpen {
-				cd.warnings <- Warning{
+				select {
+				case cd.warnings <- Warning{
 					Timestamp: metrics.Timestamp.Format("15:04:05.000"),
 					Level:     InfoLevel,
 					Type:      SignalingWarning,
 					Message:   fmt.Sprintf("Data channel %s in state: %s", stat.Label, stat.State),
+				}:
+				case <-cd.ctx.Done():
+					return metrics
 				}
 			}
 		}
@@ -648,7 +652,7 @@ func (cd *ConnectionDoctor) AccumulateNewStats() QualityMetrics {
 
 	// Process RTCP feedback
 	if metrics.Network.Nacks > 0 || metrics.Network.Plis > 0 || metrics.Network.Firs > 0 {
-		cd.processRTCPStats(&metrics, &RTCPFeedbackStats{
+		cd.processRTCPStats(&RTCPFeedbackStats{
 			NACKCount: metrics.Network.Nacks,
 			PLICount:  metrics.Network.Plis,
 			FIRCount:  metrics.Network.Firs,
@@ -658,7 +662,7 @@ func (cd *ConnectionDoctor) AccumulateNewStats() QualityMetrics {
 	return metrics
 }
 
-func (cd *ConnectionDoctor) processRTCPStats(metrics *QualityMetrics, stat *RTCPFeedbackStats) {
+func (cd *ConnectionDoctor) processRTCPStats(stat *RTCPFeedbackStats) {
 	const (
 		nackThreshold = 10 // NACKs per second
 		pliThreshold  = 2  // PLIs per second
@@ -677,29 +681,44 @@ func (cd *ConnectionDoctor) processRTCPStats(metrics *QualityMetrics, stat *RTCP
 
 	// Check for excessive feedback
 	if nackRate > nackThreshold {
-		cd.warnings <- Warning{Timestamp: time.Now().Format("15:04:05.000"),
+		select {
+		case cd.warnings <- Warning{
+			Timestamp:   time.Now().Format("15:04:05.000"),
 			Level:       CriticalLevel,
 			Type:        PacketLossWarning,
 			Message:     fmt.Sprintf("High NACK rate: %.2f/s", nackRate),
 			Measurement: nackRate,
+		}:
+		case <-cd.ctx.Done():
+			return
 		}
 	}
 
 	if pliRate > pliThreshold {
-		cd.warnings <- Warning{Timestamp: time.Now().Format("15:04:05.000"),
+		select {
+		case cd.warnings <- Warning{
+			Timestamp:   time.Now().Format("15:04:05.000"),
 			Level:       CriticalLevel,
 			Type:        FramerateWarning,
 			Message:     fmt.Sprintf("High PLI rate: %.2f/s", pliRate),
 			Measurement: pliRate,
+		}:
+		case <-cd.ctx.Done():
+			return
 		}
 	}
 
 	if firRate > firThreshold {
-		cd.warnings <- Warning{Timestamp: time.Now().Format("15:04:05.000"),
+		select {
+		case cd.warnings <- Warning{
+			Timestamp:   time.Now().Format("15:04:05.000"),
 			Level:       CriticalLevel,
 			Type:        FramerateWarning,
 			Message:     fmt.Sprintf("High FIR rate: %.2f/s", firRate),
 			Measurement: firRate,
+		}:
+		case <-cd.ctx.Done():
+			return
 		}
 	}
 }
@@ -713,10 +732,15 @@ func (cd *ConnectionDoctor) processInboundStats(metrics *QualityMetrics, stat *w
 		if stat.FramesDecoded > 0 {
 			avgDecodeTime := stat.TotalDecodeTime / float64(stat.FramesDecoded)
 			if avgDecodeTime > 0.033 { // More than 33ms per frame
-				cd.warnings <- Warning{Timestamp: time.Now().Format("15:04:05.000"),
-					Level:   SuggestionLevel,
-					Type:    FramerateWarning,
-					Message: fmt.Sprintf("High decode time: %.2fms", avgDecodeTime*1000),
+				select {
+				case cd.warnings <- Warning{
+					Timestamp: time.Now().Format("15:04:05.000"),
+					Level:     SuggestionLevel,
+					Type:      FramerateWarning,
+					Message:   fmt.Sprintf("High decode time: %.2fms", avgDecodeTime*1000),
+				}:
+				case <-cd.ctx.Done():
+					return
 				}
 			}
 		}
@@ -750,10 +774,15 @@ func (cd *ConnectionDoctor) collectWSMetrics(metrics *QualityMetrics) {
 	err := cd.manager.wsConnection.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(time.Second))
 	if err != nil {
 		metrics.WSState = "Error"
-		cd.warnings <- Warning{Timestamp: time.Now().Format("15:04:05.000"),
-			Level:   CriticalLevel,
-			Type:    SignalingWarning,
-			Message: fmt.Sprintf("WebSocket ping failed: %v", err),
+		select {
+		case cd.warnings <- Warning{
+			Timestamp: time.Now().Format("15:04:05.000"),
+			Level:     CriticalLevel,
+			Type:      SignalingWarning,
+			Message:   fmt.Sprintf("WebSocket ping failed: %v", err),
+		}:
+		case <-cd.ctx.Done():
+			return
 		}
 		return
 	}
@@ -765,10 +794,15 @@ func (cd *ConnectionDoctor) collectWSMetrics(metrics *QualityMetrics) {
 	if cd.manager.rpcConn != nil {
 		jsonrpc_latency, err := cd.checkJSONRPCHealth()
 		if err != nil {
-			cd.warnings <- Warning{Timestamp: time.Now().Format("15:04:05.000"),
-				Level:   CriticalLevel,
-				Type:    SignalingWarning,
-				Message: fmt.Sprintf("JSON-RPC health check failed: %v", err),
+			select {
+			case cd.warnings <- Warning{
+				Timestamp: time.Now().Format("15:04:05.000"),
+				Level:     CriticalLevel,
+				Type:      SignalingWarning,
+				Message:   fmt.Sprintf("JSON-RPC health check failed: %v", err),
+			}:
+			case <-cd.ctx.Done():
+				return
 			}
 		} else {
 			metrics.JSONRPCLatency = jsonrpc_latency
@@ -885,11 +919,15 @@ func (cd *ConnectionDoctor) checkPackageLostRate(metrics QualityMetrics) {
 func (cd *ConnectionDoctor) checkConnectionStates(metrics QualityMetrics) {
 	// Check ICE State
 	if metrics.ICEState == webrtc.ICEConnectionStateFailed {
-		cd.warnings <- Warning{
+		select {
+		case cd.warnings <- Warning{
 			Timestamp: time.Now().Format("15:04:05.000"),
 			Level:     CriticalLevel,
 			Type:      ICEWarning,
 			Message:   "ICE connection failed",
+		}:
+		default:
+			log.Printf("Warning channel blocked, dropping ICE failure warning")
 		}
 	}
 

@@ -76,7 +76,7 @@ type DeviceInfo struct {
 
 type RecordingManager struct {
 	recorder       *video.Recorder
-	notifier       *notification.Notifier
+	notifier       notification.Notifier
 	isRecording    bool
 	cooldownTimer  *time.Timer
 	mu             sync.Mutex
@@ -188,20 +188,13 @@ func main() {
 func NewApplication(ctx context.Context, cfg *config.Config) (*Application, error) {
 	appCtx, cancel := context.WithCancel(ctx)
 
-	// Setup signal handling
-	notifier, err := notification.NewNotifier(&notification.MailSlurpConfig{
-		APIKey:   cfg.MailSlurpConfig.APIKey,
-		InboxID:  cfg.MailSlurpConfig.InboxID,
-		SMTPHost: cfg.MailSlurpConfig.SMTPHost,
-		SMTPPort: cfg.MailSlurpConfig.SMTPPort,
-		ToEmail:  cfg.MailSlurpConfig.ToEmail,
-	})
-	if err != nil {
-		cancel() // Clean up if we fail
-		return nil, fmt.Errorf("failed to create notifier: %v", err)
-	}
+	// MailSlurp notifications are temporarily disabled
+	log.Println("WARNING: Email notifications temporarily disabled")
+	// Use nil for the notifier pointer
+	var notifier *notification.Notifier = nil
 
-	motionDetector, err := motion.NewDetector(&cfg.MotionConfig, notifier)
+	// Create a motion detector with nil notifier
+	motionDetector, err := motion.NewDetector(&cfg.MotionConfig, nil)
 	if err != nil {
 		cancel() // Clean up if we fail
 		return nil, fmt.Errorf("failed to create motion detector: %v", err)
@@ -215,10 +208,11 @@ func NewApplication(ctx context.Context, cfg *config.Config) (*Application, erro
 		OutputPath: cfg.VideoConfig.OutputPath,
 	})
 
-	recordingManager := NewRecordingManager(ctx, videoRecorder, notifier)
+	recordingManager := NewRecordingManager(ctx, videoRecorder, nil)
 
 	// Connect to WebSocket
-	wsConn, _, err := websocket.DefaultDialer.Dial("ws://your-sfu:7000/ws", nil)
+	wsURL := fmt.Sprintf("ws://%s/ws", cfg.WebSocketAddr)
+	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to connect to WebSocket: %v", err)
@@ -529,9 +523,9 @@ func (app *Application) handleRecording(motionChan <-chan bool, frameChan <-chan
 			if err := app.videoRecorder.StartRecording(frameChan); err != nil {
 				log.Printf("Failed to start recording: %v", err)
 			}
-			if err := app.notifier.SendNotification(); err != nil {
-				log.Printf("Failed to send notification: %v", err)
-			}
+
+			// No need to check for notifier, just log directly
+			log.Printf("Motion detected at %s (email notifications disabled)", time.Now().Format(time.RFC1123))
 		} else {
 			if err := app.videoRecorder.StopRecording(); err != nil {
 				log.Printf("Failed to stop recording: %v", err)
@@ -673,7 +667,7 @@ func (fp *FrameProducer) Stop() {
 }
 
 // ....................
-func NewRecordingManager(ctx context.Context, recorder *video.Recorder, notifier *notification.Notifier) *RecordingManager {
+func NewRecordingManager(ctx context.Context, recorder *video.Recorder, notifier notification.Notifier) *RecordingManager {
 	rmCtx, cancel := context.WithCancel(ctx)
 
 	return &RecordingManager{
@@ -716,12 +710,16 @@ func (rm *RecordingManager) handleMotion(motionChan <-chan bool, frameChan <-cha
 				recordingStartTime = time.Now()
 				rm.isRecording = true
 
-				// Send notification with context
-				go func() {
-					if err := rm.notifier.SendNotification(); err != nil {
-						log.Printf("Failed to send notification: %v", err)
-					}
-				}()
+				// Send notification only if notifier is available
+				if rm.notifier != nil {
+					go func() {
+						if err := rm.notifier.SendNotification(); err != nil {
+							log.Printf("Failed to send notification: %v", err)
+						}
+					}()
+				} else {
+					log.Printf("Motion detected at %s (notifications disabled)", time.Now().Format(time.RFC1123))
+				}
 
 			} else if !motion && rm.isRecording {
 				// Check if minimum recording time has elapsed

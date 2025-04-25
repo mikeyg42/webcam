@@ -1,6 +1,9 @@
 package config
 
-import "time"
+import (
+	"os"
+	"time"
+)
 
 // Config holds all application configuration
 type Config struct {
@@ -57,15 +60,34 @@ type WebRTCAuth struct {
 
 // NewDefaultConfig returns a Config with default values
 func NewDefaultConfig() *Config {
+	// Get MailSlurp API key from environment, or use default for development
+	mailSlurpAPIKey := os.Getenv("MAILSLURP_API_KEY")
+	if mailSlurpAPIKey == "" {
+		mailSlurpAPIKey = "4f6d68998fd08a2d051c71dbaeadca66558e5a69edbc102134af9c3e0ac867bc"
+	}
+
+	// Get MailSlurp Inbox ID from environment, or use default for development
+	mailSlurpInboxID := os.Getenv("MAILSLURP_INBOX_ID")
+	if mailSlurpInboxID == "" {
+		mailSlurpInboxID = "f7c87f5b-54a1-43c5-91e6-6a3009d4e9a9"
+	}
+
+	// Get recipient email from environment, or use default for development
+	toEmail := os.Getenv("NOTIFICATION_EMAIL")
+	if toEmail == "" {
+		toEmail = "user-f7c87f5b-54a1-43c5-91e6-6a3009d4e9a9@mailslurp.biz"
+	}
+
 	return &Config{
 		RecordVideo:   true,
 		WebSocketAddr: "localhost:7000",
 		MailSlurpConfig: MailSlurpConfig{
 			SMTPHost: "mx.mailslurp.com",
 			SMTPPort: 2525,
-			APIKey:   "4f6d68998fd08a2d051c71dbaeadca66558e5a69edbc102134af9c3e0ac867bc",
-			InboxID:  "f7c87f5b-54a1-43c5-91e6-6a3009d4e9a9",
-			ToEmail:  "user-f7c87f5b-54a1-43c5-91e6-6a3009d4e9a9@mailslurp.biz",
+			APIKey:   mailSlurpAPIKey,
+			InboxID:  mailSlurpInboxID,
+			ToEmail:  toEmail,
+			Debug:    false, // Will be set via command line flag
 		},
 		VideoConfig: VideoConfig{
 			Width:      640,

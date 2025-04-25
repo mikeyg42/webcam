@@ -50,6 +50,20 @@ func (d *Detector) GetStats() MotionStats {
 	return d.stats
 }
 
+// Send notification asynchronously - only if notifier is available
+func (d *Detector) sendNotification() {
+	if d.notifier == nil {
+		log.Println("Motion detected (notifications disabled)")
+		return
+	}
+
+	go func() {
+		if err := d.notifier.SendNotification(); err != nil {
+			log.Printf("Failed to send notification: %v", err)
+		}
+	}()
+}
+
 // Detect processes incoming frames and detects motion
 func (d *Detector) Detect(frameChan <-chan gocv.Mat, motionChan chan<- bool) {
 	defer close(motionChan)
@@ -96,12 +110,8 @@ func (d *Detector) Detect(frameChan <-chan gocv.Mat, motionChan chan<- bool) {
 				lastNotification = time.Now()
 				motionChan <- true
 
-				// Send notification asynchronously
-				go func() {
-					if err := d.notifier.SendNotification(); err != nil {
-						log.Printf("Failed to send notification: %v", err)
-					}
-				}()
+				// Use the helper method instead of direct notification
+				d.sendNotification()
 			}
 		} else if currentlyDetectingMotion {
 			// If no motion detected and we're currently in motion detection state
@@ -137,16 +147,13 @@ func NewDetector(config *config.MotionConfig, notifier Notifier) (*Detector, err
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
-	if notifier == nil {
-		return nil, fmt.Errorf("notifier cannot be nil")
-	}
 
 	// Create background subtractor
 	mog2 := gocv.NewBackgroundSubtractorMOG2()
 
 	return &Detector{
 		config:       config,
-		notifier:     notifier,
+		notifier:     notifier, // Can be nil
 		mog2:         &mog2,
 		stats:        MotionStats{},
 		motionBuffer: make([]bool, config.MaxConsecutiveFrames),

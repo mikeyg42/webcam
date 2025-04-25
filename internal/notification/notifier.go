@@ -14,16 +14,23 @@ import (
 	mailslurp "github.com/mailslurp/mailslurp-client-go"
 )
 
+// Notifier interface for sending notifications
+type Notifier interface {
+	SendNotification() error
+}
+
 type MailSlurpConfig struct {
 	APIKey   string
 	InboxID  string
 	SMTPHost string
 	SMTPPort int
 	ToEmail  string
-	Debug    bool // when debug is set to true, the notifier will send a mocked security alert email along with some metrics and configs
+	Debug    bool 
+	NoAPIMode bool
 }
 
-type Notifier struct {
+// MailSlurpNotifier implements the Notifier interface using MailSlurp email service
+type MailSlurpNotifier struct {
 	config        *MailSlurpConfig
 	client        *mailslurp.APIClient
 	ctx           context.Context
@@ -33,6 +40,7 @@ type Notifier struct {
 	startupTime   time.Time
 	emailTemplate string
 	debug         bool
+	noAPIMode     bool
 }
 
 type EmailTemplate struct {
@@ -81,37 +89,33 @@ func (t *EmailTemplate) Execute(data EmailData) (string, error) {
 	return bodyBuffer.String(), nil
 }
 
-func NewNotifier(config *MailSlurpConfig) (*Notifier, error) {
+// NewMailSlurpNotifier creates a new notifier that uses MailSlurp for sending emails
+func NewMailSlurpNotifier(config *MailSlurpConfig) (*MailSlurpNotifier, error) {
 	ctx := context.WithValue(context.Background(), mailslurp.ContextAPIKey,
 		mailslurp.APIKey{Key: config.APIKey})
 
-	notifier := &Notifier{
-		config:      config,
-		client:      mailslurp.NewAPIClient(mailslurp.NewConfiguration()),
-		ctx:         ctx,
-		debug:       config.Debug,
-		startupTime: time.Now(),
+	// Create default email template
+	defaultTemplate := defaultEmailBody
+
+	notifier := &MailSlurpNotifier{
+		config:        config,
+		client:        mailslurp.NewAPIClient(mailslurp.NewConfiguration()),
+		ctx:           ctx,
+		debug:         config.Debug,
+		startupTime:   time.Now(),
+		emailTemplate: defaultTemplate, // Initialize the email template
 	}
 
-	if err := notifier.initialize(); err != nil {
-		return nil, err
-	}
-
-	// iff debug mode is enabled
-	if config.Debug {
-		debugCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-
-		if err := notifier.SendDebugEmail(debugCtx); err != nil {
-			log.Printf("Warning: Failed to send debug email: %v", err)
-			// Don't return error, continue initialization
+	if !notifier.noAPIMode {
+		if err := notifier.initialize(); err != nil {
+			return nil, err
 		}
 	}
 
 	return notifier, nil
 }
 
-func (n *Notifier) initialize() error {
+func (n *MailSlurpNotifier) initialize() error {
 	var err error
 	var inbox mailslurp.InboxDto
 
@@ -150,15 +154,21 @@ func (n *Notifier) initialize() error {
 	return nil
 }
 
-// Update SendNotification to use the new context-aware methods
-func (n *Notifier) SendNotification() error {
+// SendNotification sends a notification via email
+func (n *MailSlurpNotifier) SendNotification() error {
+	if n.noAPIMode {
+		log.Printf("MOTION DETECTED at %s (email notifications disabled)",
+			time.Now().Format(time.RFC1123))
+		return nil
+	}
+
 	ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
 	defer cancel()
 
 	return n.SendNotificationWithContext(ctx)
 }
 
-func (n *Notifier) SendNotificationWithContext(ctx context.Context) error {
+func (n *MailSlurpNotifier) SendNotificationWithContext(ctx context.Context) error {
 	if n.client == nil {
 		return fmt.Errorf("MailSlurp client not initialized")
 	}
@@ -177,7 +187,7 @@ func formatEmail(to, subject, body string) []byte {
 		"%s", to, subject, body))
 }
 
-func (n *Notifier) prepareEmailBody(ctx context.Context) (string, error) {
+func (n *MailSlurpNotifier) prepareEmailBody(ctx context.Context) (string, error) {
 	// Create template with context awareness
 	select {
 	case <-ctx.Done():
@@ -201,7 +211,7 @@ func (n *Notifier) prepareEmailBody(ctx context.Context) (string, error) {
 	}
 }
 
-func (n *Notifier) sendEmail(ctx context.Context) error {
+func (n *MailSlurpNotifier) sendEmail(ctx context.Context) error {
 	// Check context before proceeding
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("context error before sending email: %v", err)
@@ -239,13 +249,14 @@ func (n *Notifier) sendEmail(ctx context.Context) error {
 	return n.sendWithRetry(ctx, msg)
 }
 
-func (n *Notifier) Close() error {
+// Close closes any resources used by the notifier
+func (n *MailSlurpNotifier) Close() error {
 	// wait for pending notifications to complete
 	// Close any open connections
 	return nil
 }
 
-func (n *Notifier) sendWithRetry(ctx context.Context, msg []byte) error {
+func (n *MailSlurpNotifier) sendWithRetry(ctx context.Context, msg []byte) error {
 	retryConfig := RetryConfig{
 		MaxAttempts: 3,
 		Delay:       time.Second,
@@ -291,7 +302,7 @@ func (n *Notifier) sendWithRetry(ctx context.Context, msg []byte) error {
 	return fmt.Errorf("all retry attempts failed, last error: %v", lastErr)
 }
 
-func (n *Notifier) sendMailWithContext(ctx context.Context, msg []byte) error {
+func (n *MailSlurpNotifier) sendMailWithContext(ctx context.Context, msg []byte) error {
 	// Create a channel for the result
 	done := make(chan error, 1)
 
@@ -315,7 +326,7 @@ func (n *Notifier) sendMailWithContext(ctx context.Context, msg []byte) error {
 	}
 }
 
-func (n *Notifier) SendDebugEmail(ctx context.Context) error {
+func (n *MailSlurpNotifier) SendDebugEmail(ctx context.Context) error {
 	debugData := EmailData{
 		Time:     n.startupTime.Format(time.RFC3339),
 		Location: "System Startup",
