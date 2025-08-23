@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -14,6 +15,7 @@ type Config struct {
 	RecordVideo             bool
 	WebrtcAuth              WebRTCAuth
 	StatsCollectionInterval time.Duration
+	TailscaleConfig         TailscaleConfig
 }
 
 type MailSlurpConfig struct {
@@ -58,24 +60,33 @@ type WebRTCAuth struct {
 	Password string
 }
 
+type TailscaleConfig struct {
+	Enabled    bool
+	NodeName   string
+	AuthKey    string
+	DERPMap    string // Custom DERP server map URL if needed
+	Hostname   string // Tailscale hostname for this device
+	ListenPort int    // UDP port for Tailscale to listen on
+}
+
 // NewDefaultConfig returns a Config with default values
 func NewDefaultConfig() *Config {
 	// Get MailSlurp API key from environment, or use default for development
 	mailSlurpAPIKey := os.Getenv("MAILSLURP_API_KEY")
 	if mailSlurpAPIKey == "" {
-		mailSlurpAPIKey = "4f6d68998fd08a2d051c71dbaeadca66558e5a69edbc102134af9c3e0ac867bc"
+		mailSlurpAPIKey = "your-mailslurp-api-key-here" // Set MAILSLURP_API_KEY environment variable
 	}
 
 	// Get MailSlurp Inbox ID from environment, or use default for development
 	mailSlurpInboxID := os.Getenv("MAILSLURP_INBOX_ID")
 	if mailSlurpInboxID == "" {
-		mailSlurpInboxID = "f7c87f5b-54a1-43c5-91e6-6a3009d4e9a9"
+		mailSlurpInboxID = "your-inbox-id-here" // Set MAILSLURP_INBOX_ID environment variable
 	}
 
 	// Get recipient email from environment, or use default for development
 	toEmail := os.Getenv("NOTIFICATION_EMAIL")
 	if toEmail == "" {
-		toEmail = "user-f7c87f5b-54a1-43c5-91e6-6a3009d4e9a9@mailslurp.biz"
+		toEmail = "your-email@example.com" // Set NOTIFICATION_EMAIL environment variable
 	}
 
 	return &Config{
@@ -108,20 +119,29 @@ func NewDefaultConfig() *Config {
 			MinConsecutiveFrames: 3,
 		},
 		WebrtcAuth: WebRTCAuth{
-			Username: "awsome",
-			Password: "awsome",
+			Username: getEnvString("WEBRTC_USERNAME", "camera_user"),
+			Password: getEnvString("WEBRTC_PASSWORD", "change-this-password"),
 		},
 		StatsCollectionInterval: 5 * time.Second,
+		TailscaleConfig: TailscaleConfig{
+			Enabled:    getEnvBool("TAILSCALE_ENABLED", false),
+			NodeName:   getEnvString("TAILSCALE_NODE_NAME", "webcam-security"),
+			AuthKey:    os.Getenv("TAILSCALE_AUTH_KEY"),
+			DERPMap:    getEnvString("TAILSCALE_DERP_MAP", ""),
+			Hostname:   getEnvString("TAILSCALE_HOSTNAME", ""),
+			ListenPort: getEnvInt("TAILSCALE_LISTEN_PORT", 41641),
+		},
 	}
 }
 
+// GetTurnConfigs returns TURN server configuration (fallback when Tailscale is disabled)
 func GetTurnConfigs() *TURNConfigs {
 	return &TURNConfigs{
-		PublicIP:  "192.168.1.143",
-		Port:      3478,
-		Users:     "user1=pass1,user2=pass2,pion=ion,pion2=ion2",
-		Realm:     "pion.ly",
-		ThreadNum: 4,
+		PublicIP:  getEnvString("TURN_PUBLIC_IP", "127.0.0.1"), // Set to your local IP for network access
+		Port:      getEnvInt("TURN_PORT", 3478),
+		Users:     getEnvString("TURN_USERS", "camera_user=change-this-password"), // Should match WEBRTC_* vars
+		Realm:     getEnvString("TURN_REALM", "pion.ly"),
+		ThreadNum: getEnvInt("TURN_THREADS", 4),
 	}
 }
 
@@ -129,3 +149,27 @@ const (
 	MinBitrate = 100000  // 100 kbps
 	MaxBitrate = 2000000 // 2 Mbps
 )
+
+// Helper functions for environment variables
+func getEnvString(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		return value == "true" || value == "1"
+	}
+	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			return parsed
+		}
+	}
+	return defaultValue
+}

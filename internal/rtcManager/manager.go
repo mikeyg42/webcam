@@ -33,6 +33,7 @@ import (
 	"github.com/sourcegraph/jsonrpc2"
 
 	"github.com/mikeyg42/webcam/internal/config"
+	"github.com/mikeyg42/webcam/internal/tailscale"
 	"github.com/mikeyg42/webcam/internal/video"
 )
 
@@ -109,7 +110,7 @@ type Manager struct {
 	needsRenegotiation       atomic.Bool
 	pendingOperations        []func() error
 	lastCodecSelector        *mediadevices.CodecSelector
-	turnServer               *TURNServer
+	turnServer               *TURNServer\n	tailscaleManager         *tailscale.TailscaleManager
 	rpcConn                  *jsonrpc2.Conn
 	handler                  *rtcHandler
 	ConnectionDoctor         *ConnectionDoctor
@@ -198,7 +199,7 @@ func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websock
 	ctx, cancel := context.WithCancel(appCtx)
 
 	// Initialize TURN server first
-	turnServer := CreateTURNServer(ctx)
+	// Check if Tailscale is enabled and initialize accordingly\n	var tailscaleManager *tailscale.TailscaleManager\n	var turnServer *TURNServer\n	\n	if myconfig.TailscaleConfig.Enabled {\n		if err := tailscale.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {\n			log.Printf(\"Tailscale configuration invalid, falling back to TURN: %v\", err)\n			myconfig.TailscaleConfig.Enabled = false\n		} else {\n			var err error\n			tailscaleManager, err = tailscale.NewTailscaleManager(ctx, &myconfig.TailscaleConfig)\n			if err != nil {\n				log.Printf(\"Failed to initialize Tailscale, falling back to TURN: %v\", err)\n				myconfig.TailscaleConfig.Enabled = false\n			} else {\n				log.Println(\"Tailscale networking initialized for WebRTC\")\n			}\n		}\n	}\n	\n	if !myconfig.TailscaleConfig.Enabled {\n		turnServer = CreateTURNServer(ctx)\n	}
 
 	// Create ICE configuration with TURN server
 	pcConfig := webrtc.Configuration{

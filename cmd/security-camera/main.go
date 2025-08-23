@@ -219,7 +219,7 @@ func NewApplication(ctx context.Context, cfg *config.Config) (*Application, erro
 	}
 
 	// Create WebRTC manager with the WebSocket connection
-	webrtcManager, err := rtcManager.NewManager(appCtx, cfg, wsConn, videoRecorder)
+	// Use Tailscale-enabled manager if Tailscale is configured\n	var webrtcManager *rtcManager.Manager\n	var err error\n	\n	if cfg.TailscaleConfig.Enabled {\n		log.Println(\"Creating WebRTC manager with Tailscale support\")\n		webrtcManager, err = rtcManager.NewManagerWithTailscale(appCtx, cfg, wsConn, videoRecorder)\n	} else {\n		log.Println(\"Creating WebRTC manager with traditional networking\")\n		webrtcManager, err = rtcManager.NewManager(appCtx, cfg, wsConn, videoRecorder)\n	}
 	if err != nil {
 		cancel()
 		wsConn.Close()
