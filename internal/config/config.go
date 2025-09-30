@@ -9,7 +9,9 @@ import (
 // Config holds all application configuration
 type Config struct {
 	WebSocketAddr           string
-	MailSlurpConfig         MailSlurpConfig
+	EmailMethod             string // "mailersend", "gmail", or "disabled"
+	MailSendConfig          MailSendConfig
+	GmailOAuth2Config       GmailOAuth2Config
 	VideoConfig             VideoConfig
 	MotionConfig            MotionConfig
 	RecordVideo             bool
@@ -18,13 +20,22 @@ type Config struct {
 	TailscaleConfig         TailscaleConfig
 }
 
-type MailSlurpConfig struct {
-	APIKey   string
-	InboxID  string
-	SMTPHost string
-	SMTPPort int
-	ToEmail  string
-	Debug    bool
+type MailSendConfig struct {
+	APIToken  string
+	ToEmail   string
+	FromEmail string
+	Debug     bool
+}
+
+type GmailOAuth2Config struct {
+	ClientID           string
+	ClientSecret       string
+	ToEmail            string
+	FromEmail          string
+	RedirectURL        string
+	TokenStorePath     string
+	TokenEncryptionKey string
+	Debug              bool
 }
 
 type VideoConfig struct {
@@ -71,16 +82,10 @@ type TailscaleConfig struct {
 
 // NewDefaultConfig returns a Config with default values
 func NewDefaultConfig() *Config {
-	// Get MailSlurp API key from environment, or use default for development
-	mailSlurpAPIKey := os.Getenv("MAILSLURP_API_KEY")
-	if mailSlurpAPIKey == "" {
-		mailSlurpAPIKey = "your-mailslurp-api-key-here" // Set MAILSLURP_API_KEY environment variable
-	}
-
-	// Get MailSlurp Inbox ID from environment, or use default for development
-	mailSlurpInboxID := os.Getenv("MAILSLURP_INBOX_ID")
-	if mailSlurpInboxID == "" {
-		mailSlurpInboxID = "your-inbox-id-here" // Set MAILSLURP_INBOX_ID environment variable
+	// Get MailSend API token from environment, or use default for development
+	mailSendAPIToken := os.Getenv("MAILSEND_API_TOKEN")
+	if mailSendAPIToken == "" {
+		mailSendAPIToken = "your-mailsend-token-here" // Set MAILSEND_API_TOKEN environment variable
 	}
 
 	// Get recipient email from environment, or use default for development
@@ -89,16 +94,44 @@ func NewDefaultConfig() *Config {
 		toEmail = "your-email@example.com" // Set NOTIFICATION_EMAIL environment variable
 	}
 
+	// Get from email from environment, or use default
+	fromEmail := os.Getenv("FROM_EMAIL")
+	if fromEmail == "" {
+		fromEmail = "security@webcam-system.local"
+	}
+
+	// Determine email method priority
+	emailMethod := getEnvString("EMAIL_METHOD", "auto")
+	if emailMethod == "auto" {
+		// Auto-detect based on available configuration
+		if mailSendAPIToken != "" && mailSendAPIToken != "your-mailsend-token-here" {
+			emailMethod = "mailersend"
+		} else if os.Getenv("GMAIL_CLIENT_ID") != "" {
+			emailMethod = "gmail"
+		} else {
+			emailMethod = "disabled"
+		}
+	}
+
 	return &Config{
 		RecordVideo:   true,
-		WebSocketAddr: "localhost:7000",
-		MailSlurpConfig: MailSlurpConfig{
-			SMTPHost: "mx.mailslurp.com",
-			SMTPPort: 2525,
-			APIKey:   mailSlurpAPIKey,
-			InboxID:  mailSlurpInboxID,
-			ToEmail:  toEmail,
-			Debug:    false, // Will be set via command line flag
+		WebSocketAddr: "localhost:7001",
+		EmailMethod:   emailMethod,
+		MailSendConfig: MailSendConfig{
+			APIToken:  mailSendAPIToken,
+			ToEmail:   toEmail,
+			FromEmail: fromEmail,
+			Debug:     false, // Will be set via command line flag
+		},
+		GmailOAuth2Config: GmailOAuth2Config{
+			ClientID:           getEnvString("GMAIL_CLIENT_ID", ""),
+			ClientSecret:       getEnvString("GMAIL_CLIENT_SECRET", ""),
+			ToEmail:            toEmail,
+			FromEmail:          getEnvString("GMAIL_FROM_EMAIL", ""),
+			RedirectURL:        getEnvString("GMAIL_REDIRECT_URL", ""),
+			TokenStorePath:     getEnvString("GMAIL_TOKEN_PATH", "./gmail_token.json"),
+			TokenEncryptionKey: getEnvString("GMAIL_TOKEN_KEY", ""),
+			Debug:              false, // Will be set via command line flag
 		},
 		VideoConfig: VideoConfig{
 			Width:      640,
@@ -108,15 +141,15 @@ func NewDefaultConfig() *Config {
 			OutputPath: "recordings/",
 		},
 		MotionConfig: MotionConfig{
-			MinimumArea:          3000,
-			FrameSkip:            5,
-			Threshold:            25.0,
+			MinimumArea:          500,   // Much more sensitive - was 3000
+			FrameSkip:            2,     // Process every 2nd frame (every other frame) for verbose testing
+			Threshold:            20.0,  // Lower threshold - was 25.0
 			DilationSize:         3,
-			CooldownPeriod:       30 * time.Second,
-			NoMotionDelay:        10 * time.Second,
+			CooldownPeriod:       10 * time.Second,  // Shorter cooldown - was 30s
+			NoMotionDelay:        3 * time.Second,   // Shorter delay - was 10s
 			BlurSize:             7,
 			MaxConsecutiveFrames: 45,
-			MinConsecutiveFrames: 3,
+			MinConsecutiveFrames: 2,     // Need fewer consecutive frames - was 3
 		},
 		WebrtcAuth: WebRTCAuth{
 			Username: getEnvString("WEBRTC_USERNAME", "camera_user"),
@@ -138,7 +171,7 @@ func NewDefaultConfig() *Config {
 func GetTurnConfigs() *TURNConfigs {
 	return &TURNConfigs{
 		PublicIP:  getEnvString("TURN_PUBLIC_IP", "127.0.0.1"), // Set to your local IP for network access
-		Port:      getEnvInt("TURN_PORT", 3478),
+		Port:      getEnvInt("TURN_PORT", 3479),
 		Users:     getEnvString("TURN_USERS", "camera_user=change-this-password"), // Should match WEBRTC_* vars
 		Realm:     getEnvString("TURN_REALM", "pion.ly"),
 		ThreadNum: getEnvInt("TURN_THREADS", 4),

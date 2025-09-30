@@ -25,7 +25,7 @@ let tailscaleInfo = {
 
 // WebRTC Configuration - Enhanced for Tailscale
 let webrtcConfig = {
-    codec: 'vp8',
+    codec: 'vp9',
     iceServers: [
         // Default STUN server for initial connectivity
         { urls: "stun:stun.l.google.com:19302" }

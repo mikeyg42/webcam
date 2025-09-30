@@ -124,19 +124,32 @@ class TailscaleIntegration {
 
     getOptimizedIonSfuUrl() {
         if (!this.isConnected) {
+            console.log('Tailscale not connected, using default Ion SFU URL');
+
             return config.ionSfu.url;
         }
 
         // If ion-sfu is running on a Tailscale peer, use its Tailscale IP
-        const ionSfuPeer = Array.from(this.peers.values()).find(peer => 
-            peer.hostname.includes('ion-sfu') || peer.hostname.includes('sfu')
-        );
+        const ionSfuPeer = Array.from(this.peers.values()).find(peer => {
+            const hostname = peer.hostname.toLowerCase();
+            return hostname.includes('ion-sfu') || 
+                   hostname.includes('sfu') || 
+                   hostname.includes('media') ||
+                   peer.id === process.env.ION_SFU_PEER_ID; // Allow explicit peer ID
+        });
 
-        if (ionSfuPeer) {
-            const originalUrl = new URL(config.ionSfu.url);
-            return `${originalUrl.protocol}//${ionSfuPeer.ip}:${originalUrl.port || '7000'}${originalUrl.pathname}`;
+                if (ionSfuPeer) {
+            try {
+                const originalUrl = new URL(config.ionSfu.url.replace('ws:', 'http:').replace('wss:', 'https:'));
+                const optimizedUrl = `ws://${ionSfuPeer.ip}:${originalUrl.port || '7000'}${originalUrl.pathname}`;
+                console.log(`Using optimized Ion SFU URL via Tailscale: ${optimizedUrl}`);
+                return optimizedUrl;
+            } catch (error) {
+                console.error('Failed to create optimized Ion SFU URL:', error);
+            }
         }
 
+        console.log('No Ion SFU peer found, using default URL');
         return config.ionSfu.url;
     }
 
@@ -164,30 +177,158 @@ const tailscale = new TailscaleIntegration();
 // Initialize Express app
 const app = express();
 
+const ionSfuUrl = process.env.ION_SFU_URL || 'ws://localhost:7001/ws';
+const ionSfuWssUrl = ionSfuUrl.replace('ws://', 'wss://');
 // Security middleware with Tailscale-friendly CSP
-const cspDirectives = {
-    defaultSrc: ["'self'"],
-    scriptSrc: ["'self'", "unpkg.com"],
-    connectSrc: ["'self'", "ws:", "wss:", config.ionSfu.url],
-    imgSrc: ["'self'", "data:"],
-    styleSrc: ["'self'", "'unsafe-inline'"]
-};
+// Enhanced CSP configuration
+async function buildCSPDirectives() {
+    const baseDirectives = {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "https://unpkg.com", "'unsafe-eval'"],
+        connectSrc: ["'self'", "ws:", "wss:", "http:", "https:"],
+        mediaSrc: ["'self'", "blob:", "data:", "mediastream:"],
+        workerSrc: ["'self'", "blob:", "'unsafe-eval'"],
+        imgSrc: ["'self'", "data:", "blob:"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'none'"]
+    };
 
-// Add Tailscale IPs to CSP if available
-if (config.tailscale.enabled) {
-    cspDirectives.connectSrc.push("100.*", "fd7a:*"); // Tailscale IP ranges
+    // Add Ion SFU URLs
+    baseDirectives.connectSrc.push(ionSfuUrl, ionSfuWssUrl);
+
+    // Add Tailscale-specific URLs if connected
+    if (config.tailscale.enabled && tailscale.isConnected) {
+        // Add local Tailscale IP
+        if (tailscale.localIP) {
+            baseDirectives.connectSrc.push(
+                `ws://${tailscale.localIP}:*`,
+                `wss://${tailscale.localIP}:*`,
+                `http://${tailscale.localIP}:*`,
+                `https://${tailscale.localIP}:*`
+            );
+        }
+
+        // Add peer IPs
+        tailscale.getAllPeers().forEach(peer => {
+            baseDirectives.connectSrc.push(
+                `ws://${peer.ip}:*`,
+                `wss://${peer.ip}:*`,
+                `http://${peer.ip}:*`,
+                `https://${peer.ip}:*`
+            );
+        });
+
+        // Add Tailscale IP ranges (proper CIDR notation)
+        baseDirectives.connectSrc.push(
+            "ws://100.64.0.0/10",
+            "wss://100.64.0.0/10"
+        );
+    }
+
+    return baseDirectives;
 }
 
-app.use(helmet({
-    contentSecurityPolicy: {
-        directives: cspDirectives
-    }
-}));
+app.use(async (req, res, next) => {
+    const cspDirectives = await buildCSPDirectives();
+    
+    helmet({
+        contentSecurityPolicy: {
+            directives: cspDirectives
+        }
+    })(req, res, next);
+});
 
 app.use(cors(config.cors));
 app.use(express.json({ limit: '1mb' }));
 
-// Serve static files
+// Enhanced Tailscale auth middleware
+function tailscaleAuthMiddleware(req, res, next) {
+    if (!config.tailscale.enabled) {
+        return next();
+    }
+
+    // Get real client IP (handle proxies properly)
+    const clientIP = getClientIP(req);
+    console.log(`Auth check for IP: ${clientIP}`);
+
+    if (!isTailscaleIP(clientIP)) {
+        console.warn(`Access denied for non-Tailscale IP: ${clientIP}`);
+        return res.status(403).json({
+            error: 'Access denied',
+            message: 'This camera system is only accessible via Tailscale network'
+        });
+    }
+
+    // Enhanced peer validation with better error handling
+    if (tailscale.isConnected && !isKnownPeer(clientIP)) {
+        console.warn(`Access denied for unknown Tailscale peer: ${clientIP}`);
+        console.log(`Known peers: ${Array.from(tailscale.peers.values()).map(p => p.ip).join(', ')}`);
+        
+        return res.status(403).json({
+            error: 'Access denied',
+            message: 'Device not authorized in this Tailscale network',
+            debug: process.env.NODE_ENV === 'development' ? {
+                clientIP,
+                knownPeers: tailscale.getAllPeers().map(p => p.ip),
+                localIP: tailscale.localIP
+            } : undefined
+        });
+    }
+
+    console.log(`✅ Tailscale access granted for: ${clientIP}`);
+    next();
+}
+
+// Helper function to get real client IP
+function getClientIP(req) {
+    return req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+           req.headers['x-real-ip'] ||
+           req.connection.remoteAddress ||
+           req.socket.remoteAddress ||
+           req.ip;
+}
+
+// Enhanced IP validation
+function isTailscaleIP(ip) {
+    // Remove IPv6 prefix if present
+    const cleanIP = ip.replace(/^::ffff:/, '');
+    
+    // Tailscale IPv4 range: 100.64.0.0/10
+    if (cleanIP.startsWith('100.')) {
+        const parts = cleanIP.split('.');
+        if (parts.length === 4) {
+            const secondOctet = parseInt(parts[1], 10);
+            return secondOctet >= 64 && secondOctet <= 127;
+        }
+    }
+    
+    // Tailscale IPv6 range
+    if (cleanIP.startsWith('fd7a:115c:a1e0:')) {
+        return true;
+    }
+    
+    // Local development
+    return ['127.0.0.1', '::1', 'localhost'].includes(cleanIP);
+}
+
+function isKnownPeer(ip) {
+    const cleanIP = ip.replace(/^::ffff:/, '');
+    
+    // Allow local/self IP
+    if (cleanIP === tailscale.localIP || ['127.0.0.1', '::1'].includes(cleanIP)) {
+        return true;
+    }
+
+    // Check against known peers
+    return tailscale.getAllPeers().some(peer => peer.ip === cleanIP);
+}
+// Apply Tailscale authentication to all routes except health checks
+app.use('/api', tailscaleAuthMiddleware);
+app.use('/ws', tailscaleAuthMiddleware);
+
+// Serve static files with Tailscale authentication
+app.use(tailscaleAuthMiddleware);
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Tailscale status endpoint
@@ -198,6 +339,75 @@ app.get('/tailscale/status', (req, res) => {
 // Tailscale peers endpoint
 app.get('/tailscale/peers', (req, res) => {
     res.json(tailscale.getAllPeers());
+});
+
+// Debug endpoints (only in development)
+if (process.env.NODE_ENV === 'development') {
+    app.get('/debug/csp', async (req, res) => {
+        const cspDirectives = await buildCSPDirectives();
+        res.json({
+            csp: cspDirectives,
+            tailscale: tailscale.getLocalInfo(),
+            peers: tailscale.getAllPeers(),
+            clientIP: getClientIP(req)
+        });
+    });
+
+    app.get('/debug/network', (req, res) => {
+        res.json({
+            ionSfuUrl: config.ionSfu.url,
+            optimizedIonSfuUrl: tailscale.getOptimizedIonSfuUrl(),
+            tailscaleStatus: tailscale.getLocalInfo(),
+            peers: tailscale.getAllPeers(),
+            clientIP: getClientIP(req),
+            config: {
+                tailscaleEnabled: config.tailscale.enabled,
+                port: config.port,
+                host: config.host
+            }
+        });
+    });
+
+    app.get('/debug/rooms', (req, res) => {
+        const roomsInfo = [];
+        roomManager.rooms.forEach((room, roomId) => {
+            roomsInfo.push({
+                id: roomId,
+                clientCount: room.clients.size,
+                ionWsState: room.ionWsState,
+                reconnectAttempts: room.reconnectAttempts,
+                pendingMessages: room.pendingMessages.length,
+                tailscaleInfo: room.tailscaleInfo
+            });
+        });
+        res.json({
+            rooms: roomsInfo,
+            totalRooms: roomManager.rooms.size
+        });
+    });
+}
+
+// Authentication status endpoint
+app.get('/api/auth/status', (req, res) => {
+    const clientIP = req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'];
+
+    if (!config.tailscale.enabled) {
+        return res.json({
+            authenticated: true,
+            method: 'none',
+            message: 'Tailscale authentication disabled - using traditional setup',
+            clientIP: clientIP
+        });
+    }
+
+    res.json({
+        authenticated: true,
+        method: 'tailscale',
+        message: 'Access granted via Tailscale network',
+        clientIP: clientIP,
+        tailscaleConnected: tailscale.isConnected,
+        localTailscaleIP: tailscale.localIP
+    });
 });
 
 // Create HTTP server
@@ -427,10 +637,29 @@ const wss = new WebSocket.Server({
         if (!roomId) {
             console.warn('Client connection rejected: Missing roomId query parameter.');
             cb(false, 400, 'Room ID is required');
-        } else {
-            info.req.roomId = roomId;
-            cb(true);
+        } 
+        
+        // Apply Tailscale authentication to WebSocket connections
+        if (config.tailscale.enabled) {
+            const clientIP = getClientIP({ 
+                headers: info.req.headers,
+                connection: info.req.connection,
+                socket: info.req.socket
+            });
+
+            if (!isTailscaleIP(clientIP)) {
+                console.warn(`WebSocket rejected for non-Tailscale IP: ${clientIP}`);
+                return cb(false, 403, 'Tailscale authentication required');
+            }
+
+            if (tailscale.isConnected && !isKnownPeer(clientIP)) {
+                console.warn(`WebSocket rejected for unknown peer: ${clientIP}`);
+                return cb(false, 403, 'Unknown Tailscale peer');
+            }
         }
+
+        info.req.roomId = roomId;
+        cb(true);
     }
 });
 

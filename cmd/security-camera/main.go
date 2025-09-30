@@ -1,170 +1,120 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"image"
 	"log"
-	"net/url"
+	"math"
 	"os"
 	"os/signal"
-	"strings"
-	"sync"
-	"sync/atomic"
+
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/mediadevices"
 	"github.com/pion/mediadevices/pkg/driver"
-	"github.com/pion/webrtc/v4"
+
 	"gocv.io/x/gocv"
 
 	"github.com/mikeyg42/webcam/internal/config"
+	"github.com/mikeyg42/webcam/internal/framestream"
+	"github.com/mikeyg42/webcam/internal/gui"
+	"github.com/mikeyg42/webcam/internal/integration"
 	"github.com/mikeyg42/webcam/internal/motion"
 	"github.com/mikeyg42/webcam/internal/notification"
 	"github.com/mikeyg42/webcam/internal/rtcManager"
 	"github.com/mikeyg42/webcam/internal/validate"
 	"github.com/mikeyg42/webcam/internal/video"
 
-	_ "github.com/pion/mediadevices/pkg/driver/camera"     // This is required to register camera adapter
-	_ "github.com/pion/mediadevices/pkg/driver/microphone" // This is required to register microphone adapter
-	//_ "github.com/pion/mediadevices/pkg/driver/screen"
+	_ "github.com/pion/mediadevices/pkg/driver/camera"
+	_ "github.com/pion/mediadevices/pkg/driver/microphone"
 )
 
-// Application struct that holds all components
+// Application holds all system components
 type Application struct {
-	config              *config.Config
-	webrtcManager       *rtcManager.Manager
-	motionDetector      *motion.Detector
-	videoRecorder       *video.Recorder
-	wsConnection        *websocket.Conn
-	notifier            *notification.Notifier
-	frameProducer       *FrameProducer
-	recordingManager    *RecordingManager
-	selectedCameraIndex int
-	state               ApplicationState
-	stateMu             sync.RWMutex
-	startTime           time.Time
-	ctx                 context.Context
-	cancel              context.CancelFunc
+	config             *config.Config
+	webrtcManager      *rtcManager.Manager
+	motionDetector     *motion.Detector
+	videoRecorder      *video.Recorder
+	wsConnection       *websocket.Conn
+	notifier           *notification.Notifier
+	frameDistributor   *framestream.FrameDistributor
+	pipeline           *integration.Pipeline
+	selectedCamera     mediadevices.MediaDeviceInfo
+	selectedMicrophone mediadevices.MediaDeviceInfo
+	testingMode        bool
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
-type ApplicationState int
-
-const (
-	StateInitializing ApplicationState = iota
-	StateRunning
-	StateShuttingDown
-	StateStopped
-)
-
-type FrameProducer struct {
-	camera      *gocv.VideoCapture
-	frameChan   chan gocv.Mat
-	deviceIndex int
-	ctx         context.Context    // Add context
-	cancel      context.CancelFunc // Add cancel function
-}
-
-type DeviceInfo struct {
-	Device     mediadevices.MediaDeviceInfo
-	IsWorking  bool
-	DeviceName string
-	DeviceType string
-}
-
-type RecordingManager struct {
-	recorder       *video.Recorder
-	notifier       notification.Notifier
-	isRecording    bool
-	cooldownTimer  *time.Timer
-	mu             sync.Mutex
-	cooldownPeriod time.Duration
-	minRecordTime  time.Duration
-	ctx            context.Context
-	cancel         context.CancelFunc
-}
-
-type WebSocketManager struct {
-	conn            *websocket.Conn
-	url             url.URL
-	reconnectPeriod time.Duration
-	maxRetries      int
-	isConnected     bool
-	mu              sync.RWMutex
-	stopChan        chan struct{}
-	messageChan     chan []byte
-	ctx             context.Context
-	cancel          context.CancelFunc
-
-	// fields specific to ION-SFU
-	sessionID       string
-	pingInterval    time.Duration
-	writeTimeout    time.Duration
-	readTimeout     time.Duration
-	pendingRequests sync.Map      // Track pending RPC requests
-	messageID       atomic.Uint64 // For generating unique message IDs
-}
-
-// application state
-func (app *Application) setState(state ApplicationState) {
-	app.stateMu.Lock()
-	defer app.stateMu.Unlock()
-	app.state = state
-}
-
-func (app *Application) GetState() ApplicationState {
-	app.stateMu.RLock()
-	defer app.stateMu.RUnlock()
-	return app.state
+// CalibrationResult holds calibration values
+type CalibrationResult struct {
+	Baseline  float64
+	Threshold float64
 }
 
 func main() {
-	// Create root context
+	// Create root context for lifecycle management
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Setup signal handling for command line graceful shutd0own
+	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	// Load configuration - a file with some default values and general configuration settings
+	// Load and validate configuration
 	cfg := config.NewDefaultConfig()
-
-	// Validate configuration
 	if err := validate.ValidateConfig(cfg); err != nil {
 		log.Fatalf("Configuration validation failed: %v", err)
 	}
 
 	// Parse command line flags
-	flag.StringVar(&cfg.WebSocketAddr, "addr", cfg.WebSocketAddr, "WebSocket address to use")
-
-	// debug mode for the mailSlurpConfig simlpy sends us a test email upon loggin in when true
-	var debugMode bool
-	flag.BoolVar(&debugMode, "debug", false, "Enable debug mode with startup notification")
+	var (
+		debugMode   bool
+		testingMode bool
+	)
+	flag.StringVar(&cfg.WebSocketAddr, "addr", cfg.WebSocketAddr, "WebSocket server address")
+	flag.BoolVar(&debugMode, "debug", false, "Enable debug mode")
+	flag.BoolVar(&testingMode, "testing", false, "Testing mode (skip WebRTC)")
 	flag.Parse()
-	cfg.MailSlurpConfig.Debug = debugMode
 
-	// Create new application instance
-	app, err := NewApplication(ctx, cfg)
+	// Create application instance
+	app, err := NewApplication(ctx, cfg, testingMode)
 	if err != nil {
 		log.Fatalf("Failed to create application: %v", err)
 	}
 	defer app.Cleanup()
 
-	// Initialize the application
+	// Initialize all components
 	if err := app.Initialize(); err != nil {
-		log.Fatalf("Failed to initialize application: %v", err)
+		log.Fatalf("Failed to initialize: %v", err)
 	}
 
-	// Start application in goroutine
+	// Run calibration phase
+	calibration := app.runCalibrationPhase()
+
+	// Apply calibration to detector
+	app.motionDetector.SetCalibration(calibration.Baseline, calibration.Threshold)
+
+	// Wait for user to start detection
+	fmt.Println("\n================================")
+	fmt.Println("CALIBRATION COMPLETE")
+	fmt.Println("================================")
+	fmt.Print("Press ENTER to start motion detection: ")
+	bufio.NewReader(os.Stdin).ReadString('\n')
+
+	// Start main processing
 	errChan := make(chan error, 1)
 	go func() {
 		errChan <- app.startProcessing()
 	}()
 
-	// Wait for either error, shutdown signal, or context cancellation
+	// Wait for shutdown signal
 	select {
 	case err := <-errChan:
 		if err != nil && err != context.Canceled {
@@ -176,7 +126,7 @@ func main() {
 		log.Printf("Context cancelled")
 	}
 
-	// Initiate graceful shutdown
+	// Graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
@@ -185,21 +135,25 @@ func main() {
 	}
 }
 
-func NewApplication(ctx context.Context, cfg *config.Config) (*Application, error) {
+// NewApplication creates a new application instance
+func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (*Application, error) {
 	appCtx, cancel := context.WithCancel(ctx)
 
-	// MailSlurp notifications are temporarily disabled
-	log.Println("WARNING: Email notifications temporarily disabled")
-	// Use nil for the notifier pointer
-	var notifier *notification.Notifier = nil
-
-	// Create a motion detector with nil notifier
-	motionDetector, err := motion.NewDetector(&cfg.MotionConfig, nil)
+	// Setup email notifications
+	notifier, err := setupEmailNotifications(appCtx)
 	if err != nil {
-		cancel() // Clean up if we fail
+		log.Printf("Email setup failed: %v", err)
+		notifier = nil
+	}
+
+	// Create motion detector
+	motionDetector, err := motion.NewDetector(&cfg.MotionConfig, notifier)
+	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("failed to create motion detector: %v", err)
 	}
 
+	// Create video recorder
 	videoRecorder := video.NewRecorder(&video.VideoConfig{
 		Width:      cfg.VideoConfig.Width,
 		Height:     cfg.VideoConfig.Height,
@@ -208,565 +162,562 @@ func NewApplication(ctx context.Context, cfg *config.Config) (*Application, erro
 		OutputPath: cfg.VideoConfig.OutputPath,
 	})
 
-	recordingManager := NewRecordingManager(ctx, videoRecorder, nil)
+	var wsConn *websocket.Conn
+	var webrtcManager *rtcManager.Manager
 
-	// Connect to WebSocket
-	wsURL := fmt.Sprintf("ws://%s/ws", cfg.WebSocketAddr)
-	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("failed to connect to WebSocket: %v", err)
-	}
+	if !testingMode {
+		// Connect to WebSocket server
+		wsURL := fmt.Sprintf("ws://%s/ws?roomId=cameraRoom", cfg.WebSocketAddr)
+		log.Printf("Connecting to WebSocket: %s", wsURL)
 
-	// Create WebRTC manager with the WebSocket connection
-	// Use Tailscale-enabled manager if Tailscale is configured\n	var webrtcManager *rtcManager.Manager\n	var err error\n	\n	if cfg.TailscaleConfig.Enabled {\n		log.Println(\"Creating WebRTC manager with Tailscale support\")\n		webrtcManager, err = rtcManager.NewManagerWithTailscale(appCtx, cfg, wsConn, videoRecorder)\n	} else {\n		log.Println(\"Creating WebRTC manager with traditional networking\")\n		webrtcManager, err = rtcManager.NewManager(appCtx, cfg, wsConn, videoRecorder)\n	}
-	if err != nil {
-		cancel()
-		wsConn.Close()
-		return nil, fmt.Errorf("failed to create WebRTC manager: %v", err)
+		dialer := websocket.Dialer{
+			HandshakeTimeout: 10 * time.Second,
+		}
+		wsConn, _, err = dialer.Dial(wsURL, nil)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("WebSocket connection failed: %v", err)
+		}
+		log.Println("WebSocket connected")
+
+		// Create WebRTC manager
+		webrtcManager, err = rtcManager.NewManager(appCtx, cfg, wsConn, videoRecorder)
+		if err != nil {
+			cancel()
+			wsConn.Close()
+			return nil, fmt.Errorf("failed to create WebRTC manager: %v", err)
+		}
 	}
 
 	return &Application{
-		config:           cfg,
-		ctx:              appCtx,
-		cancel:           cancel,
-		motionDetector:   motionDetector,
-		videoRecorder:    videoRecorder,
-		notifier:         notifier,
-		recordingManager: recordingManager,
-		startTime:        time.Now(),
-		wsConnection:     wsConn,
-		webrtcManager:    webrtcManager,
+		config:         cfg,
+		ctx:            appCtx,
+		cancel:         cancel,
+		motionDetector: motionDetector,
+		videoRecorder:  videoRecorder,
+		notifier:       notifier,
+		wsConnection:   wsConn,
+		webrtcManager:  webrtcManager,
+		testingMode:    testingMode,
 	}, nil
 }
 
-func (app *Application) Cleanup() {
-	app.cancel() // Cancel context to signal all goroutines to stop
-
-	// clean up resources in reverse order
-	if app.videoRecorder != nil {
-		app.videoRecorder.StopRecording()
-	}
-	if app.motionDetector != nil {
-		app.motionDetector.Close()
-	}
-	if app.webrtcManager != nil {
-		app.webrtcManager.Cleanup()
-	}
-	if app.frameProducer != nil {
-		app.frameProducer.Stop()
-	}
-	if app.wsConnection != nil {
-		app.wsConnection.Close()
-	}
-}
-
+// Initialize sets up all components
 func (app *Application) Initialize() error {
+	log.Println("Initializing application...")
 
-	// Initialize WebRTC
-	codecSelector, err := app.webrtcManager.Initialize()
-	if err != nil {
-		return fmt.Errorf("failed to initialize WebRTC: %v", err)
-	}
+	var codecSelector *mediadevices.CodecSelector
+	var camera, microphone mediadevices.MediaDeviceInfo
+	var err error
 
-	// Select devices
-	camera, microphone, err := app.selectDevices(codecSelector)
-	if err != nil {
-		return fmt.Errorf("failed to select devices: %v", err)
-	}
-
-	if err := app.webrtcManager.SetupMediaTracks(camera, microphone, codecSelector); err != nil {
-		return fmt.Errorf("failed to setup media tracks: %v", err)
-	}
-
-	if err := app.webrtcManager.SetupSignaling(); err != nil {
-		return fmt.Errorf("failed to setup signaling: %v", err)
-	}
-
-	return app.waitForConnection(30 * time.Second)
-}
-
-// Block until PeerConnectionStateConnected occurs, or time out after 30 seconds.
-// If connected, return nil; otherwise, return a timeout error.”
-func (app *Application) waitForConnection(timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	// Create a channel to receive connection state
-	connected := make(chan struct{})
-
-	// Set up one-time connection check
-	var once sync.Once
-
-	checkFunc := func(state webrtc.PeerConnectionState) {
-		if state == webrtc.PeerConnectionStateConnected {
-			once.Do(func() {
-				close(connected)
-			})
-		}
-	}
-
-	// Add temp connection state handler that registers a callback for Pion’s OnConnectionStateChange internally
-	handlerID := app.webrtcManager.AddConnectionStateHandler(checkFunc)
-
-	// this will remove the handler after the function returns
-	defer app.webrtcManager.RemoveConnectionStateHandler(handlerID)
-
-	select {
-	case <-connected:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("connection timeout after %v", timeout)
-	}
-}
-
-func (app *Application) testDevice(device mediadevices.MediaDeviceInfo, codecSelector *mediadevices.CodecSelector) (*DeviceInfo, error) {
-	info := &DeviceInfo{
-		Device: device,
-	}
-
-	// Create a copy of the manager config just for testing
-	tempManager := app.webrtcManager
-
-	switch device.Kind {
-	case mediadevices.VideoInput:
-		// Set the device in manager temporarily
-		tempManager.SetCamera(device)
-
-		// Try to generate a stream with just video
-		stream, err := tempManager.GenerateStream(codecSelector)
-		if err != nil {
-			return info, fmt.Errorf("failed to generate video stream: %v", err)
-		}
-		defer func() {
-			for _, track := range stream.GetTracks() {
-				track.Close()
-			}
-		}()
-
-		// Check if we got video tracks
-		videoTracks := stream.GetVideoTracks()
-		if len(videoTracks) == 0 {
-			return info, fmt.Errorf("no video tracks in stream")
-		}
-
-		info.IsWorking = true
-		info.DeviceName = fmt.Sprintf("%s (Working Camera)", device.Label)
-
-	case mediadevices.AudioInput:
-		// Set the device in manager temporarily
-		tempManager.SetMicrophone(device)
-
-		// Try to generate a stream with just audio
-		stream, err := tempManager.GenerateStream(codecSelector)
-		if err != nil {
-			return info, fmt.Errorf("failed to generate audio stream: %v", err)
-		}
-		defer func() {
-			for _, track := range stream.GetTracks() {
-				track.Close()
-			}
-		}()
-
-		// Check if we got audio tracks
-		audioTracks := stream.GetAudioTracks()
-		if len(audioTracks) == 0 {
-			return info, fmt.Errorf("no audio tracks in stream")
-		}
-
-		info.IsWorking = true
-		info.DeviceName = fmt.Sprintf("%s (Working Microphone)", device.Label)
-	}
-
-	return info, nil
-}
-
-func (app *Application) selectDevices(codecSelector *mediadevices.CodecSelector) (camera, microphone mediadevices.MediaDeviceInfo, err error) {
-	// Enumerate available devices
-	devices := mediadevices.EnumerateDevices()
-
-	var workingCameras []*DeviceInfo
-	var workingMicrophones []*DeviceInfo
-
-	log.Println("Available devices:")
-	for _, device := range devices {
-		log.Printf("ID: %s | Label: %s | Kind: %v | DeviceType: %v ||\n",
-			device.DeviceID,
-			device.Label,
-			device.Kind,       // e.g. VideoInput, AudioInput
-			device.DeviceType, // e.g. "camera", "microphone", "screen"
-		)
-
-		// Skip screen capture devices
-		if device.DeviceType == driver.Screen {
-			log.Printf("Skipping screen device: %s", device.Label)
-			continue
-		}
-
-		// Skip specific device IDs (case insensitive)
-		if strings.Contains(strings.ToUpper(device.DeviceID), "3EB17E44") ||
-			strings.Contains(strings.ToUpper(device.Label), "3EB17E44") {
-			log.Printf("Skipping iPhone input: %s", device.Label)
-			continue
-		}
-
-		var info *DeviceInfo
-		var err error
-
-		info, err = app.testDevice(device, codecSelector)
-		if err != nil {
-			log.Printf("Device '%s' failed testing: %v", device.Label, err)
-			continue
-		}
-
-		if info.IsWorking {
-			switch device.Kind {
-			case mediadevices.VideoInput:
-				workingCameras = append(workingCameras, info)
-				log.Printf("Added working camera: %s", info.DeviceName)
-			case mediadevices.AudioInput:
-				workingMicrophones = append(workingMicrophones, info)
-				log.Printf("Added working microphone: %s", info.DeviceName)
-			}
-		}
-	}
-
-	if len(workingCameras) == 0 {
-		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
-			fmt.Errorf("no working cameras found")
-	}
-	if len(workingMicrophones) == 0 {
-		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
-			fmt.Errorf("no working microphones found")
-	}
-
-	if len(workingCameras) == 1 {
-		camera = workingCameras[0].Device
-		app.selectedCameraIndex = 0
-		fmt.Printf("\nAutomatically selected camera: %s\n", workingCameras[0].DeviceName)
+	if app.testingMode {
+		// Testing mode - basic setup
+		codecSelector = &mediadevices.CodecSelector{}
+		camera, microphone, err = app.selectDevicesForTesting()
 	} else {
-		// List available working cameras
-		fmt.Println("\nAvailable working cameras:")
-		for i, info := range workingCameras {
-			fmt.Printf("%d: %s\n", i, info.DeviceName)
-		}
-
-		// Select a camera
-		fmt.Print("Select a camera (0 for the first camera): ")
-		var cameraIndex int
-		_, err = fmt.Scan(&cameraIndex)
-		if err != nil || cameraIndex < 0 || cameraIndex >= len(workingCameras) {
-			return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
-				fmt.Errorf("invalid camera selection")
-		}
-		camera = workingCameras[cameraIndex].Device
-		app.selectedCameraIndex = cameraIndex
-	}
-
-	// List available working microphones
-	if len(workingMicrophones) == 1 {
-		microphone = workingMicrophones[0].Device
-		fmt.Printf("\nAutomatically selected microphone: %s\n", workingMicrophones[0].DeviceName)
-	} else {
-		fmt.Println("\nAvailable working microphones:")
-		for i, info := range workingMicrophones {
-			fmt.Printf("%d: %s\n", i, info.DeviceName)
-		}
-
-		// Select a microphone
-		fmt.Print("Select a microphone (0 for the first microphone): ")
-		var micIndex int
-		_, err = fmt.Scan(&micIndex)
+		// Production mode - full WebRTC setup
+		codecSelector, err = app.webrtcManager.Initialize()
 		if err != nil {
-			return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
-				fmt.Errorf("invalid microphone selection")
+			return fmt.Errorf("WebRTC initialization failed: %v", err)
 		}
-		microphone = workingMicrophones[micIndex].Device
+
+		camera, microphone, err = app.selectDevices(codecSelector)
 	}
 
-	return camera, microphone, nil
+	if err != nil {
+		return fmt.Errorf("device selection failed: %v", err)
+	}
+
+	app.selectedCamera = camera
+	app.selectedMicrophone = microphone
+
+	// Create frame distributor
+	app.frameDistributor, err = framestream.NewFrameDistributor(app.ctx, camera, codecSelector)
+	if err != nil {
+		return fmt.Errorf("failed to create frame distributor: %v", err)
+	}
+
+	// Create integration pipeline
+	app.pipeline = integration.NewPipeline(app.ctx, app.config, app.frameDistributor, 
+		app.motionDetector, app.videoRecorder)
+
+	// Setup WebRTC signaling
+	if !app.testingMode && app.webrtcManager != nil {
+		if err := app.webrtcManager.SetupSignaling(); err != nil {
+			return fmt.Errorf("signaling setup failed: %v", err)
+		}
+	}
+
+	log.Println("Initialization complete")
+	return nil
 }
 
+// runCalibrationPhase performs optical flow calibration
+func (app *Application) runCalibrationPhase() CalibrationResult {
+	fmt.Println("\n================================")
+	fmt.Println("MOTION DETECTION CALIBRATION")
+	fmt.Println("================================")
+	fmt.Println("Please ensure the camera view is EMPTY")
+	fmt.Println("No people, pets, or moving objects should be visible")
+	fmt.Print("\nPress ENTER when ready to calibrate: ")
+
+	bufio.NewReader(os.Stdin).ReadString('\n')
+
+	log.Println("Starting 10-second calibration...")
+
+	// Start frame distributor at FULL resolution (1280x720)
+	// It will stay running through calibration and into production
+	if err := app.frameDistributor.Start(1280, 720); err != nil {
+		log.Fatalf("Failed to start frame distributor: %v", err)
+	}
+
+	// Create channels for calibration
+	calibChan := make(chan gocv.Mat, 30)
+	doneChan := make(chan CalibrationResult, 1)
+
+	// Drain other channels during calibration
+	drainDone := make(chan struct{})
+	go app.drainChannelsDuringCalibration(drainDone)
+
+	// Run calibration processor
+	go app.runCalibrationProcessor(calibChan, doneChan)
+
+	// Feed frames to calibration
+	go app.feedCalibrationFrames(calibChan)
+
+	// Wait for calibration result
+	result := <-doneChan
+
+	// Stop draining (but keep frame distributor running!)
+	close(drainDone)
+
+	log.Printf("Calibration complete - Baseline: %.4f%%, Threshold: %.4f%%",
+		result.Baseline, result.Threshold)
+
+	return result
+}
+
+// drainChannelsDuringCalibration prevents channel overflow
+func (app *Application) drainChannelsDuringCalibration(done chan struct{}) {
+	vp9Chan := app.frameDistributor.GetVP9Channel()
+	recordChan := app.frameDistributor.GetRecordChannel()
+
+	for {
+		select {
+		case <-vp9Chan:
+			// Drain
+		case <-recordChan:
+			// Drain
+		case <-done:
+			// Calibration complete, stop draining
+			return
+		case <-app.ctx.Done():
+			return
+		}
+	}
+}
+
+// feedCalibrationFrames converts and feeds frames for calibration
+func (app *Application) feedCalibrationFrames(calibChan chan<- gocv.Mat) {
+	motionChan := app.frameDistributor.GetMotionChannel()
+	timeout := time.After(11 * time.Second)
+
+	defer close(calibChan)
+
+	for {
+		select {
+		case frame := <-motionChan:
+			if frame == nil {
+				continue
+			}
+			
+			// Convert to Mat
+			mat, err := imageToMat(frame)
+			if err != nil {
+				continue
+			}
+
+			// Non-blocking send
+			select {
+			case calibChan <- mat:
+			default:
+				mat.Close()
+			}
+
+		case <-timeout:
+			return
+		case <-app.ctx.Done():
+			return
+		}
+	}
+}
+
+// runCalibrationProcessor performs the actual calibration
+func (app *Application) runCalibrationProcessor(calibChan <-chan gocv.Mat, doneChan chan<- CalibrationResult) {
+	// Optical flow calibration components
+	var (
+		prevSmall = gocv.NewMat()
+		currSmall = gocv.NewMat()
+		flow      = gocv.NewMat()
+		tempGray  = gocv.NewMat()
+		tempSmall = gocv.NewMat()
+		magnitude = gocv.NewMat()
+	)
+
+	// Clean up when done
+	defer func() {
+		prevSmall.Close()
+		currSmall.Close()
+		flow.Close()
+		tempGray.Close()
+		tempSmall.Close()
+		magnitude.Close()
+	}()
+
+	samples := make([]float64, 0, 150)
+	startTime := time.Now()
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case frame, ok := <-calibChan:
+			if !ok {
+				// Channel closed, calculate result
+				result := calculateCalibrationResult(samples)
+				doneChan <- result
+				return
+			}
+
+			// Process frame with optical flow
+			motionArea := processCalibrationFrame(frame, &prevSmall, &currSmall, 
+				&flow, &tempGray, &tempSmall, &magnitude)
+			frame.Close()
+
+			if motionArea >= 0 {
+				samples = append(samples, motionArea)
+			}
+
+		case <-ticker.C:
+			elapsed := time.Since(startTime).Seconds()
+			remaining := 10.0 - elapsed
+			if remaining > 0 {
+				log.Printf("[Calibration] %.0f seconds remaining...", remaining)
+			}
+
+		case <-time.After(10 * time.Second):
+			// Timeout - calculate result
+			result := calculateCalibrationResult(samples)
+			doneChan <- result
+			return
+		}
+	}
+}
+
+// processCalibrationFrame analyzes a single frame during calibration
+func processCalibrationFrame(frame gocv.Mat, prevSmall, currSmall, flow, 
+	tempGray, tempSmall, magnitude *gocv.Mat) float64 {
+
+	// Convert to grayscale
+	if frame.Channels() > 1 {
+		gocv.CvtColor(frame, tempGray, gocv.ColorBGRToGray)
+	} else {
+		frame.CopyTo(tempGray)
+	}
+
+	// Downsample
+	size := image.Pt(tempGray.Cols()/2, tempGray.Rows()/2)
+	gocv.PyrDown(*tempGray, tempSmall, size, gocv.BorderDefault)
+
+	// First frame
+	if prevSmall.Empty() {
+		tempSmall.CopyTo(prevSmall)
+		return -1
+	}
+
+	// Copy current
+	tempSmall.CopyTo(currSmall)
+
+	// Calculate optical flow
+	gocv.CalcOpticalFlowFarneback(
+		*prevSmall, *currSmall, flow,
+		0.5, 3, 15, 3, 5, 1.2,
+		gocv.OptflowFarnebackGaussian,
+	)
+
+	// Analyze flow
+	motionArea := analyzeCalibrationFlow(*flow, magnitude)
+
+	// Swap frames
+	currSmall.CopyTo(prevSmall)
+
+	return motionArea
+}
+
+// analyzeCalibrationFlow computes motion area from optical flow
+func analyzeCalibrationFlow(flow gocv.Mat, magnitude *gocv.Mat) float64 {
+	if flow.Empty() {
+		return 0
+	}
+
+	flowChannels := gocv.Split(flow)
+	defer func() {
+		for _, ch := range flowChannels {
+			ch.Close()
+		}
+	}()
+
+	if len(flowChannels) < 2 {
+		return 0
+	}
+
+	// Calculate magnitude
+	gocv.Magnitude(flowChannels[0], flowChannels[1], magnitude)
+
+	// Create motion mask
+	mask := gocv.NewMat()
+	defer mask.Close()
+	gocv.Threshold(*magnitude, &mask, float32(0.3), 255, gocv.ThresholdBinary)
+
+	// Convert to uint8
+	maskU8 := gocv.NewMat()
+	defer maskU8.Close()
+	mask.ConvertTo(&maskU8, gocv.MatTypeCV8U)
+
+	// Calculate motion area percentage
+	motionPixels := gocv.CountNonZero(maskU8)
+	totalPixels := magnitude.Rows() * magnitude.Cols()
+
+	if totalPixels > 0 {
+		return float64(motionPixels) * 100.0 / float64(totalPixels)
+	}
+
+	return 0
+}
+
+// calculateCalibrationResult computes baseline and threshold from samples
+func calculateCalibrationResult(samples []float64) CalibrationResult {
+	if len(samples) < 10 {
+		log.Printf("Warning: Only %d calibration samples collected", len(samples))
+		return CalibrationResult{
+			Baseline:  0.5,
+			Threshold: 1.0,
+		}
+	}
+
+	// Calculate mean
+	sum := 0.0
+	for _, v := range samples {
+		sum += v
+	}
+	mean := sum / float64(len(samples))
+
+	// Calculate standard deviation
+	variance := 0.0
+	for _, v := range samples {
+		diff := v - mean
+		variance += diff * diff
+	}
+	stddev := math.Sqrt(variance / float64(len(samples)))
+
+	// Set baseline and threshold
+	baseline := mean + stddev
+	threshold := baseline + 0.05 // Hair trigger - very sensitive
+
+	log.Printf("[Calibration] Samples: %d, Mean: %.4f, StdDev: %.4f", 
+		len(samples), mean, stddev)
+
+	return CalibrationResult{
+		Baseline:  baseline,
+		Threshold: threshold,
+	}
+}
+
+// startProcessing begins main application processing
 func (app *Application) startProcessing() error {
-	app.setState(StateRunning)
-	defer app.setState(StateStopped)
+	log.Println("Starting main processing...")
 
-	frameProducer, err := NewFrameProducer(app.ctx, app.selectedCameraIndex) // You'll need to store this during device selection
-	if err != nil {
-		return fmt.Errorf("failed to create frame producer: %v", err)
+	// Frame distributor is ALREADY running from calibration phase!
+	// Don't start it again - that would cause "panic: close of closed channel"
+
+	// Start motion detector
+	if err := app.motionDetector.Start(); err != nil {
+		return fmt.Errorf("failed to start motion detector: %v", err)
 	}
-	app.frameProducer = frameProducer
 
-	motionChan := make(chan bool)
+	// Start integration pipeline
+	if err := app.pipeline.Start(); err != nil {
+		return fmt.Errorf("failed to start pipeline: %v", err)
+	}
 
-	// Start frame producer
-	app.frameProducer.Start()
+	log.Println("All systems running")
 
-	// Start motion detection
-	go app.motionDetector.Detect(app.frameProducer.frameChan, motionChan)
-
-	// start recording manager
-	go app.recordingManager.handleMotion(motionChan, app.frameProducer.frameChan)
-
-	// Start recording handler
-	go app.handleRecording(motionChan, app.frameProducer.frameChan)
-
-	go app.webrtcManager.ConnectionDoctor.StartStatsCollection(app.config.StatsCollectionInterval)
-
+	// Wait for context cancellation
 	<-app.ctx.Done()
 	return app.ctx.Err()
 }
 
-func (app *Application) handleRecording(motionChan <-chan bool, frameChan <-chan gocv.Mat) {
-	for motion := range motionChan {
-		if motion {
-			if err := app.videoRecorder.StartRecording(frameChan); err != nil {
-				log.Printf("Failed to start recording: %v", err)
-			}
-
-			// No need to check for notifier, just log directly
-			log.Printf("Motion detected at %s (email notifications disabled)", time.Now().Format(time.RFC1123))
-		} else {
-			if err := app.videoRecorder.StopRecording(); err != nil {
-				log.Printf("Failed to stop recording: %v", err)
-			}
-		}
-	}
-}
-
+// Shutdown performs graceful shutdown
 func (app *Application) Shutdown(ctx context.Context) error {
-	app.setState(StateShuttingDown)
-	// Create a channel to signal completion
+	log.Println("Shutting down...")
+
 	done := make(chan struct{})
 
 	go func() {
-		// Stop frame producer
-		if app.frameProducer != nil {
-			app.frameProducer.Stop()
+		// Stop components in reverse order
+		if app.pipeline != nil {
+			app.pipeline.Stop()
 		}
 
-		// Close WebSocket connection
-		if app.wsConnection != nil {
-			app.wsConnection.WriteMessage(
-				websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-			)
-			app.wsConnection.Close()
+		if app.frameDistributor != nil {
+			app.frameDistributor.Stop()
 		}
 
-		// Stop WebRTC
-		if app.webrtcManager != nil {
-			app.webrtcManager.Cleanup()
-		}
-
-		// Stop motion detector
 		if app.motionDetector != nil {
 			app.motionDetector.Close()
 		}
 
-		// Stop video recorder
 		if app.videoRecorder != nil {
 			app.videoRecorder.StopRecording()
+		}
+
+		if app.wsConnection != nil {
+			app.wsConnection.Close()
+		}
+
+		if app.webrtcManager != nil {
+			app.webrtcManager.Cleanup()
 		}
 
 		close(done)
 	}()
 
-	// Wait for shutdown to complete or context to timeout
 	select {
 	case <-done:
+		log.Println("Shutdown complete")
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("shutdown timed out: %v", ctx.Err())
+		return fmt.Errorf("shutdown timeout")
 	}
 }
 
-// ....................
+// Cleanup releases resources
+func (app *Application) Cleanup() {
+	app.cancel()
+	// Additional cleanup if needed
+}
 
-func NewFrameProducer(ctx context.Context, deviceIndex int) (*FrameProducer, error) {
-	// Create child context
-	fpCtx, cancel := context.WithCancel(ctx)
+// selectDevices selects camera and microphone (simplified for brevity)
+func (app *Application) selectDevices(codecSelector *mediadevices.CodecSelector) (
+	camera, microphone mediadevices.MediaDeviceInfo, err error) {
+	
+	// Using hardcoded devices as in your original
+	camera = mediadevices.MediaDeviceInfo{
+		DeviceID:   "hardcoded-camera-0",
+		Label:      "0x83330001d6c0103",
+		Kind:       mediadevices.VideoInput,
+		DeviceType: driver.Camera,
+	}
 
-	camera, err := gocv.OpenVideoCapture(deviceIndex)
+	microphone = mediadevices.MediaDeviceInfo{
+		DeviceID:   "hardcoded-microphone-2",
+		Label:      "4170706c65555342417564696f456e67696e653a4d61727368616c6c20456c656374726f6e69637320202020203a4d584c203939302055534220202020202020202020202020203a383333343030303a31",
+		Kind:       mediadevices.AudioInput,
+		DeviceType: driver.Microphone,
+	}
+
+	return camera, microphone, nil
+}
+
+// selectDevicesForTesting selects devices in testing mode
+func (app *Application) selectDevicesForTesting() (
+	mediadevices.MediaDeviceInfo, mediadevices.MediaDeviceInfo, error) {
+	
+	devices := mediadevices.EnumerateDevices()
+
+	var camera, microphone mediadevices.MediaDeviceInfo
+	var cameraFound, micFound bool
+
+	for _, device := range devices {
+		if device.Kind == mediadevices.VideoInput && !cameraFound {
+			camera = device
+			cameraFound = true
+		}
+		if device.Kind == mediadevices.AudioInput && !micFound {
+			microphone = device
+			micFound = true
+		}
+
+		if cameraFound && micFound {
+			break
+		}
+	}
+
+	if !cameraFound {
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{}, 
+			fmt.Errorf("no camera found")
+	}
+
+	return camera, microphone, nil
+}
+
+// setupEmailNotifications configures email alerts
+func setupEmailNotifications(ctx context.Context) (*notification.Notifier, error) {
+	result, err := gui.ShowEmailSetupDialog(ctx)
 	if err != nil {
-		cancel() // Clean up if we fail
-		return nil, fmt.Errorf("failed to open camera: %v", err)
+		return nil, err
 	}
 
-	return &FrameProducer{
-		camera:      camera,
-		frameChan:   make(chan gocv.Mat, 10),
-		deviceIndex: deviceIndex,
-		ctx:         fpCtx,
-		cancel:      cancel,
-	}, nil
-}
-
-func (fp *FrameProducer) Start() {
-	go func() {
-		defer fp.camera.Close()
-		defer fp.cancel() // Ensure context is cancelled when we're done
-
-		for {
-			select {
-			case <-fp.ctx.Done():
-				return
-			default:
-				img := gocv.NewMat()
-				if ok := fp.camera.Read(&img); !ok {
-					img.Close()
-					log.Printf("Failed to read frame, attempting recovery...")
-					if err := fp.attemptRecovery(); err != nil {
-						log.Printf("Recovery failed: %v", err)
-						return
-					}
-					continue
-				}
-
-				if img.Empty() {
-					img.Close()
-					continue
-				}
-
-				// Non-blocking send to channel
-				select {
-				case fp.frameChan <- img:
-					// Frame sent successfully
-				case <-fp.ctx.Done():
-					img.Close()
-					return
-				default:
-					// Channel full, drop frame
-					img.Close()
-				}
-			}
+	switch result.Method {
+	case gui.EmailMethodMailerSend:
+		notifier, err := notification.NewMailSendNotifier(result.MailerSendConfig, "WebCam Security")
+		if err != nil {
+			return nil, err
 		}
-	}()
+		var n notification.Notifier = notifier
+		return &n, nil
+
+	case gui.EmailMethodGmail:
+		notifier, err := notification.NewGmailNotifier(ctx, result.GmailConfig, "WebCam Security")
+		if err != nil {
+			return nil, err
+		}
+		var n notification.Notifier = notifier
+		return &n, nil
+
+	case gui.EmailMethodDisabled:
+		return nil, nil
+
+	default:
+		return nil, nil
+	}
 }
 
-func (fp *FrameProducer) attemptRecovery() error {
-	fp.camera.Close()
-	for i := 0; i < 3; i++ { // Try 3 times
-		select {
-		case <-fp.ctx.Done():
-			return fmt.Errorf("context cancelled during recovery")
-		case <-time.After(time.Second):
-			camera, err := gocv.OpenVideoCapture(fp.deviceIndex)
-			if err == nil {
-				fp.camera = camera
-				return nil
-			}
-			log.Printf("Recovery attempt %d failed: %v", i+1, err)
+// imageToMat converts image.Image to gocv.Mat
+func imageToMat(img image.Image) (gocv.Mat, error) {
+	bounds := img.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+
+	mat := gocv.NewMatWithSize(height, width, gocv.MatTypeCV8UC3)
+
+	// Simple conversion - can be optimized further
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			mat.SetUCharAt(y, x*3+2, uint8(r>>8))
+			mat.SetUCharAt(y, x*3+1, uint8(g>>8))
+			mat.SetUCharAt(y, x*3, uint8(b>>8))
 		}
 	}
-	return fmt.Errorf("failed to recover camera after 3 attempts")
+
+	return mat, nil
 }
 
-func (fp *FrameProducer) Stop() {
-	fp.cancel()
-}
-
-// ....................
-func NewRecordingManager(ctx context.Context, recorder *video.Recorder, notifier notification.Notifier) *RecordingManager {
-	rmCtx, cancel := context.WithCancel(ctx)
-
-	return &RecordingManager{
-		recorder:       recorder,
-		notifier:       notifier,
-		cooldownPeriod: 30 * time.Second,
-		minRecordTime:  10 * time.Second,
-		ctx:            rmCtx,
-		cancel:         cancel,
+// decodeFriendlyDeviceName converts hex-encoded labels
+func decodeFriendlyDeviceName(label string) string {
+	if decoded, err := hex.DecodeString(label); err == nil {
+		return string(decoded)
 	}
-}
-
-func (rm *RecordingManager) handleMotion(motionChan <-chan bool, frameChan <-chan gocv.Mat) {
-	var recordingStartTime time.Time
-
-	for {
-		select {
-		case <-rm.ctx.Done():
-			rm.stopRecording()
-			return
-
-		case motion, ok := <-motionChan:
-			if !ok {
-				rm.stopRecording()
-				return
-			}
-
-			rm.mu.Lock()
-			if motion && !rm.isRecording {
-				if rm.cooldownTimer != nil {
-					rm.cooldownTimer.Stop()
-				}
-
-				if err := rm.recorder.StartRecording(frameChan); err != nil {
-					log.Printf("Failed to start recording: %v", err)
-					rm.mu.Unlock()
-					continue
-				}
-
-				recordingStartTime = time.Now()
-				rm.isRecording = true
-
-				// Send notification only if notifier is available
-				if rm.notifier != nil {
-					go func() {
-						if err := rm.notifier.SendNotification(); err != nil {
-							log.Printf("Failed to send notification: %v", err)
-						}
-					}()
-				} else {
-					log.Printf("Motion detected at %s (notifications disabled)", time.Now().Format(time.RFC1123))
-				}
-
-			} else if !motion && rm.isRecording {
-				// Check if minimum recording time has elapsed
-				if time.Since(recordingStartTime) < rm.minRecordTime {
-					rm.mu.Unlock()
-					continue
-				}
-
-				// Start cooldown timer with context awareness
-				rm.cooldownTimer = time.AfterFunc(rm.cooldownPeriod, func() {
-					select {
-					case <-rm.ctx.Done():
-						return
-					default:
-						rm.mu.Lock()
-						if rm.isRecording {
-							if err := rm.recorder.StopRecording(); err != nil {
-								log.Printf("Failed to stop recording: %v", err)
-							}
-							rm.isRecording = false
-						}
-						rm.mu.Unlock()
-					}
-				})
-			}
-			rm.mu.Unlock()
-		}
-	}
-}
-
-func (rm *RecordingManager) stopRecording() {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	if rm.isRecording {
-		if err := rm.recorder.StopRecording(); err != nil {
-			log.Printf("Failed to stop recording during shutdown: %v", err)
-		}
-		rm.isRecording = false
-	}
-
-	if rm.cooldownTimer != nil {
-		rm.cooldownTimer.Stop()
-	}
-}
-
-func (rm *RecordingManager) Stop() {
-	rm.cancel()
-	rm.stopRecording()
+	return label
 }

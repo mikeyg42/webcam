@@ -17,7 +17,7 @@ const config = {
         methods: ['GET', 'POST']
     },
     ionSfu: {
-        url: process.env.ION_SFU_URL || 'ws://localhost:7000/ws',
+        url: process.env.ION_SFU_URL || 'ws://localhost:7001/ws',
         reconnectInterval: 5000,
         maxReconnectAttempts: 10
     },
@@ -31,19 +31,69 @@ const config = {
 const app = express();
 
 // Security middleware
+const ionSfuUrl = process.env.ION_SFU_URL || 'ws://localhost:7001/ws';
+const ionSfuWssUrl = ionSfuUrl.replace('ws://', 'wss://');
+
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", "unpkg.com"],
-            connectSrc: ["'self'", "ws:", "wss:", config.ionSfu.url], // Allow connection to SFU
-            imgSrc: ["'self'", "data:"],
-            styleSrc: ["'self'", "'unsafe-inline'"]
+            scriptSrc: ["'self'", "https://unpkg.com", "'unsafe-eval'"],
+            connectSrc: ["'self'", "ws:", "wss:", ionSfuUrl, ionSfuWssUrl],
+            mediaSrc: ["'self'", "blob:", "data:"],
+            workerSrc: ["'self'", "blob:"],
+            imgSrc: ["'self'", "data:", "blob:"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            objectSrc: ["'none'"],
+            frameAncestors: ["'none'"]
         }
     }
 }));
 app.use(cors(config.cors));
 app.use(express.json({ limit: '1mb' }));
+
+// Tailscale authentication middleware (for when TAILSCALE_ENABLED=true)
+function tailscaleAuthMiddleware(req, res, next) {
+    const tailscaleEnabled = process.env.TAILSCALE_ENABLED === 'true';
+
+    if (!tailscaleEnabled) {
+        // If Tailscale is not enabled, allow all requests (traditional setup)
+        return next();
+    }
+
+    const clientIP = req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'];
+
+    // Check if the request is coming from a Tailscale IP range
+    const isTailscaleIP = (ip) => {
+        // Tailscale IP ranges: 100.64.0.0/10 and fd7a:115c:a1e0::/48
+        if (ip.startsWith('100.')) {
+            const parts = ip.split('.');
+            const secondOctet = parseInt(parts[1], 10);
+            return secondOctet >= 64 && secondOctet <= 127;
+        }
+        if (ip.startsWith('fd7a:115c:a1e0:')) {
+            return true;
+        }
+        // Also allow localhost for development
+        return ip === '127.0.0.1' || ip === '::1' || ip === 'localhost';
+    };
+
+    if (!isTailscaleIP(clientIP)) {
+        console.warn(`Access denied for non-Tailscale IP: ${clientIP}`);
+        return res.status(403).json({
+            error: 'Access denied',
+            message: 'This camera system is only accessible via Tailscale network'
+        });
+    }
+
+    console.log(`Tailscale access granted for IP: ${clientIP}`);
+    next();
+}
+
+// Apply Tailscale authentication when enabled
+if (process.env.TAILSCALE_ENABLED === 'true') {
+    app.use(tailscaleAuthMiddleware);
+}
 
 // Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
@@ -113,7 +163,9 @@ class Room {
             // Optionally skip broadcasting back to the sender
             if (client !== senderClient && client.readyState === WebSocket.OPEN) {
                 try {
-                    client.send(message);
+                    // Ensure message is sent as text
+                    const messageText = typeof message === 'string' ? message : String(message);
+                    client.send(messageText);
                 } catch (error) {
                     console.error(`Error broadcasting to client ${client.id} in room ${this.id}:`, error);
                 }
@@ -123,9 +175,17 @@ class Room {
 
     forwardToIon(message) {
          if (this.ionWs && this.ionWsState === 'open') {
-            this.ionWs.send(message);
+            // Ensure message is sent as text to ion-sfu
+           // const messageText = Buffer.isBuffer(message) ? message.toString('utf8') :
+                //               typeof message === 'string' ? message : String(message);
+           // this.ionWs.send(messageText);
+           this.ionWs.send(message);
         } else {
-            this.pendingMessages.push(message);
+            // Store as text for pending messages
+            //const messageText = Buffer.isBuffer(message) ? message.toString('utf8') :
+           //                   typeof message === 'string' ? message : String(message);
+            //this.pendingMessages.push(messageText);
+            this.pendingMessages.push(message)
              // Attempt to connect if not already trying
             if (this.ionWsState === 'closed') {
                  this.ensureIonConnection();
@@ -157,8 +217,17 @@ class Room {
         });
 
         this.ionWs.on('message', (message) => {
+            // Ensure message is sent as text to browser clients
+            let messageText;
+            if (Buffer.isBuffer(message)) {
+                messageText = message.toString('utf8');
+            } else if (typeof message === 'string') {
+                messageText = message;
+            } else {
+                messageText = String(message);
+            }
             // Broadcast message from ion-sfu to all clients in this room
-            this.broadcast(message);
+            this.broadcast(messageText);
         });
 
         this.ionWs.on('close', () => {
@@ -290,6 +359,114 @@ const heartbeatInterval = setInterval(() => {
 wss.on('close', () => {
     clearInterval(heartbeatInterval);
 });
+
+// API Routes
+// Authentication status endpoint
+app.get('/api/auth/status', (req, res) => {
+    const clientIP = req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'];
+    const tailscaleEnabled = process.env.TAILSCALE_ENABLED === 'true';
+
+    if (!tailscaleEnabled) {
+        return res.json({
+            authenticated: true,
+            method: 'none',
+            message: 'Traditional setup - no additional authentication required',
+            clientIP: clientIP
+        });
+    }
+
+    res.json({
+        authenticated: true,
+        method: 'tailscale',
+        message: 'Access granted via Tailscale network',
+        clientIP: clientIP
+    });
+});
+
+// Endpoint to provide WebRTC configuration with proper credentials
+app.get('/api/webrtc-config', (req, res) => {
+    const webrtcUsername = process.env.WEBRTC_USERNAME || 'camera_user';
+    const webrtcPassword = process.env.WEBRTC_PASSWORD || 'change-this-password';
+    const turnPublicIp = process.env.TURN_PUBLIC_IP || '127.0.0.1';
+    const turnPort = process.env.TURN_PORT || '3478';
+
+    const webrtcConfig = {
+        codec: 'vp9',
+        iceServers: [
+            // Public STUN server (for NAT traversal assistance)
+            { urls: "stun:stun.l.google.com:19302" },
+            // TURN server configuration with dynamic credentials
+            {
+                urls: `turn:${turnPublicIp}:${turnPort}?transport=udp`,
+                username: webrtcUsername,
+                credential: webrtcPassword
+            },
+            {
+                urls: `turn:${turnPublicIp}:${turnPort}?transport=tcp`,
+                username: webrtcUsername,
+                credential: webrtcPassword
+            }
+        ],
+        iceTransportPolicy: 'all' // Allow both direct and relayed connections
+    };
+
+    res.json(webrtcConfig);
+});
+
+// Debug endpoints (only in development)
+if (process.env.NODE_ENV === 'development') {
+    app.get('/debug/csp', (req, res) => {
+        const cspDirectives = {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", "https://unpkg.com", "'unsafe-eval'"],
+            connectSrc: ["'self'", "ws:", "wss:", ionSfuUrl, ionSfuWssUrl],
+            mediaSrc: ["'self'", "blob:", "data:"],
+            workerSrc: ["'self'", "blob:"],
+            imgSrc: ["'self'", "data:", "blob:"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            objectSrc: ["'none'"],
+            frameAncestors: ["'none'"]
+        };
+        res.json({
+            csp: cspDirectives,
+            tailscale: { enabled: false },
+            peers: [],
+            clientIP: req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for']
+        });
+    });
+
+    app.get('/debug/network', (req, res) => {
+        res.json({
+            ionSfuUrl: config.ionSfu.url,
+            optimizedIonSfuUrl: config.ionSfu.url,
+            tailscaleStatus: { enabled: false },
+            peers: [],
+            clientIP: req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'],
+            config: {
+                tailscaleEnabled: false,
+                port: config.port,
+                host: config.host
+            }
+        });
+    });
+
+    app.get('/debug/rooms', (req, res) => {
+        const roomsInfo = [];
+        roomManager.rooms.forEach((room, roomId) => {
+            roomsInfo.push({
+                id: roomId,
+                clientCount: room.clients.size,
+                ionWsState: room.ionWsState,
+                reconnectAttempts: room.reconnectAttempts,
+                pendingMessages: room.pendingMessages.length
+            });
+        });
+        res.json({
+            rooms: roomsInfo,
+            totalRooms: roomManager.rooms.size
+        });
+    });
+}
 
 // Error handling middleware
 app.use((err, req, res, next) => {

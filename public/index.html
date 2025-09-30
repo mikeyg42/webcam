@@ -8,35 +8,43 @@
             font-family: Arial, sans-serif;
             margin: 20px;
         }
-        .video-container {
+        #video-container {
             margin-top: 20px;
-            padding: 10px;
-            border: 1px solid #ccc;
-            min-height: 240px;
-            position: relative;
+            padding: 20px;
+            border: 2px solid #333;
+            border-radius: 8px;
+            background-color: #f9f9f9;
+            text-align: center;
+        }
+        #stream-info {
+            margin-bottom: 15px;
+        }
+        #stream-info h3 {
+            margin: 0 0 10px 0;
+            color: #333;
+        }
+        #stream-info p {
+            margin: 0;
+            color: #666;
+            font-style: italic;
         }
         #remotes {
-            margin-top: 20px;
-        }
-        #local {
-            width: 240px;
-            height: 180px;
-            border: 1px solid #ddd;
-            margin-right: 10px;
-            display: inline-block;
-            vertical-align: top;
+            min-height: 360px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            flex-wrap: wrap;
         }
         video {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
+            max-width: 100%;
+            height: auto;
+            border: 2px solid #333;
+            border-radius: 4px;
+            background: #000;
         }
         #remotes video {
-            width: 320px;
-            height: 240px;
-            display: inline-block;
-            margin: 5px;
-            border: 1px solid #eee;
+            width: 640px;
+            height: 480px;
         }
         #status {
             padding: 10px;
@@ -63,17 +71,13 @@
 </head>
 <body>
     <div id="status">Connection Status: Initializing...</div>
-    <div>
-        <div id="local" class="video-container">
-            <span style="position: absolute; margin: 5px;">
-                Local camera
-            </span>
+
+    <div id="video-container" class="video-container">
+        <div id="stream-info">
+            <h3>Security Camera Feed</h3>
+            <p>Waiting for security camera stream...</p>
         </div>
-        <div id="remotes" class="video-container">
-            <span style="position: absolute; margin: 5px;">
-                Waiting for video stream...
-            </span>
-        </div>
+        <div id="remotes"></div>
     </div>
     <div id="debug">Debug Messages:</div>
 

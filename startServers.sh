@@ -39,8 +39,8 @@ echo "Starting ion-sfu server..."
 if ! docker run --platform=linux/amd64 \
     --name ion-sfu-instance \
     -d --add-host=host.docker.internal:host-gateway \
-    -p 7000:7000 -p 5000-5200:5000-5200/udp \
-    -p 3478:3478/udp \
+    -p 7001:7000 -p 5000-5200:5000-5200/udp \
+    -p 3480:3478/udp \
     -v $(pwd)/configs/sfu.toml:/configs/sfu.toml \
     pionwebrtc/ion-sfu:latest-jsonrpc; then
     echo "Failed to start ion-sfu container. Please check docker logs (docker logs ion-sfu-instance) for details."
@@ -49,7 +49,7 @@ if ! docker run --platform=linux/amd64 \
 fi
 
 # Wait for ion-sfu JSON-RPC endpoint to be ready
-echo "Waiting for ion-sfu JSON-RPC (ws://localhost:7000/ws) to be ready..."
+echo "Waiting for ion-sfu JSON-RPC (ws://localhost:7001/ws) to be ready..."
 timeout=30
 elapsed=0
 # We can't directly curl a WebSocket, so we'll check the HTTP endpoint if available
@@ -69,6 +69,7 @@ echo "ion-sfu container started. Node.js server will attempt to connect."
 
 # Start Node.js server with nodemon for development
 echo "Starting Node.js server..."
+export ION_SFU_URL=ws://localhost:7001/ws
 if command -v nodemon &> /dev/null; then
     nodemon server.js
 else

@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/mikeyg42/webcam/internal/config"

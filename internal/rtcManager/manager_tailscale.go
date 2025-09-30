@@ -89,7 +89,10 @@ func NewManagerWithTailscale(appCtx context.Context, myconfig *config.Config, ws
 
 	// Create RPC handler and connection
 	m.handler = &rtcHandler{manager: m}
-	stream := jsonrpc2.NewBufferedStream(wsConn.UnderlyingConn(), jsonrpc2.VSCodeObjectCodec{})
+
+	// Create a WebSocket adapter for jsonrpc2
+	wsAdapter := &websocketAdapter{conn: wsConn}
+	stream := jsonrpc2.NewBufferedStream(wsAdapter, jsonrpc2.PlainObjectCodec{})
 	m.rpcConn = jsonrpc2.NewConn(ctx, stream, m.handler)
 
 	m.ConnectionDoctor = m.NewConnectionDoctor(ctx)

@@ -315,7 +315,7 @@ func (m *Manager) resetMediaConstraints() {
 	constraints := mediadevices.MediaStreamConstraints{
 		Video: func(c *mediadevices.MediaTrackConstraints) {
 			c.DeviceID = prop.String(m.camera.DeviceID)
-			c.FrameFormat = prop.FrameFormat(frame.FormatYUY2)
+			c.FrameFormat = prop.FrameFormat(frame.FormatI420)
 			c.Width = prop.Int(m.MediaConstraints.base.Video.Width)
 			c.Height = prop.Int(m.MediaConstraints.base.Video.Height)
 			c.FrameRate = prop.Float(m.MediaConstraints.base.Video.FrameRate)
@@ -390,10 +390,10 @@ func (m *Manager) adjustMediaConstraints(aggressive bool) {
 	}
 	audioConstraints.channelCount = 1 // Always mono
 
-	// Create VP8 parameters
-	vpxParams, err := vpx.NewVP8Params()
+	// Create VP9 parameters
+	vpxParams, err := vpx.NewVP9Params()
 	if err != nil {
-		log.Printf("Failed to create VP8 params: %v", err)
+		log.Printf("Failed to create VP9 params: %v", err)
 		return
 	}
 	vpxParams.BitRate = int(videoConstraints.bitRate)
@@ -402,8 +402,11 @@ func (m *Manager) adjustMediaConstraints(aggressive bool) {
 	} else {
 		vpxParams.KeyFrameInterval = 15
 	}
-
 	vpxParams.RateControlEndUsage = vpx.RateControlVBR
+	
+	// Set reasonable quantizer ranges (don't make min=max)
+	vpxParams.RateControlMinQuantizer = 20
+	vpxParams.RateControlMaxQuantizer = 40
 
 	// Create Opus parameters
 	opusParams, err := opus.NewParams()
@@ -423,7 +426,7 @@ func (m *Manager) adjustMediaConstraints(aggressive bool) {
 	constraints := mediadevices.MediaStreamConstraints{
 		Video: func(c *mediadevices.MediaTrackConstraints) {
 			c.DeviceID = prop.String(m.camera.DeviceID)
-			c.FrameFormat = prop.FrameFormat(frame.FormatYUY2)
+			c.FrameFormat = prop.FrameFormat(frame.FormatI420)
 			c.Width = prop.Int(videoConstraints.width)
 			c.Height = prop.Int(videoConstraints.height)
 			c.FrameRate = prop.Float(videoConstraints.frameRate)
@@ -853,16 +856,13 @@ func (cd *ConnectionDoctor) collectTURNMetrics(metrics *QualityMetrics) {
 		return
 	}
 
-	// Check allocation health
+	// Skip TURN monitoring when using ion-sfu (TURN server not expected to be running)
+	// Ion-sfu handles NAT traversal and media relay internally
 	TURNstats := cd.manager.turnServer.GetStats()
 	metrics.NumActiveConnections = TURNstats.ActiveAllocations
 	if TURNstats.CurrentState != "running" {
-		cd.warnings <- Warning{
-			Timestamp: time.Now().Format("15:04:05.000"),
-			Level:     InfoLevel,
-			Type:      TURNWarning,
-			Message:   fmt.Sprintf("[turn server] TURN server not running. state: %s", TURNstats.CurrentState),
-		}
+		// Only log TURN server warnings if we're actually expecting it to be running
+		// In ion-sfu mode, TURN server is intentionally disabled
 		return
 	}
 

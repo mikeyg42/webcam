@@ -135,7 +135,7 @@ func (r *Recorder) StartRecording(frameChan <-chan gocv.Mat) error {
 				Name:            "Video",
 				TrackNumber:     1,
 				TrackUID:        12345,
-				CodecID:         "V_VP8",
+				CodecID:         "V_VP9",
 				TrackType:       1,
 				DefaultDuration: uint64(time.Second/time.Duration(r.config.Framerate)) * 1000,
 				Video: &webm.Video{
