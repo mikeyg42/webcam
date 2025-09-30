@@ -50,6 +50,7 @@ type Application struct {
 	testingMode        bool
 	ctx                context.Context
 	cancel             context.CancelFunc
+	drainDoneChannel   chan struct{} // Signal to stop draining channels
 }
 
 // CalibrationResult holds calibration values
@@ -288,8 +289,9 @@ func (app *Application) runCalibrationPhase() CalibrationResult {
 	// Wait for calibration result
 	result := <-doneChan
 
-	// Stop draining (but keep frame distributor running!)
-	close(drainDone)
+	// Keep draining running - don't stop it yet!
+	// It will be stopped when the pipeline starts consuming frames
+	app.drainDoneChannel = drainDone // Store for later
 
 	log.Printf("Calibration complete - Baseline: %.4f%%, Threshold: %.4f%%",
 		result.Baseline, result.Threshold)
@@ -298,6 +300,7 @@ func (app *Application) runCalibrationPhase() CalibrationResult {
 }
 
 // drainChannelsDuringCalibration prevents channel overflow
+// Runs until pipeline is ready to consume frames
 func (app *Application) drainChannelsDuringCalibration(done chan struct{}) {
 	vp9Chan := app.frameDistributor.GetVP9Channel()
 	recordChan := app.frameDistributor.GetRecordChannel()
@@ -305,11 +308,12 @@ func (app *Application) drainChannelsDuringCalibration(done chan struct{}) {
 	for {
 		select {
 		case <-vp9Chan:
-			// Drain
+			// Drain VP9 frames silently
 		case <-recordChan:
-			// Drain
+			// Drain record frames silently
 		case <-done:
-			// Calibration complete, stop draining
+			// Pipeline started, stop draining
+			log.Println("[Calibration] Stopping channel drain - pipeline taking over")
 			return
 		case <-app.ctx.Done():
 			return
@@ -548,6 +552,12 @@ func (app *Application) startProcessing() error {
 	// Start integration pipeline
 	if err := app.pipeline.Start(); err != nil {
 		return fmt.Errorf("failed to start pipeline: %v", err)
+	}
+
+	// NOW stop the drain goroutine - pipeline is consuming frames
+	if app.drainDoneChannel != nil {
+		close(app.drainDoneChannel)
+		app.drainDoneChannel = nil
 	}
 
 	log.Println("All systems running")
