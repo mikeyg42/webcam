@@ -93,6 +93,12 @@ func (r *Recorder) GetStats() RecorderStats {
 	return r.stats
 }
 
+func (r *Recorder) IsRecording() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.isRecording
+}
+
 func (r *Recorder) processBuffers() {
 	for {
 		select {

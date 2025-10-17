@@ -7,6 +7,7 @@ import (
 	"image/png"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -252,37 +253,132 @@ func (p *Pipeline) handleMotionEvents(motionChan <-chan bool) {
 }
 
 // consumeRecordingFrames handles frames for recording
+// This function writes frames directly to disk, independent of WebRTC
 func (p *Pipeline) consumeRecordingFrames() {
 	recordChannel := p.frameDistributor.GetRecordChannel()
-	log.Println("[Pipeline] Starting recording frame consumer")
+	log.Println("[Pipeline] Starting recording frame consumer (direct-to-disk mode)")
 
+	var videoWriter *gocv.VideoWriter
+	var currentRecordingFile string
+	var recordingStartTime time.Time
 	frameCount := 0
+	framesWritten := 0
 	lastLogTime := time.Now()
+
+	// Cleanup function for video writer
+	closeVideoWriter := func() {
+		if videoWriter != nil && videoWriter.IsOpened() {
+			videoWriter.Close()
+			if currentRecordingFile != "" {
+				// Verify file was created successfully
+				if info, err := os.Stat(currentRecordingFile); err == nil {
+					log.Printf("[Pipeline] Recording closed: %s (%d bytes, %d frames)",
+						currentRecordingFile, info.Size(), framesWritten)
+				}
+			}
+			videoWriter = nil
+			currentRecordingFile = ""
+			framesWritten = 0
+		}
+	}
+
+	defer closeVideoWriter()
 
 	for {
 		select {
 		case <-p.ctx.Done():
 			log.Println("[Pipeline] Recording consumer stopping due to context cancellation")
+			closeVideoWriter()
 			return
+
 		case frame, ok := <-recordChannel:
 			if !ok {
 				log.Println("[Pipeline] Record channel closed, stopping recording consumer")
+				closeVideoWriter()
 				return
 			}
 
-			if frame != nil {
-				frameCount++
+			if frame == nil {
+				continue
+			}
 
-				// Log progress every 10 seconds (less frequent than other channels)
-				if time.Since(lastLogTime) >= 10*time.Second {
-					bounds := frame.Bounds()
-					log.Printf("[Pipeline] Processing recording frames (%d processed, %dx%d)",
-						frameCount, bounds.Dx(), bounds.Dy())
-					lastLogTime = time.Now()
+			frameCount++
+
+			// Check if recording is active
+			isRecording := p.videoRecorder.IsRecording()
+
+			// Start new recording if needed
+			if isRecording && videoWriter == nil {
+				// Create recording file
+				timestamp := time.Now().Format("2006-01-02_15-04-05")
+				outputDir := p.config.VideoConfig.OutputPath
+				if err := os.MkdirAll(outputDir, 0755); err != nil {
+					log.Printf("[Pipeline] ERROR: Failed to create output directory: %v", err)
+					continue
 				}
 
-				// TODO: Convert frame to format suitable for recording
-				// For now, just acknowledge we received it
+				currentRecordingFile = filepath.Join(outputDir, fmt.Sprintf("recording_%s_direct.webm", timestamp))
+
+				// Initialize video writer with VP9 codec
+				// FourCC for VP9: "VP90"
+				fourcc := "VP90"
+				fps := 15.0 // TODO: Get from config
+				width := 1280 // TODO: Get from config
+				height := 720 // TODO: Get from config
+
+				vw, err := gocv.VideoWriterFile(currentRecordingFile, fourcc, fps, width, height, true)
+				if err != nil {
+					log.Printf("[Pipeline] ERROR: Failed to create video writer: %v", err)
+					continue
+				}
+				videoWriter = vw
+
+				if !videoWriter.IsOpened() {
+					log.Printf("[Pipeline] ERROR: Video writer not opened for %s", currentRecordingFile)
+					videoWriter.Close()
+					videoWriter = nil
+					continue
+				}
+
+				recordingStartTime = time.Now()
+				framesWritten = 0
+				log.Printf("[Pipeline] 🔴 Started direct recording to: %s", currentRecordingFile)
+			}
+
+			// Stop recording if needed
+			if !isRecording && videoWriter != nil {
+				duration := time.Since(recordingStartTime)
+				log.Printf("[Pipeline] ⏹️ Stopping direct recording after %v (%d frames)",
+					duration.Round(time.Second), framesWritten)
+				closeVideoWriter()
+			}
+
+			// Write frame if recording
+			if isRecording && videoWriter != nil && videoWriter.IsOpened() {
+				// Convert image.Image to gocv.Mat
+				mat, err := imageToMat(frame)
+				if err != nil {
+					log.Printf("[Pipeline] ERROR: Failed to convert frame to Mat: %v", err)
+					continue
+				}
+
+				// Write frame to video file
+				if err := videoWriter.Write(mat); err != nil {
+					log.Printf("[Pipeline] ERROR: Failed to write frame: %v", err)
+					mat.Close()
+					continue
+				}
+
+				mat.Close()
+				framesWritten++
+
+				// Log progress
+				if time.Since(lastLogTime) >= 5*time.Second {
+					duration := time.Since(recordingStartTime)
+					log.Printf("[Pipeline] Recording: %d frames written, duration: %v, file: %s",
+						framesWritten, duration.Round(time.Second), filepath.Base(currentRecordingFile))
+					lastLogTime = time.Now()
+				}
 			}
 		}
 	}
