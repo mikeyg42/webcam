@@ -14,82 +14,6 @@ import (
 )
 
 // ============================================================================
-// MAT POOL - Optimized memory management for GoCV Mats
-// ============================================================================
-
-// MatPool manages a pool of GoCV Mats with proper C++ object lifecycle handling
-// This prevents memory leaks and reduces allocations
-type MatPool struct {
-	pool  sync.Pool
-	stats struct {
-		sync.Mutex
-		gets, puts, creates int64
-	}
-}
-
-// NewMatPool creates a pool with pre-warmed Mat pointers
-func NewMatPool(warmupSize int) *MatPool {
-	mp := &MatPool{}
-	mp.pool = sync.Pool{
-		New: func() interface{} {
-			mp.stats.Lock()
-			mp.stats.creates++
-			mp.stats.Unlock()
-			// Return pointer to empty Mat - lazy initialization
-			return &gocv.Mat{}
-		},
-	}
-
-	// Pre-warm the pool to avoid allocations during processing
-	for i := 0; i < warmupSize; i++ {
-		mp.pool.Put(&gocv.Mat{})
-	}
-
-	return mp
-}
-
-// Get retrieves a Mat from the pool, allocating if necessary
-func (mp *MatPool) Get() *gocv.Mat {
-	mp.stats.Lock()
-	mp.stats.gets++
-	mp.stats.Unlock()
-
-	mat := mp.pool.Get().(*gocv.Mat)
-
-	// Lazy initialization - only allocate when actually needed
-	if mat.Empty() {
-		*mat = gocv.NewMat()
-	}
-
-	return mat
-}
-
-// Put returns a Mat to the pool after cleaning it
-func (mp *MatPool) Put(mat *gocv.Mat) {
-	if mat == nil {
-		return
-	}
-
-	mp.stats.Lock()
-	mp.stats.puts++
-	mp.stats.Unlock()
-
-	// Clean the Mat but keep the pointer for reuse
-	if !mat.Empty() {
-		mat.Close()
-	}
-
-	mp.pool.Put(mat)
-}
-
-// Stats returns pool usage statistics for monitoring
-func (mp *MatPool) Stats() (gets, puts, creates int64) {
-	mp.stats.Lock()
-	defer mp.stats.Unlock()
-	return mp.stats.gets, mp.stats.puts, mp.stats.creates
-}
-
-// ============================================================================
 // DATA STRUCTURES
 // ============================================================================
 
@@ -124,10 +48,8 @@ type Detector struct {
 	tempGray  *gocv.Mat // Grayscale conversion buffer
 	tempSmall *gocv.Mat // Downsampling buffer
 	magnitude *gocv.Mat // Flow magnitude buffer
-	mask      *gocv.Mat // Binary motion mask
-
-	// Mat pool for dynamic allocations
-	matPool *MatPool
+	mask      *gocv.Mat // Binary motion mask (float32)
+	maskU8    *gocv.Mat // Binary motion mask (uint8) - PRE-ALLOCATED, NO POOL NEEDED
 
 	// Detection parameters (fixed after calibration)
 	baselineFlow   float64 // Baseline motion level from calibration
@@ -144,7 +66,12 @@ type Detector struct {
 
 	// Consecutive frame tracking for noise reduction
 	consecutiveMotionFrames int
-	lastLogTime            time.Time
+	lastLogTime             time.Time
+
+	// SIMPLE DATA COLLECTION - First 100 motion values
+	flowDataMu    sync.Mutex
+	flowDataCount int
+	maxDataPoints int
 }
 
 // NewDetector creates a detector that will be calibrated later
@@ -153,10 +80,7 @@ func NewDetector(config *config.MotionConfig, notifier *notification.Notifier) (
 		return nil, fmt.Errorf("config cannot be nil")
 	}
 
-	// Create Mat pool with small warm-up
-	matPool := NewMatPool(4)
-
-	// Pre-allocate all persistent Mats
+	// Pre-allocate ALL persistent Mats including maskU8
 	prevSmall := gocv.NewMat()
 	currSmall := gocv.NewMat()
 	flow := gocv.NewMat()
@@ -164,6 +88,7 @@ func NewDetector(config *config.MotionConfig, notifier *notification.Notifier) (
 	tempSmall := gocv.NewMat()
 	magnitude := gocv.NewMat()
 	mask := gocv.NewMat()
+	maskU8 := gocv.NewMat() // Pre-allocate the uint8 mask - NO POOL NEEDED
 
 	return &Detector{
 		config:         config,
@@ -175,11 +100,13 @@ func NewDetector(config *config.MotionConfig, notifier *notification.Notifier) (
 		tempSmall:      &tempSmall,
 		magnitude:      &magnitude,
 		mask:           &mask,
-		matPool:        matPool,
-		baselineFlow:   0.0, // Will be set by SetCalibration
-		fixedThreshold: 0.3, // Will be set by SetCalibration
+		maskU8:         &maskU8, // Store the pre-allocated Mat
+		baselineFlow:   0.0,     // Will be set by SetCalibration
+		fixedThreshold: 0.3,     // Will be set by SetCalibration
 		stats:          MotionStats{},
 		lastLogTime:    time.Now(),
+		maxDataPoints:  100, // Collect first 100 data points
+		flowDataCount:  0,
 	}, nil
 }
 
@@ -204,6 +131,13 @@ func (d *Detector) Start() error {
 	d.frameCount = 0
 	d.consecutiveMotionFrames = 0
 
+	// Reset data collection
+	d.flowDataMu.Lock()
+	d.flowDataCount = 0
+	d.flowDataMu.Unlock()
+
+	log.Println("[Detector] Starting data collection for first 100 frames...")
+
 	// Clear previous frame buffer
 	if !d.prevSmall.Empty() {
 		d.prevSmall.Close()
@@ -225,13 +159,6 @@ func (d *Detector) Stop() error {
 	}
 
 	d.isRunning = false
-
-	// Log final pool statistics
-	if d.matPool != nil {
-		gets, puts, creates := d.matPool.Stats()
-		log.Printf("[Detector] Mat pool final stats - Gets: %d, Puts: %d, Creates: %d", gets, puts, creates)
-	}
-
 	log.Println("[Detector] Stopped")
 	return nil
 }
@@ -270,6 +197,9 @@ func (d *Detector) Detect(frameChan <-chan gocv.Mat, motionChan chan<- bool) {
 		processedFrames++
 		d.frameCount++
 
+		// SIMPLE DATA LOGGING - First 100 frames
+		d.logFlowData(motionArea)
+
 		// Track consecutive frames for noise reduction
 		if hasMotion {
 			d.consecutiveMotionFrames++
@@ -303,7 +233,7 @@ func (d *Detector) Detect(frameChan <-chan gocv.Mat, motionChan chan<- bool) {
 
 					// Send notification
 					d.sendNotification()
-					
+
 					// Update stats
 					d.statsMu.Lock()
 					d.stats.MotionEvents++
@@ -342,10 +272,34 @@ func (d *Detector) Detect(frameChan <-chan gocv.Mat, motionChan chan<- bool) {
 	log.Printf("[Detector] Detection loop ended - processed %d frames", processedFrames)
 }
 
+// logFlowData logs the first N motion area values for analysis
+func (d *Detector) logFlowData(motionArea float64) {
+	d.flowDataMu.Lock()
+	defer d.flowDataMu.Unlock()
+
+	if d.flowDataCount >= d.maxDataPoints {
+		return // Already collected enough data
+	}
+
+	d.flowDataCount++
+
+	// Log with special tag for easy grep/filtering
+	log.Printf("[FLOWDATA] Frame %03d: %.6f%% (baseline: %.4f, threshold: %.4f)",
+		d.flowDataCount, motionArea, d.baselineFlow, d.fixedThreshold)
+
+	// Print completion message
+	if d.flowDataCount == d.maxDataPoints {
+		log.Println("[FLOWDATA] ======== DATA COLLECTION COMPLETE ========")
+		log.Printf("[FLOWDATA] Collected %d motion area values", d.maxDataPoints)
+		log.Println("[FLOWDATA] To extract: grep '\\[FLOWDATA\\]' from logs")
+		log.Println("[FLOWDATA] ==========================================")
+	}
+}
+
 // processFrameOpticalFlow analyzes a single frame using optical flow
 func (d *Detector) processFrameOpticalFlow(frame gocv.Mat) (bool, float64) {
 	start := time.Now()
-	
+
 	// Convert to grayscale
 	if frame.Channels() > 1 {
 		gocv.CvtColor(frame, d.tempGray, gocv.ColorBGRToGray)
@@ -420,13 +374,11 @@ func (d *Detector) analyzeFlow() float64 {
 	// Create binary mask of pixels with significant motion
 	gocv.Threshold(*d.magnitude, d.mask, float32(0.3), 255, gocv.ThresholdBinary)
 
-	// Convert to uint8 for counting
-	maskU8 := d.matPool.Get()
-	defer d.matPool.Put(maskU8)
-	d.mask.ConvertTo(maskU8, gocv.MatTypeCV8U)
+	// Convert to uint8 for counting - USE PRE-ALLOCATED MAT, NO POOL
+	d.mask.ConvertTo(d.maskU8, gocv.MatTypeCV8U)
 
 	// Count motion pixels
-	motionPixels := gocv.CountNonZero(*maskU8)
+	motionPixels := gocv.CountNonZero(*d.maskU8)
 	totalPixels := d.magnitude.Rows() * d.magnitude.Cols()
 
 	// Calculate percentage
@@ -455,7 +407,7 @@ func (d *Detector) updateStats(motionArea float64, processingTime time.Duration)
 	} else {
 		// Running average
 		d.stats.AverageMotionArea = (d.stats.AverageMotionArea*float64(d.stats.FramesProcessed-1) + motionArea) / float64(d.stats.FramesProcessed)
-		
+
 		// Track min/max
 		if motionArea > d.stats.MaxMotionArea {
 			d.stats.MaxMotionArea = motionArea
@@ -502,10 +454,11 @@ func (d *Detector) Close() error {
 		return err
 	}
 
-	// Clean up all Mats
+	// Clean up ALL Mats including the pre-allocated maskU8
 	mats := []*gocv.Mat{
 		d.prevSmall, d.currSmall, d.flow,
 		d.tempGray, d.tempSmall, d.magnitude, d.mask,
+		d.maskU8, // Clean up the pre-allocated uint8 mask
 	}
 
 	for _, mat := range mats {

@@ -15,8 +15,7 @@ import (
 )
 
 // ============================================================================
-// IMPROVED FRAME DISTRIBUTOR
-// Incorporates Opus 4's improvements while maintaining working calibration flow
+//  FRAME DISTRIBUTOR
 // ============================================================================
 
 // FrameDistributor manages a single camera source and distributes frames to multiple consumers
