@@ -285,6 +285,16 @@ func (h *ConfigHandler) updateInternalConfig(req *ConfigResponse) {
 		cfg.MailSendConfig.APIToken = req.Email.MailSendAPIToken
 	}
 
+	// Update Gmail OAuth2 settings
+	cfg.GmailOAuth2Config.ToEmail = req.Email.ToEmail
+	cfg.GmailOAuth2Config.FromEmail = req.Email.FromEmail
+	if req.Email.GmailClientID != "" {
+		cfg.GmailOAuth2Config.ClientID = req.Email.GmailClientID
+	}
+	if req.Email.GmailClientSecret != "" {
+		cfg.GmailOAuth2Config.ClientSecret = req.Email.GmailClientSecret
+	}
+
 	// Update WebRTC auth
 	cfg.WebrtcAuth.Username = req.WebRTC.Username
 	if req.WebRTC.Password != "" {
@@ -344,6 +354,22 @@ func (h *ConfigHandler) saveConfig() error {
 	return nil
 }
 
+// TestNotification handles POST /api/test-notification
+func (h *ConfigHandler) TestNotification(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// This endpoint needs to be handled by the main application
+	// For now, return a message indicating the feature needs implementation
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": false,
+		"message": "Notification test requires application restart with updated configuration. Save your settings and restart the camera application to enable notifications.",
+	})
+}
+
 // RegisterRoutes registers HTTP routes for configuration API
 func (h *ConfigHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
@@ -356,4 +382,6 @@ func (h *ConfigHandler) RegisterRoutes(mux *http.ServeMux) {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+
+	mux.HandleFunc("/api/test-notification", h.TestNotification)
 }

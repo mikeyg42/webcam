@@ -157,7 +157,7 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 	logger := recorderlog.NewStdLogger().Named("security-camera")
 
 	// Setup email notifications
-	notifier, err := setupEmailNotifications(appCtx)
+	notifier, err := setupEmailNotifications(appCtx, cfg)
 	if err != nil {
 		log.Printf("Email setup failed: %v", err)
 		notifier = nil
@@ -721,34 +721,53 @@ func (app *Application) selectDevicesForTesting() (
 	return camera, microphone, nil
 }
 
-// setupEmailNotifications configures email alerts
-func setupEmailNotifications(ctx context.Context) (*notification.Notifier, error) {
-	result, err := gui.ShowEmailSetupDialog(ctx)
-	if err != nil {
-		return nil, err
-	}
+// setupEmailNotifications configures email alerts from main config
+func setupEmailNotifications(ctx context.Context, cfg *config.Config) (*notification.Notifier, error) {
+	switch cfg.EmailMethod {
+	case "mailersend":
+		// Create MailerSend notifier
+		mailsendCfg := &notification.MailSendConfig{
+			APIToken:  cfg.MailSendConfig.APIToken,
+			ToEmail:   cfg.MailSendConfig.ToEmail,
+			FromEmail: cfg.MailSendConfig.FromEmail,
+			Debug:     cfg.MailSendConfig.Debug,
+		}
 
-	switch result.Method {
-	case gui.EmailMethodMailerSend:
-		notifier, err := notification.NewMailSendNotifier(result.MailerSendConfig, "WebCam Security")
+		notifier, err := notification.NewMailSendNotifier(mailsendCfg, "WebCam Security")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to create MailerSend notifier: %w", err)
 		}
 		var n notification.Notifier = notifier
+		log.Println("Email notifications enabled (MailerSend)")
 		return &n, nil
 
-	case gui.EmailMethodGmail:
-		notifier, err := notification.NewGmailNotifier(ctx, result.GmailConfig, "WebCam Security")
+	case "gmail":
+		// Create Gmail OAuth2 notifier
+		gmailCfg := &notification.GmailConfig{
+			ClientID:           cfg.GmailOAuth2Config.ClientID,
+			ClientSecret:       cfg.GmailOAuth2Config.ClientSecret,
+			ToEmail:            cfg.GmailOAuth2Config.ToEmail,
+			FromEmail:          cfg.GmailOAuth2Config.FromEmail,
+			RedirectURL:        cfg.GmailOAuth2Config.RedirectURL,
+			TokenStorePath:     cfg.GmailOAuth2Config.TokenStorePath,
+			TokenEncryptionKey: cfg.GmailOAuth2Config.TokenEncryptionKey,
+			Debug:              cfg.GmailOAuth2Config.Debug,
+		}
+
+		notifier, err := notification.NewGmailNotifier(ctx, gmailCfg, "WebCam Security")
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to create Gmail notifier: %w", err)
 		}
 		var n notification.Notifier = notifier
+		log.Println("Email notifications enabled (Gmail OAuth2)")
 		return &n, nil
 
-	case gui.EmailMethodDisabled:
+	case "disabled":
+		log.Println("Email notifications disabled")
 		return nil, nil
 
 	default:
+		log.Printf("Unknown email method '%s', notifications disabled", cfg.EmailMethod)
 		return nil, nil
 	}
 }

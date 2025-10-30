@@ -230,10 +230,44 @@ function updateEmailFields() {
     const commonFields = document.getElementById('emailCommonFields');
     const mailersendFields = document.getElementById('mailersendFields');
     const gmailFields = document.getElementById('gmailFields');
+    const testSection = document.getElementById('notificationTestSection');
 
     commonFields.style.display = method !== 'disabled' ? 'block' : 'none';
     mailersendFields.style.display = method === 'mailersend' ? 'block' : 'none';
     gmailFields.style.display = method === 'gmail' ? 'block' : 'none';
+    testSection.style.display = method !== 'disabled' ? 'block' : 'none';
+}
+
+// Test notification
+async function testNotification() {
+    const btn = document.getElementById('testNotificationBtn');
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Sending...';
+
+    try {
+        const response = await fetch('/api/test-notification', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            showAlert(result.message || 'Test notification sent successfully!', 'success');
+        } else {
+            showAlert(result.message || 'Test notification feature not yet available. Save configuration and restart application.', 'error');
+        }
+
+    } catch (error) {
+        console.error('Error testing notification:', error);
+        showAlert(`Failed to send test notification: ${error.message}`, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+    }
 }
 
 // Set video preset
