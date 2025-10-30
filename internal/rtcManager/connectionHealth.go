@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"net"
 	"sync"
 	"time"
 
@@ -30,9 +29,6 @@ const (
 
 	criticalWSLatency = 500 // Milliseconds
 	warningWSLatency  = 200 // Milliseconds
-
-	criticalTURNLatency = 300 // Milliseconds
-	warningTURNLatency  = 150 // Milliseconds
 
 	// Bitrate thresholds
 	criticalBitrate = 50_000  // 50 Kbps
@@ -78,7 +74,6 @@ const (
 	BitrateWarning
 	FramerateWarning
 	ICEWarning
-	TURNWarning
 	SignalingWarning
 	ConnWarning
 )
@@ -142,11 +137,9 @@ type QualityMetrics struct {
 	JSONRPCLatency time.Duration
 	WSState        string
 
-	// TURN specific metrics
-	TURNLatency          time.Duration
-	TURNState            string
-	RelayedBytes         uint64
-	NumActiveConnections int
+	// Tailscale specific metrics (could add ping RTT here later)
+	TailscaleConnected bool
+	TailscaleIP        string
 }
 
 // ---------
@@ -192,11 +185,6 @@ func (m *Manager) RespondToDoctorsWarnings() {
 			case SignalingWarning:
 				if warningFrequency >= 2 {
 					m.handleDisconnection()
-				}
-			case TURNWarning:
-				if warningFrequency >= 3 {
-					// Consider restarting TURN server or switching to backup
-					log.Printf("Multiple TURN issues detected, considering infrastructure changes")
 				}
 			}
 
@@ -638,8 +626,6 @@ func (cd *ConnectionDoctor) AccumulateNewStats() QualityMetrics {
 			}
 		}
 	}
-	// assess TURN Server health\
-	cd.collectTURNMetrics(&metrics)
 
 	cd.collectWSMetrics(&metrics)
 
@@ -849,49 +835,6 @@ func (cd *ConnectionDoctor) pingRPC() (time.Duration, error) {
 	latency := time.Since(start)
 	log.Printf("[pingRPC] Ping successful, latency: %v", latency)
 	return latency, nil
-}
-
-func (cd *ConnectionDoctor) collectTURNMetrics(metrics *QualityMetrics) {
-	if cd.manager.turnServer == nil {
-		return
-	}
-
-	// Skip TURN monitoring when using ion-sfu (TURN server not expected to be running)
-	// Ion-sfu handles NAT traversal and media relay internally
-	TURNstats := cd.manager.turnServer.GetStats()
-	metrics.NumActiveConnections = TURNstats.ActiveAllocations
-	if TURNstats.CurrentState != "running" {
-		// Only log TURN server warnings if we're actually expecting it to be running
-		// In ion-sfu mode, TURN server is intentionally disabled
-		return
-	}
-
-	// Perform TURN latency test
-	start := time.Now()
-	testAllocation := func() error {
-		// Create a temporary allocation to test TURN server responsiveness
-		conn, err := net.DialUDP("udp", nil, &net.UDPAddr{
-			IP:   net.ParseIP(cd.manager.turnServer.PublicIP),
-			Port: cd.manager.turnServer.Port,
-		})
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-		return nil
-	}
-
-	if err := testAllocation(); err != nil {
-		cd.warnings <- Warning{
-			Timestamp: time.Now().Format("15:04:05.000"),
-			Level:     CriticalLevel,
-			Type:      TURNWarning,
-			Message:   fmt.Sprintf("TURN allocation test failed: %v", err),
-		}
-	}
-
-	metrics.TURNLatency = time.Since(start)
-	metrics.TURNState = cd.manager.turnServer.GetState()
 }
 
 func (cd *ConnectionDoctor) checkPackageLostRate(metrics QualityMetrics) {
@@ -1238,16 +1181,6 @@ func (cd *ConnectionDoctor) analyzeNetworkStability() {
 }
 func (cd *ConnectionDoctor) analyzeInfrastructureHealth(metrics QualityMetrics) {
 	// Check TURN server health
-	if metrics.TURNLatency > criticalTURNLatency {
-		cd.warnings <- Warning{
-			Timestamp:   time.Now().Format("15:04:05.000"),
-			Level:       CriticalLevel,
-			Type:        TURNWarning,
-			Message:     fmt.Sprintf("TURN server latency critical: %v", metrics.TURNLatency),
-			Measurement: metrics.TURNLatency.Seconds(),
-		}
-	}
-
 	// Check WebSocket connection health
 	if metrics.WSLatency > criticalWSLatency {
 		cd.warnings <- Warning{
@@ -1256,20 +1189,6 @@ func (cd *ConnectionDoctor) analyzeInfrastructureHealth(metrics QualityMetrics) 
 			Type:        SignalingWarning,
 			Message:     fmt.Sprintf("WebSocket latency critical: %v", metrics.WSLatency),
 			Measurement: metrics.WSLatency.Seconds(),
-		}
-	}
-
-	// Check for infrastructure capacity issues
-	if metrics.NumActiveConnections > 0 {
-		utilizationRate := float64(metrics.RelayedBytes) / float64(metrics.NumActiveConnections)
-		if utilizationRate > 1_000_000 { // 1 MB per connection
-			cd.warnings <- Warning{
-				Timestamp:   time.Now().Format("15:04:05.000"),
-				Level:       SuggestionLevel,
-				Type:        TURNWarning,
-				Message:     "High TURN server utilization",
-				Measurement: utilizationRate,
-			}
 		}
 	}
 }
@@ -1302,12 +1221,11 @@ func (cd *ConnectionDoctor) analyzeTrends(recent []QualityMetrics) {
 
 	// Calculate trends using exponential moving averages
 	var (
-		packetLossEMA  = calculateEMA(recent, func(m QualityMetrics) float64 { return m.PacketLossRate })
-		rttEMA         = calculateEMA(recent, func(m QualityMetrics) float64 { return m.RTT.Seconds() })
-		bitrateEMA     = calculateEMA(recent, func(m QualityMetrics) float64 { return float64(m.Bitrate) })
-		jitterEMA      = calculateEMA(recent, func(m QualityMetrics) float64 { return m.JitterBuffer })
-		wsLatencyEMA   = calculateEMA(recent, func(m QualityMetrics) float64 { return m.WSLatency.Seconds() })
-		turnLatencyEMA = calculateEMA(recent, func(m QualityMetrics) float64 { return m.TURNLatency.Seconds() })
+		packetLossEMA = calculateEMA(recent, func(m QualityMetrics) float64 { return m.PacketLossRate })
+		rttEMA        = calculateEMA(recent, func(m QualityMetrics) float64 { return m.RTT.Seconds() })
+		bitrateEMA    = calculateEMA(recent, func(m QualityMetrics) float64 { return float64(m.Bitrate) })
+		jitterEMA     = calculateEMA(recent, func(m QualityMetrics) float64 { return m.JitterBuffer })
+		wsLatencyEMA  = calculateEMA(recent, func(m QualityMetrics) float64 { return m.WSLatency.Seconds() })
 	)
 
 	if bitrateEMA < float64(warningBitrate) {
@@ -1360,27 +1278,7 @@ func (cd *ConnectionDoctor) analyzeTrends(recent []QualityMetrics) {
 		}
 	}
 
-	if turnLatencyEMA > warningTURNLatency {
-		if turnLatencyEMA > criticalTURNLatency {
-			cd.warnings <- Warning{
-				Timestamp:   time.Now().Format("15:04:05.000"),
-				Level:       CriticalLevel,
-				Type:        TURNWarning,
-				Message:     fmt.Sprintf("Sustained critically high TURN latency: %.3fms", turnLatencyEMA*1000),
-				Measurement: turnLatencyEMA,
-			}
-		} else {
-			cd.warnings <- Warning{
-				Timestamp:   time.Now().Format("15:04:05.000"),
-				Level:       SuggestionLevel,
-				Type:        TURNWarning,
-				Message:     fmt.Sprintf("Sustained borderline dangerous TURN latency: %.3fms", turnLatencyEMA*1000),
-				Measurement: turnLatencyEMA,
-			}
-		}
-	}
-
-	vars, err := getVariances(recent, []string{"TURNLatency", "Bitrate", "PacketLoss", "RTT", "WSLatency"})
+	vars, err := getVariances(recent, []string{"Bitrate", "PacketLoss", "RTT", "WSLatency"})
 	if err != nil {
 		log.Printf("Failed to calculate variances: %v", err)
 	}
@@ -1471,11 +1369,10 @@ func calculateVariance(values []float64) float64 {
 func getVariances(m []QualityMetrics, fields []string) (map[string]float64, error) {
 	// Define a mapping of field names to accessor functions.
 	fieldAccessors := map[string]func(QualityMetrics) float64{
-		"TURNLatency": func(m QualityMetrics) float64 { return float64(m.TURNLatency.Milliseconds()) },
-		"Bitrate":     func(m QualityMetrics) float64 { return float64(m.Bitrate) },
-		"PacketLoss":  func(m QualityMetrics) float64 { return m.PacketLossRate },
-		"RTT":         func(m QualityMetrics) float64 { return m.RTT.Seconds() },
-		"WSLatency":   func(m QualityMetrics) float64 { return m.WSLatency.Seconds() },
+		"Bitrate":    func(m QualityMetrics) float64 { return float64(m.Bitrate) },
+		"PacketLoss": func(m QualityMetrics) float64 { return m.PacketLossRate },
+		"RTT":        func(m QualityMetrics) float64 { return m.RTT.Seconds() },
+		"WSLatency":  func(m QualityMetrics) float64 { return m.WSLatency.Seconds() },
 	}
 
 	variances := make(map[string]float64)

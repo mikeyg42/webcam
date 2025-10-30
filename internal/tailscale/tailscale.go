@@ -69,16 +69,7 @@ func (tm *TailscaleManager) initialize() error {
 	}
 
 	if status.BackendState != "Running" {
-		log.Println("Tailscale not running, attempting to start...")
-		
-		if err := tm.startTailscale(); err != nil {
-			return fmt.Errorf("failed to start Tailscale: %w", err)
-		}
-
-		// Wait for connection
-		if err := tm.waitForConnection(30 * time.Second); err != nil {
-			return fmt.Errorf("failed to connect to Tailscale: %w", err)
-		}
+		return fmt.Errorf("tailscale is not running (state: %s) - please start Tailscale externally and ensure it's connected to your tailnet", status.BackendState)
 	}
 
 	// Get our Tailscale info
@@ -91,32 +82,6 @@ func (tm *TailscaleManager) initialize() error {
 	tm.localIP = status.Self.TailAddr
 	
 	log.Printf("Tailscale initialized - Hostname: %s, IP: %s", tm.hostname, tm.localIP)
-	return nil
-}
-
-// startTailscale starts the Tailscale daemon and connects
-func (tm *TailscaleManager) startTailscale() error {
-	var cmd *exec.Cmd
-	
-	if tm.config.AuthKey != "" {
-		// Use auth key for unattended setup
-		cmd = exec.CommandContext(tm.ctx, "tailscale", "up", 
-			"--authkey", tm.config.AuthKey,
-			"--hostname", tm.config.NodeName,
-		)
-	} else {
-		// Interactive setup (user needs to authenticate via browser)
-		cmd = exec.CommandContext(tm.ctx, "tailscale", "up",
-			"--hostname", tm.config.NodeName,
-		)
-	}
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("tailscale up failed: %w, output: %s", err, string(output))
-	}
-
-	log.Printf("Tailscale started: %s", string(output))
 	return nil
 }
 

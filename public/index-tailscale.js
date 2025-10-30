@@ -20,7 +20,7 @@ let tailscaleInfo = {
     localIP: null,
     hostname: null,
     peers: [],
-    networkType: 'traditional'
+    networkType: 'unknown'  // Will be set to 'tailscale' once detected
 };
 
 // WebRTC Configuration - Enhanced for Tailscale
@@ -75,11 +75,10 @@ async function detectAndConfigureTailscale() {
     } catch (error) {
         logDebug(`Tailscale detection failed: ${error.message}`);
     }
-    
-    // Fall back to traditional configuration
-    configureWebRTCTraditional();
-    logDebug("Using traditional WebRTC networking");
-    return false;
+
+    // Tailscale is required - no fallback
+    updateStatus('🔴 Tailscale not detected. Please connect to your tailnet and reload.');
+    throw new Error('Tailscale not connected - Tailscale is required for WebRTC');
 }
 
 function configureWebRTCForTailscale() {
@@ -100,25 +99,6 @@ function configureWebRTCForTailscale() {
     
     tailscaleInfo.networkType = 'tailscale';
     updateStatusWithTailscale("Tailscale network detected");
-}
-
-function configureWebRTCTraditional() {
-    // Traditional configuration with TURN servers
-    webrtcConfig = {
-        ...webrtcConfig,
-        iceServers: [
-            { urls: "stun:stun.l.google.com:19302" },
-            // Add TURN server configuration here if available
-            // {
-            //     urls: "turn:YOUR_TURN_SERVER:3478",
-            //     username: "user",
-            //     credential: "password"
-            // }
-        ],
-        iceTransportPolicy: 'all'
-    };
-    
-    tailscaleInfo.networkType = 'traditional';
 }
 
 // --- Enhanced Logging and Status Functions ---

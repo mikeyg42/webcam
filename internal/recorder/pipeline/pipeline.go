@@ -1,7 +1,10 @@
 package pipeline
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -334,10 +337,22 @@ func (s *Segmenter) getNextSegmentIndex(recordingID string) int {
 	return len(matches)
 }
 
-// calculateChecksum computes SHA256 checksum of a file (placeholder)
+// calculateChecksum computes SHA256 checksum of a file
 func (s *Segmenter) calculateChecksum(path string) string {
-	// TODO: compute real SHA256
-	return fmt.Sprintf("sha256_%s", filepath.Base(path))
+	file, err := os.Open(path)
+	if err != nil {
+		s.logger.Warnw("Failed to open file for checksum", "path", path, "error", err)
+		return ""
+	}
+	defer file.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		s.logger.Warnw("Failed to compute checksum", "path", path, "error", err)
+		return ""
+	}
+
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 // cleanupStaleSegments removes old temporary files
@@ -408,10 +423,65 @@ func NewMKVWriter(path string) (*MKVWriter, error) {
 	return w, nil
 }
 
-// writeHeader writes the MKV container header (placeholder)
+// writeHeader writes a minimal valid MKV/Matroska container header
 func (w *MKVWriter) writeHeader() error {
-	header := []byte("MKV_HEADER_PLACEHOLDER")
-	_, err := w.file.Write(header)
+	// EBML Header for Matroska
+	header := []byte{
+		// EBML Header (ID: 0x1A45DFA3)
+		0x1A, 0x45, 0xDF, 0xA3,
+		0x9F, // Size: variable (31 bytes)
+
+		// EBMLVersion (ID: 0x4286) = 1
+		0x42, 0x86, 0x81, 0x01,
+
+		// EBMLReadVersion (ID: 0x42F7) = 1
+		0x42, 0xF7, 0x81, 0x01,
+
+		// EBMLMaxIDLength (ID: 0x42F2) = 4
+		0x42, 0xF2, 0x81, 0x04,
+
+		// EBMLMaxSizeLength (ID: 0x42F3) = 8
+		0x42, 0xF3, 0x81, 0x08,
+
+		// DocType (ID: 0x4282) = "matroska"
+		0x42, 0x82, 0x88,
+		0x6D, 0x61, 0x74, 0x72, 0x6F, 0x73, 0x6B, 0x61, // "matroska"
+
+		// DocTypeVersion (ID: 0x4287) = 4
+		0x42, 0x87, 0x81, 0x04,
+
+		// DocTypeReadVersion (ID: 0x4285) = 2
+		0x42, 0x85, 0x81, 0x02,
+
+		// Segment (ID: 0x18538067) - size unknown (0x01FFFFFFFFFFFFFF = unknown)
+		0x18, 0x53, 0x80, 0x67,
+		0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Unknown size
+	}
+
+	if _, err := w.file.Write(header); err != nil {
+		return err
+	}
+
+	// Write Segment Info (placeholder - will be updated on close)
+	info := []byte{
+		// Info element (ID: 0x1549A966)
+		0x15, 0x49, 0xA9, 0x66,
+		0xA0, // Size: variable (~32 bytes)
+
+		// TimestampScale (ID: 0x2AD7B1) = 1000000 (1ms)
+		0x2A, 0xD7, 0xB1, 0x84,
+		0x00, 0x0F, 0x42, 0x40, // 1000000 nanoseconds
+
+		// MuxingApp (ID: 0x4D80)
+		0x4D, 0x80, 0x8C,
+		0x52, 0x65, 0x63, 0x6F, 0x72, 0x64, 0x65, 0x72, 0x20, 0x76, 0x31, 0x2E, 0x30, // "Recorder v1.0"
+
+		// WritingApp (ID: 0x5741)
+		0x57, 0x41, 0x8C,
+		0x52, 0x65, 0x63, 0x6F, 0x72, 0x64, 0x65, 0x72, 0x20, 0x76, 0x31, 0x2E, 0x30, // "Recorder v1.0"
+	}
+
+	_, err := w.file.Write(info)
 	return err
 }
 

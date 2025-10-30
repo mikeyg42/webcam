@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -164,6 +165,12 @@ func NewRecordingService(cfg *config.Config, logger recorderlog.Logger) (*Record
 func (r *RecordingService) Start(ctx context.Context) error {
 	if !r.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("service already running")
+	}
+
+	// Check disk space before starting
+	if err := r.checkDiskSpace(); err != nil {
+		r.running.Store(false)
+		return fmt.Errorf("insufficient disk space: %w", err)
 	}
 
 	r.logger.Info("Starting recording service",
@@ -365,12 +372,14 @@ func (r *RecordingService) handleMotionEvent(ev MotionEvent, timer *time.Timer) 
 		r.logger.Info("Starting motion-triggered recording",
 			recorderlog.Float64("confidence", ev.Confidence))
 
+		recID := uuid.New().String()
 		rec := &storage.Recording{
-			ID:        uuid.New().String(),
+			ID:        recID,
 			Type:      "event",
 			Status:    "recording",
 			StartedAt: ev.Timestamp,
-			// storage.Recording uses sql.Null* for these in your current code
+			Bucket:    r.config.Storage.MinIO.Bucket,
+			BaseKey:   fmt.Sprintf("event/%s/%s", ev.Timestamp.Format("2006-01-02"), recID),
 			MotionConfidence: sql.NullFloat64{Float64: ev.Confidence, Valid: true},
 		}
 
@@ -424,11 +433,14 @@ func (r *RecordingService) endEventRecording() {
 }
 
 func (r *RecordingService) startContinuousRecording(ctx context.Context) error {
+	recID := uuid.New().String()
 	rec := &storage.Recording{
-		ID:        uuid.New().String(),
+		ID:        recID,
 		Type:      "continuous",
 		Status:    "recording",
 		StartedAt: time.Now(),
+		Bucket:    r.config.Storage.MinIO.Bucket,
+		BaseKey:   fmt.Sprintf("continuous/%s/%s", time.Now().Format("2006-01-02"), recID),
 	}
 	if err := r.metadataStore.SaveRecording(ctx, rec); err != nil {
 		return fmt.Errorf("failed to save recording metadata: %w", err)
@@ -657,4 +669,29 @@ func (r *RecordingService) GenerateStreamURL(ctx context.Context, recordingID st
 		return "", fmt.Errorf("failed to generate URL: %w", err)
 	}
 	return url, nil
+}
+
+// checkDiskSpace verifies sufficient disk space is available
+func (r *RecordingService) checkDiskSpace() error {
+	// Check temp directory space
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(r.config.Recording.TempDir, &stat); err != nil {
+		return fmt.Errorf("failed to stat temp dir: %w", err)
+	}
+
+	// Calculate available space in MB
+	availableMB := (stat.Bavail * uint64(stat.Bsize)) / (1024 * 1024)
+
+	// Require at least 1GB free space
+	minRequiredMB := uint64(1024)
+	if availableMB < minRequiredMB {
+		return fmt.Errorf("insufficient disk space: %d MB available, %d MB required",
+			availableMB, minRequiredMB)
+	}
+
+	r.logger.Info("Disk space check passed",
+		recorderlog.Uint64("available_mb", availableMB),
+		recorderlog.Uint64("required_mb", minRequiredMB))
+
+	return nil
 }

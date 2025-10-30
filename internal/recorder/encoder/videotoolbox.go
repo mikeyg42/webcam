@@ -50,9 +50,9 @@ typedef struct {
 EncoderContext* createEncoder(int width, int height, double frameRate, int bitrate,
                               int keyframeInterval, const char* codecType,
                               const char* profile, int maxBFrames);
-int encodeFrame_wrap(EncoderContext *ctx, CVPixelBufferRef pixelBuffer,
+int encodeFrame_wrap(EncoderContext *ctx, void *pixelBuffer,
                      uint64_t timestamp, uint64_t duration, int forceKeyframe);
-int isNullPixelBuffer(CVPixelBufferRef pb);
+int isNullPixelBuffer(void *pb);
 EncodedFrame* getEncodedFrames(EncoderContext *ctx, int *count);
 void freeEncodedFrames(EncodedFrame *frames, int count);
 int flushEncoder(EncoderContext *ctx);
@@ -425,9 +425,10 @@ EncoderContext* createEncoder(int width, int height, double frameRate, int bitra
 
 // --- Encode frame -----------------------------------------------------------
 
-int encodeFrame(EncoderContext *ctx, CVPixelBufferRef pixelBuffer,
+int encodeFrame(EncoderContext *ctx, void *pixelBuffer,
                 uint64_t timestamp, uint64_t duration, int forceKeyframe) {
     if (!ctx || !ctx->session || !pixelBuffer) return -1;
+    CVPixelBufferRef pb = (CVPixelBufferRef)pixelBuffer;
 
     // timestamps are in microseconds
     CMTime pts = CMTimeMakeWithSeconds((Float64)timestamp / 1000000.0, 1000000);
@@ -443,7 +444,7 @@ int encodeFrame(EncoderContext *ctx, CVPixelBufferRef pixelBuffer,
     }
 
     OSStatus status = VTCompressionSessionEncodeFrame(
-        ctx->session, pixelBuffer, pts, dur, properties, (void *)1, &infoFlags);
+        ctx->session, pb, pts, dur, properties, (void *)1, &infoFlags);
 
     if (properties) CFRelease(properties);
     if (status != noErr) return status;
@@ -451,13 +452,13 @@ int encodeFrame(EncoderContext *ctx, CVPixelBufferRef pixelBuffer,
     return status;
 }
 int encodeFrame_wrap(EncoderContext *ctx,
-                     CVPixelBufferRef pixelBuffer,
+                     void *pixelBuffer,
                      uint64_t timestamp,
                      uint64_t duration,
                      int forceKeyframe) {
     return encodeFrame(ctx, pixelBuffer, timestamp, duration, forceKeyframe);
 }
-int isNullPixelBuffer(CVPixelBufferRef pb) {
+int isNullPixelBuffer(void *pb) {
     return pb == NULL ? 1 : 0;
 }
 
@@ -711,7 +712,7 @@ func (e *VideoToolboxEncoder) Encode(frame image.Image, pts time.Duration) ([]by
 
 	// Get pixel buffer from pool; ensure the pool returns C.CVPixelBufferRef
 	pb := e.pixelPool.Get() // type: C.CVPixelBufferRef
-	if C.isNullPixelBuffer(pb) != 0 {
+	if unsafe.Pointer(pb) == nil {
 		return nil, &EncoderError{Code: -2, Message: "Failed to get pixel buffer from pool", Fatal: false}
 	}
 	defer e.pixelPool.Put(pb)
@@ -735,8 +736,8 @@ func (e *VideoToolboxEncoder) Encode(frame image.Image, pts time.Duration) ([]by
 		forceKey = 1
 	}
 
-	// Call the C wrapper directly (no unsafe casts)
-	status := C.encodeFrame_wrap(e.ctx, pb, timestamp, duration, forceKey)
+	// Call the C wrapper with void* cast
+	status := C.encodeFrame_wrap(e.ctx, unsafe.Pointer(pb), timestamp, duration, forceKey)
 	if status != 0 {
 		return nil, &EncoderError{Code: int(status), Message: fmt.Sprintf("VT encode failed: %d", status), Fatal: false}
 	}

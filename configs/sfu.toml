@@ -41,13 +41,11 @@ enabletemporallayer = false
 # Range of ports that ion accepts WebRTC traffic on
 # Format: [min, max]   and max - min >= 100
 portrange = [5000, 5200]
-# if sfu behind nat, set iceserver
+
+# Tailscale-only mode: no TURN server needed
+# Optional STUN for NAT traversal (though Tailscale handles this)
 # [[webrtc.iceserver]]
-# urls = ["stun:stun.stunprotocol.org:19302"]
-# [[webrtc.iceserver]]
-urls = ["turn:YOUR_LOCAL_IP:3478"]  # Replace with your actual local IP
-username = "camera_user"  # Should match WEBRTC_USERNAME in .env
-credential = "change-this-password"  # Should match WEBRTC_PASSWORD in .env
+# urls = ["stun:stun.l.google.com:19302"]
 
 # sdp semantics:
 # "unified-plan"
@@ -79,25 +77,8 @@ failed = 25
 keepalive = 4
 
 [turn]
-# Enables embeded turn server
-enabled = true
-# Sets the realm for turn server
-realm = "pion.ly"
-# The address the TURN server will listen on.
-address = "0.0.0.0:3478"
-# Certs path to config tls/dtls
-# cert="path/to/cert.pem"
-# key="path/to/key.pem"
-# Port range that turn relays to SFU
-# WARNING: It shouldn't overlap webrtc.portrange
-# Format: [min, max]
-portrange = [49152, 65535]
-[turn.auth]
-# Use an auth secret to generate long-term credentials defined in RFC5389-10.2
-# NOTE: This takes precedence over `credentials` if defined.
-# secret = "secret"
-# Sets the credentials pairs
-credentials = "pion=ion,pion2=ion2"
+# TURN server disabled - using Tailscale-only networking
+enabled = false
 
 [log]
 # 0 - INFO 1 - DEBUG 2 - TRACE

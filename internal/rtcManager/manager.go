@@ -164,7 +164,6 @@ type Manager struct {
 	needsRenegotiation       atomic.Bool
 	pendingOperations        []func() error
 	lastCodecSelector        *mediadevices.CodecSelector
-	turnServer               *TURNServer
 	tailscaleManager         *tailscale.TailscaleManager
 	rpcConn                  *jsonrpc2.Conn
 	handler                  *rtcHandler
@@ -257,44 +256,41 @@ func (h *rtcHandler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonr
 
 //================
 
-// Initialize both TURN server and RPC connection
+// Initialize Tailscale-only RTC manager
 func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
 	ctx, cancel := context.WithCancel(appCtx)
 
-	// Initialize TURN server first
-	// Check if Tailscale is enabled and initialize accordingly
-	var tailscaleManager *tailscale.TailscaleManager
-	var turnServer *TURNServer
-
-	if myconfig.TailscaleConfig.Enabled {
-		if err := tailscale.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {
-			log.Printf("Tailscale configuration invalid, falling back to TURN: %v", err)
-			myconfig.TailscaleConfig.Enabled = false
-		} else {
-			var err error
-			tailscaleManager, err = tailscale.NewTailscaleManager(ctx, &myconfig.TailscaleConfig)
-			if err != nil {
-				log.Printf("Failed to initialize Tailscale, falling back to TURN: %v", err)
-				myconfig.TailscaleConfig.Enabled = false
-			} else {
-				log.Println("Tailscale networking initialized for WebRTC")
-			}
-		}
-	}
-
+	// Require Tailscale - no fallback to TURN
 	if !myconfig.TailscaleConfig.Enabled {
-		turnServer = CreateTURNServer(ctx)
+		cancel()
+		return nil, fmt.Errorf("tailscale is required for WebRTC (TailscaleConfig.Enabled must be true)")
 	}
 
-	// Create ICE configuration with TURN server
+	if err := tailscale.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {
+		cancel()
+		return nil, fmt.Errorf("tailscale configuration invalid: %w", err)
+	}
+
+	tailscaleManager, err := tailscale.NewTailscaleManager(ctx, &myconfig.TailscaleConfig)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to initialize tailscale: %w", err)
+	}
+	log.Println("Tailscale networking initialized for WebRTC")
+
+	// Require Tailscale connection
+	tsIP := tailscaleManager.GetLocalTailscaleIP()
+	if tsIP == "" {
+		cancel()
+		return nil, fmt.Errorf("tailscale not connected (no tailnet IP)")
+	}
+	log.Printf("Tailscale IP: %s", tsIP)
+
+	// Create ICE configuration - Tailscale only, optional STUN
 	pcConfig := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
-				URLs: []string{
-					fmt.Sprintf("turn:%s:%d", turnServer.PublicIP, turnServer.Port),
-				},
-				Username:   myconfig.WebrtcAuth.Username,
-				Credential: myconfig.WebrtcAuth.Password,
+				URLs: []string{"stun:stun.l.google.com:19302"},
 			},
 		},
 		ICETransportPolicy: webrtc.ICETransportPolicyAll,
@@ -316,7 +312,6 @@ func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websock
 		nextHandlerID:           0,
 		pendingOperations:       make([]func() error, 0),
 		handlersLock:            sync.RWMutex{},
-		turnServer:              turnServer,
 		tailscaleManager:        tailscaleManager,
 	}
 
@@ -447,9 +442,39 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 
 	log.Println("VP9-only codecs registered successfully")
 
-	// Create SettingEngine for DTLS configuration
+	// Create SettingEngine for DTLS and Tailscale configuration
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.SetDTLSDisableInsecureSkipVerify(true)
+
+	// Force ICE gathering on Tailscale interface only
+	settingEngine.SetInterfaceFilter(func(name string) bool {
+		// macOS: utun* interfaces
+		// Linux/Unix: tailscale0
+		return name == "tailscale0" || strings.HasPrefix(name, "utun")
+	})
+
+	// Rewrite host candidates to Tailscale IP (pin to tailnet)
+	tsIP := m.tailscaleManager.GetLocalTailscaleIP()
+	if tsIP != "" {
+		settingEngine.SetNAT1To1IPs([]string{tsIP}, webrtc.ICECandidateTypeHost)
+		log.Printf("ICE configured to use Tailscale IP: %s", tsIP)
+	}
+
+	// Restrict to UDP only
+	settingEngine.SetNetworkTypes([]webrtc.NetworkType{
+		webrtc.NetworkTypeUDP4,
+		webrtc.NetworkTypeUDP6,
+	})
+
+	// Set ICE candidate timeout
+	settingEngine.SetICETimeouts(
+		5*time.Second,  // disconnected timeout
+		25*time.Second, // failed timeout
+		4*time.Second,  // keep-alive interval
+	)
+
+	// Enable ICE-lite if your SFU supports it
+	settingEngine.SetLite(false)
 
 	// Create API with MediaEngine
 	api := webrtc.NewAPI(
@@ -459,16 +484,6 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 
 	// Add ICE transport policy
 	m.pcConfiguration.ICETransportPolicy = webrtc.ICETransportPolicyAll
-
-	// Enable ICE-lite if your SFU supports it
-	settingEngine.SetLite(false)
-
-	// Set ICE candidate timeout
-	settingEngine.SetICETimeouts(
-		5*time.Second,  // disconnected timeout
-		25*time.Second, // failed timeout
-		4*time.Second,  // keep-alive interval
-	)
 	// Create peer connection
 	peerConnection, err := api.NewPeerConnection(m.pcConfiguration)
 	if err != nil || peerConnection == nil {
@@ -2043,12 +2058,6 @@ func validateSDP(sd *webrtc.SessionDescription) error {
 }
 
 func (m *Manager) Shutdown(ctx context.Context) error {
-	if m.turnServer != nil {
-		if err := m.turnServer.Stop(); err != nil {
-			log.Printf("Failed to stop TURN server: %v", err)
-		}
-	}
-
 	// Create a channel to signal completion
 	shutdownComplete := make(chan struct{})
 

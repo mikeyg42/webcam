@@ -14,65 +14,53 @@ import (
 	"github.com/mikeyg42/webcam/internal/video"
 )
 
-// NewManagerWithTailscale creates a new WebRTC manager with Tailscale support
+// NewManagerWithTailscale creates a new WebRTC manager (Tailscale-only)
+// This is now identical to NewManager - kept for API compatibility
 func NewManagerWithTailscale(appCtx context.Context, myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
+	// Redirect to the main NewManager - both are Tailscale-only now
+	return NewManager(appCtx, myconfig, wsConn, recorder)
+}
+
+// legacyNewManagerWithTailscale is the old implementation (kept for reference but unused)
+func legacyNewManagerWithTailscale(appCtx context.Context, myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
 	ctx, cancel := context.WithCancel(appCtx)
 
-	// Check if Tailscale is enabled and initialize accordingly
-	var tailscaleManager *tailscale.TailscaleManager
-	var turnServer *TURNServer
-	var pcConfig webrtc.Configuration
-
-	if myconfig.TailscaleConfig.Enabled {
-		// Validate Tailscale configuration
-		if err := tailscale.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {
-			log.Printf("Tailscale configuration invalid, falling back to TURN: %v", err)
-			myconfig.TailscaleConfig.Enabled = false
-		} else {
-			var err error
-			tailscaleManager, err = tailscale.NewTailscaleManager(ctx, &myconfig.TailscaleConfig)
-			if err != nil {
-				log.Printf("Failed to initialize Tailscale, falling back to TURN: %v", err)
-				myconfig.TailscaleConfig.Enabled = false
-			} else {
-				log.Println("Tailscale networking initialized for WebRTC")
-			}
-		}
+	// Require Tailscale - no fallback
+	if !myconfig.TailscaleConfig.Enabled {
+		cancel()
+		return nil, fmt.Errorf("tailscale is required (TailscaleConfig.Enabled must be true)")
 	}
 
-	if myconfig.TailscaleConfig.Enabled && tailscaleManager != nil {
-		// Configure WebRTC to use Tailscale networking
-		pcConfig = webrtc.Configuration{
-			ICEServers: []webrtc.ICEServer{
-				{
-					// Use Google STUN server for initial connectivity
-					URLs: []string{"stun:stun.l.google.com:19302"},
-				},
-			},
-			// Prefer direct connections since Tailscale handles NAT traversal
-			ICETransportPolicy: webrtc.ICETransportPolicyAll,
-		}
-		log.Printf("Using Tailscale WebRTC configuration - Local IP: %s", 
-			tailscaleManager.GetLocalTailscaleIP())
-	} else {
-		// Fall back to traditional TURN server
-		turnServer = CreateTURNServer(ctx)
-		pcConfig = webrtc.Configuration{
-			ICEServers: []webrtc.ICEServer{
-				{
-					URLs: []string{
-						fmt.Sprintf("turn:%s:%d", turnServer.PublicIP, turnServer.Port),
-					},
-					Username:   myconfig.WebrtcAuth.Username,
-					Credential: myconfig.WebrtcAuth.Password,
-				},
-			},
-			ICETransportPolicy: webrtc.ICETransportPolicyAll,
-		}
-		log.Println("Using traditional TURN server configuration")
+	if err := tailscale.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {
+		cancel()
+		return nil, fmt.Errorf("tailscale configuration invalid: %w", err)
 	}
 
-	// Create the manager with Tailscale support
+	tailscaleManager, err := tailscale.NewTailscaleManager(ctx, &myconfig.TailscaleConfig)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to initialize tailscale: %w", err)
+	}
+	log.Println("Tailscale networking initialized for WebRTC")
+
+	tsIP := tailscaleManager.GetLocalTailscaleIP()
+	if tsIP == "" {
+		cancel()
+		return nil, fmt.Errorf("tailscale not connected (no tailnet IP)")
+	}
+
+	// Configure WebRTC for Tailscale-only
+	pcConfig := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+		},
+		ICETransportPolicy: webrtc.ICETransportPolicyAll,
+	}
+	log.Printf("Using Tailscale WebRTC configuration - Local IP: %s", tsIP)
+
+	// Create the manager
 	m := &Manager{
 		config:                  myconfig,
 		wsConnection:            wsConn,
@@ -83,7 +71,6 @@ func NewManagerWithTailscale(appCtx context.Context, myconfig *config.Config, ws
 		done:                    make(chan struct{}),
 		connectionStateHandlers: make(map[int64]func(webrtc.PeerConnectionState)),
 		pendingOperations:       make([]func() error, 0),
-		turnServer:              turnServer,
 		tailscaleManager:        tailscaleManager,
 	}
 
@@ -157,14 +144,6 @@ func (m *Manager) UpdateManagerForTailscale() error {
 		{
 			URLs: []string{"stun:stun.l.google.com:19302"},
 		},
-	}
-
-	// Stop traditional TURN server if running
-	if m.turnServer != nil {
-		if err := m.turnServer.Stop(); err != nil {
-			log.Printf("Warning: failed to stop TURN server: %v", err)
-		}
-		m.turnServer = nil
 	}
 
 	log.Printf("Manager updated for Tailscale networking - Local IP: %s", 

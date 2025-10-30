@@ -33,11 +33,18 @@ type MotionStats struct {
 // DETECTOR - Optical flow motion detection with fixed thresholds
 // ============================================================================
 
+// MotionCallback is called when motion is detected
+type MotionCallback func(confidence float64, regions []image.Rectangle, timestamp time.Time)
+
 // Detector performs motion detection using Farneback optical flow
 // After calibration, it uses fixed thresholds for consistent detection
 type Detector struct {
 	config   *config.MotionConfig
 	notifier *notification.Notifier
+
+	// Motion event callback (for recording service)
+	motionCallback MotionCallback
+	callbackMu     sync.RWMutex
 
 	// Persistent Mats - allocated once, reused throughout lifetime
 	prevSmall *gocv.Mat // Previous downsampled frame
@@ -115,6 +122,27 @@ func (d *Detector) SetCalibration(baseline, threshold float64) {
 	d.baselineFlow = baseline
 	d.fixedThreshold = threshold
 	log.Printf("[Detector] Calibration applied - Baseline: %.4f%%, Threshold: %.4f%%", baseline, threshold)
+}
+
+// SetMotionCallback registers a callback for motion events (e.g., for recording service)
+func (d *Detector) SetMotionCallback(callback MotionCallback) {
+	d.callbackMu.Lock()
+	defer d.callbackMu.Unlock()
+	d.motionCallback = callback
+}
+
+// triggerMotionCallback safely calls the motion callback if set
+func (d *Detector) triggerMotionCallback(confidence float64, regions []image.Rectangle, timestamp time.Time) {
+	d.callbackMu.RLock()
+	callback := d.motionCallback
+	d.callbackMu.RUnlock()
+
+	if callback != nil {
+		// Call asynchronously to avoid blocking detection
+		go func() {
+			callback(confidence, regions, timestamp)
+		}()
+	}
 }
 
 // Start begins motion detection
@@ -233,6 +261,14 @@ func (d *Detector) Detect(frameChan <-chan gocv.Mat, motionChan chan<- bool) {
 
 					// Send notification
 					d.sendNotification()
+
+					// Trigger recording callback
+					// Normalize confidence: motionArea relative to threshold
+					confidence := motionArea / d.fixedThreshold
+					if confidence > 1.0 {
+						confidence = 1.0
+					}
+					d.triggerMotionCallback(confidence, nil, now)
 
 					// Update stats
 					d.statsMu.Lock()
