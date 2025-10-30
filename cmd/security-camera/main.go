@@ -21,6 +21,7 @@ import (
 
 	"gocv.io/x/gocv"
 
+	"github.com/mikeyg42/webcam/internal/api"
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/framestream"
 	"github.com/mikeyg42/webcam/internal/gui"
@@ -98,6 +99,15 @@ func main() {
 	if err := app.Initialize(); err != nil {
 		log.Fatalf("Failed to initialize: %v", err)
 	}
+
+	// Start API server for configuration management
+	apiServer := api.NewServer(cfg, ":8081")
+	apiServer.StartInBackground()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		apiServer.Shutdown(shutdownCtx)
+	}()
 
 	// Run calibration phase
 	calibration := app.runCalibrationPhase()

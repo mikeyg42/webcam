@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no"/>
+    <title>Security Camera Configuration</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+            position: relative;
+        }
+
+        .back-link {
+            position: absolute;
+            top: 30px;
+            left: 30px;
+            color: white;
+            text-decoration: none;
+            font-weight: 600;
+            transition: opacity 0.3s;
+        }
+
+        .back-link:hover {
+            opacity: 0.8;
+        }
+
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+
+        .tabs {
+            display: flex;
+            background: #f8f9fa;
+            border-bottom: 2px solid #e9ecef;
+            overflow-x: auto;
+        }
+
+        .tab {
+            flex: 1;
+            padding: 15px 20px;
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            color: #6c757d;
+            transition: all 0.3s;
+            white-space: nowrap;
+        }
+
+        .tab:hover {
+            background: #e9ecef;
+        }
+
+        .tab.active {
+            background: white;
+            color: #667eea;
+            border-bottom: 3px solid #667eea;
+        }
+
+        .tab-content {
+            padding: 30px;
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .form-section {
+            margin-bottom: 30px;
+        }
+
+        .form-section h3 {
+            font-size: 18px;
+            color: #333;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e9ecef;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            font-weight: 500;
+            color: #495057;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+
+        .form-group input[type="text"],
+        .form-group input[type="number"],
+        .form-group input[type="password"],
+        .form-group select {
+            width: 100%;
+            padding: 10px 15px;
+            border: 2px solid #e9ecef;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .form-group small {
+            display: block;
+            color: #6c757d;
+            margin-top: 5px;
+            font-size: 12px;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .checkbox-group input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 15px;
+            justify-content: flex-end;
+            padding: 20px 30px;
+            background: #f8f9fa;
+            border-top: 2px solid #e9ecef;
+        }
+
+        .btn {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+
+        .alert {
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            display: none;
+        }
+
+        .alert.success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+
+        .alert.error {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+
+        .alert.show {
+            display: block;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #6c757d;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .quick-actions {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+
+        .quick-action-card {
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            border: 2px solid transparent;
+        }
+
+        .quick-action-card:hover {
+            border-color: #667eea;
+            transform: translateY(-2px);
+        }
+
+        .quick-action-card h4 {
+            font-size: 16px;
+            color: #333;
+            margin-bottom: 8px;
+        }
+
+        .quick-action-card p {
+            font-size: 12px;
+            color: #6c757d;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <a href="/index.html" class="back-link">← Back to Viewer</a>
+            <h1>🎥 Security Camera Configuration</h1>
+            <p>Configure your WebRTC security camera system</p>
+        </div>
+
+        <div id="alertContainer"></div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('recording')">Recording</button>
+            <button class="tab" onclick="switchTab('video')">Video</button>
+            <button class="tab" onclick="switchTab('motion')">Motion Detection</button>
+            <button class="tab" onclick="switchTab('storage')">Storage</button>
+            <button class="tab" onclick="switchTab('network')">Network</button>
+            <button class="tab" onclick="switchTab('notifications')">Notifications</button>
+        </div>
+
+        <div id="loading" class="loading">
+            <div class="spinner"></div>
+            <p>Loading configuration...</p>
+        </div>
+
+        <form id="configForm" style="display:none;">
+            <!-- Recording Tab -->
+            <div id="recording-tab" class="tab-content active">
+                <div class="form-section">
+                    <h3>Recording Mode</h3>
+                    <div class="form-group">
+                        <label>Recording Type</label>
+                        <select id="recordingMode" onchange="updateRecordingMode()">
+                            <option value="event">Event-Based (Motion Triggered)</option>
+                            <option value="continuous">Continuous Recording</option>
+                            <option value="both">Both</option>
+                        </select>
+                        <small>Event-based records only when motion is detected. Continuous records all the time.</small>
+                    </div>
+                </div>
+
+                <div class="form-section">
+                    <h3>Storage Paths</h3>
+                    <div class="form-group">
+                        <label>Save Directory</label>
+                        <input type="text" id="saveDirectory" placeholder="/path/to/recordings" required>
+                        <small>Directory where recordings will be stored locally</small>
+                    </div>
+                </div>
+
+                <div class="form-section">
+                    <h3>Recording Settings</h3>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Segment Duration (minutes)</label>
+                            <input type="number" id="segmentDuration" min="1" max="60" value="5">
+                            <small>Break recordings into segments</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Pre-Motion Buffer (seconds)</label>
+                            <input type="number" id="preMotionBuffer" min="0" max="60" value="10">
+                            <small>Record before motion detected</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Post-Motion Buffer (seconds)</label>
+                            <input type="number" id="postMotionBuffer" min="0" max="120" value="30">
+                            <small>Continue after motion stops</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Retention Period (days)</label>
+                            <input type="number" id="retentionDays" min="1" max="365" value="7">
+                            <small>Auto-delete old recordings</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Video Tab -->
+            <div id="video-tab" class="tab-content">
+                <div class="form-section">
+                    <h3>Video Quality</h3>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Width (pixels)</label>
+                            <input type="number" id="videoWidth" min="320" max="1920" value="640">
+                        </div>
+                        <div class="form-group">
+                            <label>Height (pixels)</label>
+                            <input type="number" id="videoHeight" min="240" max="1080" value="480">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Frame Rate (fps)</label>
+                            <input type="number" id="framerate" min="1" max="60" value="25">
+                            <small>Higher = smoother but more data</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Bitrate (bits/sec)</label>
+                            <input type="number" id="bitrate" min="100000" max="10000000" value="500000">
+                            <small>Higher = better quality but more storage</small>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-section">
+                    <h3>Quick Presets</h3>
+                    <div class="quick-actions">
+                        <div class="quick-action-card" onclick="setVideoPreset('low')">
+                            <h4>Low Quality</h4>
+                            <p>320x240, 15fps, 200kbps</p>
+                        </div>
+                        <div class="quick-action-card" onclick="setVideoPreset('medium')">
+                            <h4>Medium Quality</h4>
+                            <p>640x480, 25fps, 500kbps</p>
+                        </div>
+                        <div class="quick-action-card" onclick="setVideoPreset('high')">
+                            <h4>High Quality</h4>
+                            <p>1280x720, 30fps, 2Mbps</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Motion Detection Tab -->
+            <div id="motion-tab" class="tab-content">
+                <div class="form-section">
+                    <h3>Detection Settings</h3>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Sensitivity (0-255)</label>
+                            <input type="number" id="motionThreshold" min="0" max="255" value="20" step="0.5">
+                            <small>Lower = more sensitive</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Minimum Area (pixels)</label>
+                            <input type="number" id="minimumArea" min="0" max="10000" value="500">
+                            <small>Ignore small movements</small>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Cooldown Period (seconds)</label>
+                            <input type="number" id="cooldownPeriod" min="0" max="300" value="10">
+                            <small>Minimum time between alerts</small>
+                        </div>
+                        <div class="form-group">
+                            <label>No Motion Delay (seconds)</label>
+                            <input type="number" id="noMotionDelay" min="0" max="60" value="3">
+                            <small>Delay before declaring no motion</small>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-section">
+                    <h3>Advanced Settings</h3>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Min Consecutive Frames</label>
+                            <input type="number" id="minConsecutiveFrames" min="1" max="10" value="2">
+                            <small>Frames needed to trigger</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Frame Skip</label>
+                            <input type="number" id="frameSkip" min="1" max="10" value="2">
+                            <small>Process every Nth frame</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Storage Tab -->
+            <div id="storage-tab" class="tab-content">
+                <div class="form-section">
+                    <h3>MinIO Object Storage</h3>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Endpoint</label>
+                            <input type="text" id="minioEndpoint" placeholder="localhost:9000">
+                        </div>
+                        <div class="form-group">
+                            <label>Bucket Name</label>
+                            <input type="text" id="minioBucket" value="recordings">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Access Key ID</label>
+                            <input type="text" id="minioAccessKey" placeholder="minioadmin">
+                        </div>
+                        <div class="form-group">
+                            <label>Secret Access Key</label>
+                            <input type="password" id="minioSecretKey" placeholder="Leave blank to keep current">
+                        </div>
+                    </div>
+                    <div class="form-group checkbox-group">
+                        <input type="checkbox" id="minioUseSSL">
+                        <label for="minioUseSSL">Use SSL/TLS</label>
+                    </div>
+                </div>
+
+                <div class="form-section">
+                    <h3>PostgreSQL Database</h3>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Host</label>
+                            <input type="text" id="postgresHost" placeholder="localhost">
+                        </div>
+                        <div class="form-group">
+                            <label>Port</label>
+                            <input type="number" id="postgresPort" min="1" max="65535" value="5432">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Database Name</label>
+                            <input type="text" id="postgresDatabase" value="recordings">
+                        </div>
+                        <div class="form-group">
+                            <label>Username</label>
+                            <input type="text" id="postgresUsername" placeholder="recorder">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" id="postgresPassword" placeholder="Leave blank to keep current">
+                        <small>Password will not be displayed for security</small>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Network Tab -->
+            <div id="network-tab" class="tab-content">
+                <div class="form-section">
+                    <h3>Tailscale Configuration</h3>
+                    <div class="form-group checkbox-group">
+                        <input type="checkbox" id="tailscaleEnabled" onchange="updateTailscaleFields()">
+                        <label for="tailscaleEnabled">Enable Tailscale Networking</label>
+                    </div>
+                    <small style="display:block; margin-bottom: 15px;">
+                        Tailscale is REQUIRED for this system. Disabling will prevent WebRTC connections.
+                    </small>
+
+                    <div id="tailscaleFields">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Node Name</label>
+                                <input type="text" id="tailscaleNodeName" placeholder="webcam-security">
+                            </div>
+                            <div class="form-group">
+                                <label>Hostname</label>
+                                <input type="text" id="tailscaleHostname" placeholder="your-device.tailscale.com">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Listen Port</label>
+                                <input type="number" id="tailscalePort" min="1024" max="65535" value="41641">
+                            </div>
+                            <div class="form-group">
+                                <label>Auth Key (optional)</label>
+                                <input type="password" id="tailscaleAuthKey" placeholder="Leave blank if already authenticated">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-section">
+                    <h3>WebRTC Authentication</h3>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Username</label>
+                            <input type="text" id="webrtcUsername" placeholder="camera_user">
+                        </div>
+                        <div class="form-group">
+                            <label>Password</label>
+                            <input type="password" id="webrtcPassword" placeholder="Enter new password">
+                            <small>Leave blank to keep current password</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Notifications Tab -->
+            <div id="notifications-tab" class="tab-content">
+                <div class="form-section">
+                    <h3>Email Notifications</h3>
+                    <div class="form-group">
+                        <label>Notification Method</label>
+                        <select id="emailMethod" onchange="updateEmailFields()">
+                            <option value="disabled">Disabled</option>
+                            <option value="mailersend">MailerSend</option>
+                            <option value="gmail">Gmail OAuth2</option>
+                        </select>
+                    </div>
+
+                    <div id="emailCommonFields" style="display:none;">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>To Email</label>
+                                <input type="email" id="emailTo" placeholder="your-email@example.com">
+                            </div>
+                            <div class="form-group">
+                                <label>From Email</label>
+                                <input type="email" id="emailFrom" placeholder="security@webcam.local">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="mailersendFields" style="display:none;">
+                        <div class="form-group">
+                            <label>MailerSend API Token</label>
+                            <input type="password" id="mailersendToken" placeholder="Enter your API token">
+                        </div>
+                    </div>
+
+                    <div id="gmailFields" style="display:none;">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Gmail Client ID</label>
+                                <input type="text" id="gmailClientId">
+                            </div>
+                            <div class="form-group">
+                                <label>Gmail Client Secret</label>
+                                <input type="password" id="gmailClientSecret">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="button-group">
+                <button type="button" class="btn btn-secondary" onclick="loadConfig()">Reset</button>
+                <button type="submit" class="btn btn-primary">Save Configuration</button>
+            </div>
+        </form>
+    </div>
+
+    <script src="config.js"></script>
+</body>
+</html>

@@ -8,6 +8,23 @@
             font-family: Arial, sans-serif;
             margin: 20px;
         }
+        .config-link {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 10px 20px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: 600;
+            transition: all 0.3s;
+            z-index: 1000;
+        }
+        .config-link:hover {
+            background: #764ba2;
+            transform: translateY(-2px);
+        }
         #video-container {
             margin-top: 20px;
             padding: 20px;
@@ -70,6 +87,7 @@
     <title>Security Camera Viewer</title>
 </head>
 <body>
+    <a href="/config.html" class="config-link">⚙️ Settings</a>
     <div id="status">Connection Status: Initializing...</div>
 
     <div id="video-container" class="video-container">

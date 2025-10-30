@@ -360,6 +360,35 @@ wss.on('close', () => {
     clearInterval(heartbeatInterval);
 });
 
+// Proxy configuration API to Go backend
+const goBackendUrl = process.env.GO_BACKEND_URL || 'http://localhost:8081';
+
+app.get('/api/config', async (req, res) => {
+    try {
+        const response = await fetch(`${goBackendUrl}/api/config`);
+        const data = await response.json();
+        res.json(data);
+    } catch (error) {
+        console.error('Error fetching config from Go backend:', error);
+        res.status(500).json({ error: 'Failed to fetch configuration' });
+    }
+});
+
+app.post('/api/config', async (req, res) => {
+    try {
+        const response = await fetch(`${goBackendUrl}/api/config`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(req.body)
+        });
+        const data = await response.json();
+        res.json(data);
+    } catch (error) {
+        console.error('Error updating config:', error);
+        res.status(500).json({ error: 'Failed to update configuration' });
+    }
+});
+
 // API Routes
 // Authentication status endpoint
 app.get('/api/auth/status', (req, res) => {
