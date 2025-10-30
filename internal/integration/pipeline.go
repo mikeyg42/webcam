@@ -7,7 +7,6 @@ import (
 	"image/png"
 	"log"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -16,7 +15,7 @@ import (
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/framestream"
 	"github.com/mikeyg42/webcam/internal/motion"
-	"github.com/mikeyg42/webcam/internal/video"
+	"github.com/mikeyg42/webcam/internal/recorder"
 )
 
 // Debug image saving - only save once
@@ -31,12 +30,12 @@ type Pipeline struct {
 	config           *config.Config
 	frameDistributor *framestream.FrameDistributor
 	motionDetector   *motion.Detector
-	videoRecorder    *video.Recorder
+	recorderService  *recorder.RecordingService
 }
 
 // NewPipeline creates a new integration pipeline
 func NewPipeline(ctx context.Context, cfg *config.Config, frameDistributor *framestream.FrameDistributor,
-	motionDetector *motion.Detector, videoRecorder *video.Recorder) *Pipeline {
+	motionDetector *motion.Detector, recorderService *recorder.RecordingService) *Pipeline {
 
 	pipelineCtx, cancel := context.WithCancel(ctx)
 
@@ -46,7 +45,7 @@ func NewPipeline(ctx context.Context, cfg *config.Config, frameDistributor *fram
 		config:           cfg,
 		frameDistributor: frameDistributor,
 		motionDetector:   motionDetector,
-		videoRecorder:    videoRecorder,
+		recorderService:  recorderService,
 	}
 }
 
@@ -60,7 +59,7 @@ func (p *Pipeline) Start() error {
 	// Start motion detection pipeline
 	go p.runMotionDetection()
 
-	// Start recording frame consumer
+	// Start recording frame consumer (feeds frames to recorder service)
 	go p.consumeRecordingFrames()
 
 	log.Println("[Pipeline] All pipeline connections started")
@@ -130,8 +129,14 @@ func (p *Pipeline) runMotionDetection() {
 		log.Println("[Pipeline] Motion detector stopped")
 	}()
 
-	// Start motion event handler
-	go p.handleMotionEvents(motionChan)
+	// Motion events are handled via callback to recorder service
+	// (configured in main.go via motionDetector.SetMotionCallback)
+	// Just consume the motionChan to prevent blocking
+	go func() {
+		for range motionChan {
+			// Events already sent to recorder via callback
+		}
+	}()
 
 	// Main frame processing loop
 	frameCount := 0
@@ -188,113 +193,24 @@ func (p *Pipeline) runMotionDetection() {
 	}
 }
 
-// handleMotionEvents processes motion detection events and manages recording
-func (p *Pipeline) handleMotionEvents(motionChan <-chan bool) {
-	log.Println("[Pipeline] Starting motion event handler")
-	isRecording := false
-	var recordingStart time.Time
-	lastMotionTime := time.Time{}
-
-	for {
-		select {
-		case <-p.ctx.Done():
-			log.Println("[Pipeline] Motion handler stopping due to context cancellation")
-			if isRecording {
-				log.Println("[Pipeline] Stopping recording due to shutdown...")
-				if err := p.videoRecorder.StopRecording(); err != nil {
-					log.Printf("[Pipeline] Error stopping recording: %v", err)
-				}
-			}
-			return
-		case motion, ok := <-motionChan:
-			if !ok {
-				log.Println("[Pipeline] Motion channel closed, stopping motion handler")
-				if isRecording {
-					log.Println("[Pipeline] Stopping recording due to channel close...")
-					if err := p.videoRecorder.StopRecording(); err != nil {
-						log.Printf("[Pipeline] Error stopping recording: %v", err)
-					}
-				}
-				return
-			}
-
-			if motion && !isRecording {
-				log.Println("🔴 [Pipeline] MOTION DETECTED - Starting recording...")
-				// Note: For testing, we start recording without a frame channel
-				// The frame distributor record channel is handled separately
-				if err := p.videoRecorder.StartRecording(nil); err != nil {
-					log.Printf("[Pipeline] Error starting recording: %v", err)
-				} else {
-					isRecording = true
-					recordingStart = time.Now()
-					log.Printf("[Pipeline] Recording started at %s", recordingStart.Format("15:04:05"))
-				}
-
-			} else if motion && isRecording {
-				lastMotionTime = time.Now()
-				log.Printf("⚡ [Pipeline] Motion continues (recording for %v)",
-					time.Since(recordingStart).Round(time.Second))
-
-			} else if !motion && isRecording {
-				// Wait before stopping recording
-				if time.Since(lastMotionTime) > p.config.MotionConfig.NoMotionDelay || lastMotionTime.IsZero() {
-					log.Println("⏹️ [Pipeline] No motion detected - Stopping recording...")
-					if err := p.videoRecorder.StopRecording(); err != nil {
-						log.Printf("[Pipeline] Error stopping recording: %v", err)
-					} else {
-						duration := time.Since(recordingStart)
-						log.Printf("[Pipeline] Recording stopped. Duration: %v", duration.Round(time.Second))
-					}
-					isRecording = false
-				}
-			}
-		}
-	}
-}
-
-// consumeRecordingFrames handles frames for recording
-// This function writes frames directly to disk, independent of WebRTC
+// consumeRecordingFrames feeds frames to the recorder service
+// The recorder service handles encoding, segmentation, and storage
 func (p *Pipeline) consumeRecordingFrames() {
 	recordChannel := p.frameDistributor.GetRecordChannel()
-	log.Println("[Pipeline] Starting recording frame consumer (direct-to-disk mode)")
+	log.Println("[Pipeline] Starting recording frame consumer (new recorder service)")
 
-	var videoWriter *gocv.VideoWriter
-	var currentRecordingFile string
-	var recordingStartTime time.Time
 	frameCount := 0
-	framesWritten := 0
 	lastLogTime := time.Now()
-
-	// Cleanup function for video writer
-	closeVideoWriter := func() {
-		if videoWriter != nil && videoWriter.IsOpened() {
-			videoWriter.Close()
-			if currentRecordingFile != "" {
-				// Verify file was created successfully
-				if info, err := os.Stat(currentRecordingFile); err == nil {
-					log.Printf("[Pipeline] Recording closed: %s (%d bytes, %d frames)",
-						currentRecordingFile, info.Size(), framesWritten)
-				}
-			}
-			videoWriter = nil
-			currentRecordingFile = ""
-			framesWritten = 0
-		}
-	}
-
-	defer closeVideoWriter()
 
 	for {
 		select {
 		case <-p.ctx.Done():
 			log.Println("[Pipeline] Recording consumer stopping due to context cancellation")
-			closeVideoWriter()
 			return
 
 		case frame, ok := <-recordChannel:
 			if !ok {
 				log.Println("[Pipeline] Record channel closed, stopping recording consumer")
-				closeVideoWriter()
 				return
 			}
 
@@ -304,81 +220,15 @@ func (p *Pipeline) consumeRecordingFrames() {
 
 			frameCount++
 
-			// Check if recording is active
-			isRecording := p.videoRecorder.IsRecording()
-
-			// Start new recording if needed
-			if isRecording && videoWriter == nil {
-				// Create recording file
-				timestamp := time.Now().Format("2006-01-02_15-04-05")
-				outputDir := p.config.VideoConfig.OutputPath
-				if err := os.MkdirAll(outputDir, 0755); err != nil {
-					log.Printf("[Pipeline] ERROR: Failed to create output directory: %v", err)
-					continue
-				}
-
-				currentRecordingFile = filepath.Join(outputDir, fmt.Sprintf("recording_%s_direct.webm", timestamp))
-
-				// Initialize video writer with VP9 codec
-				// FourCC for VP9: "VP90"
-				fourcc := "VP90"
-				fps := 15.0 // TODO: Get from config
-				width := 1280 // TODO: Get from config
-				height := 720 // TODO: Get from config
-
-				vw, err := gocv.VideoWriterFile(currentRecordingFile, fourcc, fps, width, height, true)
-				if err != nil {
-					log.Printf("[Pipeline] ERROR: Failed to create video writer: %v", err)
-					continue
-				}
-				videoWriter = vw
-
-				if !videoWriter.IsOpened() {
-					log.Printf("[Pipeline] ERROR: Video writer not opened for %s", currentRecordingFile)
-					videoWriter.Close()
-					videoWriter = nil
-					continue
-				}
-
-				recordingStartTime = time.Now()
-				framesWritten = 0
-				log.Printf("[Pipeline] 🔴 Started direct recording to: %s", currentRecordingFile)
+			// Send frame to recorder service
+			if err := p.recorderService.HandleFrame(frame, time.Now()); err != nil {
+				log.Printf("[Pipeline] ERROR: Failed to handle frame: %v", err)
 			}
 
-			// Stop recording if needed
-			if !isRecording && videoWriter != nil {
-				duration := time.Since(recordingStartTime)
-				log.Printf("[Pipeline] ⏹️ Stopping direct recording after %v (%d frames)",
-					duration.Round(time.Second), framesWritten)
-				closeVideoWriter()
-			}
-
-			// Write frame if recording
-			if isRecording && videoWriter != nil && videoWriter.IsOpened() {
-				// Convert image.Image to gocv.Mat
-				mat, err := imageToMat(frame)
-				if err != nil {
-					log.Printf("[Pipeline] ERROR: Failed to convert frame to Mat: %v", err)
-					continue
-				}
-
-				// Write frame to video file
-				if err := videoWriter.Write(mat); err != nil {
-					log.Printf("[Pipeline] ERROR: Failed to write frame: %v", err)
-					mat.Close()
-					continue
-				}
-
-				mat.Close()
-				framesWritten++
-
-				// Log progress
-				if time.Since(lastLogTime) >= 5*time.Second {
-					duration := time.Since(recordingStartTime)
-					log.Printf("[Pipeline] Recording: %d frames written, duration: %v, file: %s",
-						framesWritten, duration.Round(time.Second), filepath.Base(currentRecordingFile))
-					lastLogTime = time.Now()
-				}
+			// Log progress every 5 seconds
+			if time.Since(lastLogTime) >= 5*time.Second {
+				log.Printf("[Pipeline] Processed %d recording frames", frameCount)
+				lastLogTime = time.Now()
 			}
 		}
 	}

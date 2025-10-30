@@ -1,0 +1,91 @@
+version: '3.8'
+
+services:
+  # PostgreSQL - Recording Metadata Storage
+  postgres:
+    image: postgres:15-alpine
+    container_name: webcam2-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: recorder
+      POSTGRES_PASSWORD: recorder
+      POSTGRES_DB: recordings
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./internal/recorder/storage/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recorder -d recordings"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - webcam2
+
+  # MinIO - Video Segment Object Storage
+  minio:
+    image: minio/minio:latest
+    container_name: webcam2-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"  # API
+      - "9001:9001"  # Console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - webcam2
+
+  # MinIO Client - Create bucket on startup
+  minio-setup:
+    image: minio/mc:latest
+    container_name: webcam2-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for MinIO to be ready...';
+      sleep 5;
+      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb --ignore-existing myminio/recordings;
+      /usr/bin/mc anonymous set download myminio/recordings;
+      echo 'MinIO bucket setup complete';
+      exit 0;
+      "
+    networks:
+      - webcam2
+
+  # ion-sfu - WebRTC Selective Forwarding Unit (existing)
+  ion-sfu:
+    image: pionwebrtc/ion-sfu:latest-jsonrpc
+    container_name: webcam2-ion-sfu
+    restart: unless-stopped
+    ports:
+      - "7000:7000"     # WebSocket
+      - "5000-5200:5000-5200/udp"  # WebRTC media
+    volumes:
+      - ./configs/sfu.toml:/configs/sfu.toml:ro
+    command: -c /configs/sfu.toml
+    networks:
+      - webcam2
+
+volumes:
+  postgres_data:
+    driver: local
+  minio_data:
+    driver: local
+
+networks:
+  webcam2:
+    driver: bridge

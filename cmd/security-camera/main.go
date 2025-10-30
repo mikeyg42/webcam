@@ -27,9 +27,11 @@ import (
 	"github.com/mikeyg42/webcam/internal/integration"
 	"github.com/mikeyg42/webcam/internal/motion"
 	"github.com/mikeyg42/webcam/internal/notification"
+	"github.com/mikeyg42/webcam/internal/recorder"
+	"github.com/mikeyg42/webcam/internal/recorder/adapter"
+	"github.com/mikeyg42/webcam/internal/recorder/recorderlog"
 	"github.com/mikeyg42/webcam/internal/rtcManager"
 	"github.com/mikeyg42/webcam/internal/validate"
-	"github.com/mikeyg42/webcam/internal/video"
 
 	_ "github.com/pion/mediadevices/pkg/driver/camera"
 	_ "github.com/pion/mediadevices/pkg/driver/microphone"
@@ -40,7 +42,7 @@ type Application struct {
 	config             *config.Config
 	webrtcManager      *rtcManager.Manager
 	motionDetector     *motion.Detector
-	videoRecorder      *video.Recorder
+	recorderService    *recorder.RecordingService
 	wsConnection       *websocket.Conn
 	notifier           *notification.Notifier
 	frameDistributor   *framestream.FrameDistributor
@@ -51,6 +53,7 @@ type Application struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	drainDoneChannel   chan struct{} // Signal to stop draining channels
+	logger             recorderlog.Logger
 }
 
 // CalibrationResult holds calibration values
@@ -140,6 +143,9 @@ func main() {
 func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (*Application, error) {
 	appCtx, cancel := context.WithCancel(ctx)
 
+	// Create logger for recorder service
+	logger := recorderlog.NewStdLogger().Named("security-camera")
+
 	// Setup email notifications
 	notifier, err := setupEmailNotifications(appCtx)
 	if err != nil {
@@ -154,14 +160,26 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 		return nil, fmt.Errorf("failed to create motion detector: %v", err)
 	}
 
-	// Create video recorder
-	videoRecorder := video.NewRecorder(&video.VideoConfig{
-		Width:      cfg.VideoConfig.Width,
-		Height:     cfg.VideoConfig.Height,
-		Framerate:  cfg.VideoConfig.Framerate,
-		BitRate:    cfg.VideoConfig.BitRate,
-		OutputPath: cfg.VideoConfig.OutputPath,
-	})
+	// Create recorder config
+	recorderCfg, err := adapter.CreateRecorderConfig(cfg)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to create recorder config: %w", err)
+	}
+
+	// Validate recorder config
+	if err := adapter.ValidateConfig(recorderCfg); err != nil {
+		cancel()
+		return nil, fmt.Errorf("invalid recorder config: %w", err)
+	}
+
+	// Create recorder service with real storage
+	logger.Info("Initializing recording service with MinIO and PostgreSQL")
+	recorderService, err := recorder.NewRecordingService(recorderCfg, logger)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to create recorder service: %w", err)
+	}
 
 	var wsConn *websocket.Conn
 	var webrtcManager *rtcManager.Manager
@@ -181,8 +199,9 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 		}
 		log.Println("WebSocket connected")
 
-		// Create WebRTC manager
-		webrtcManager, err = rtcManager.NewManager(appCtx, cfg, wsConn, videoRecorder)
+		// Note: WebRTC manager no longer needs videoRecorder
+		// (recording is handled independently by recorderService)
+		webrtcManager, err = rtcManager.NewManager(appCtx, cfg, wsConn, nil)
 		if err != nil {
 			cancel()
 			wsConn.Close()
@@ -190,17 +209,31 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 		}
 	}
 
-	return &Application{
-		config:         cfg,
-		ctx:            appCtx,
-		cancel:         cancel,
-		motionDetector: motionDetector,
-		videoRecorder:  videoRecorder,
-		notifier:       notifier,
-		wsConnection:   wsConn,
-		webrtcManager:  webrtcManager,
-		testingMode:    testingMode,
-	}, nil
+	app := &Application{
+		config:          cfg,
+		ctx:             appCtx,
+		cancel:          cancel,
+		motionDetector:  motionDetector,
+		recorderService: recorderService,
+		notifier:        notifier,
+		wsConnection:    wsConn,
+		webrtcManager:   webrtcManager,
+		testingMode:     testingMode,
+		logger:          logger,
+	}
+
+	// Wire motion detector callback to recorder service
+	motionDetector.SetMotionCallback(func(confidence float64, regions []image.Rectangle, timestamp time.Time) {
+		// Convert to recorder's MotionEvent format
+		app.recorderService.HandleMotionEvent(recorder.MotionEvent{
+			Timestamp:  timestamp,
+			Confidence: confidence,
+			Regions:    regions,
+		})
+	})
+
+	logger.Info("Application initialized successfully")
+	return app, nil
 }
 
 // Initialize sets up all components
@@ -239,8 +272,8 @@ func (app *Application) Initialize() error {
 	}
 
 	// Create integration pipeline
-	app.pipeline = integration.NewPipeline(app.ctx, app.config, app.frameDistributor, 
-		app.motionDetector, app.videoRecorder)
+	app.pipeline = integration.NewPipeline(app.ctx, app.config, app.frameDistributor,
+		app.motionDetector, app.recorderService)
 
 	// Setup WebRTC signaling
 	if !app.testingMode && app.webrtcManager != nil {
@@ -544,6 +577,12 @@ func (app *Application) startProcessing() error {
 	// Frame distributor is ALREADY running from calibration phase!
 	// Don't start it again - that would cause "panic: close of closed channel"
 
+	// Start recorder service
+	if err := app.recorderService.Start(app.ctx); err != nil {
+		return fmt.Errorf("failed to start recorder service: %v", err)
+	}
+	app.logger.Info("Recording service started")
+
 	// Start motion detector
 	if err := app.motionDetector.Start(); err != nil {
 		return fmt.Errorf("failed to start motion detector: %v", err)
@@ -587,8 +626,10 @@ func (app *Application) Shutdown(ctx context.Context) error {
 			app.motionDetector.Close()
 		}
 
-		if app.videoRecorder != nil {
-			app.videoRecorder.StopRecording()
+		if app.recorderService != nil {
+			if err := app.recorderService.Stop(); err != nil {
+				log.Printf("Error stopping recorder service: %v", err)
+			}
 		}
 
 		if app.wsConnection != nil {
@@ -614,7 +655,6 @@ func (app *Application) Shutdown(ctx context.Context) error {
 // Cleanup releases resources
 func (app *Application) Cleanup() {
 	app.cancel()
-	// Additional cleanup if needed
 }
 
 // selectDevices selects camera and microphone (simplified for brevity)
