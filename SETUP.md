@@ -193,8 +193,8 @@ HOST=0.0.0.0
 
 #### 5. WebRTC connection fails
 - Check firewall settings
-- Verify TURN server is running
-- Consider using Tailscale for better NAT traversal
+- Ensure Tailscale is connected (required for this system)
+- Verify you're on the same tailnet as the camera device
 
 ### Debug Mode
 ```bash

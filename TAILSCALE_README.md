@@ -1,59 +1,94 @@
-# Tailscale WebRTC Security Camera Integration
+# Tailscale-Only WebRTC Security Camera
 
-This document describes how to use Tailscale mesh networking with your WebRTC security camera system to replace traditional TURN servers and enable secure, direct peer-to-peer connections.
+This document describes the **Tailscale-only** networking architecture for the WebRTC security camera system.
+
+## ⚠️ Breaking Change Notice
+
+**As of commit `b3cbadd`, TURN servers have been completely removed.**
+
+- **No fallback** to traditional networking
+- **Tailscale required** - application will fail to start without it
+- **External provisioning** - you must run `tailscale up` before starting the app
+- **ICE restricted** - only Tailscale interfaces used for WebRTC
+
+If you were using TURN servers before, see the [Migration Guide](#-migrating-from-turn) below.
 
 ## 🔗 Overview
 
-The Tailscale integration replaces your current networking architecture with:
+**CRITICAL: This system REQUIRES Tailscale. There is no fallback to traditional TURN servers.**
 
-- **Tailscale mesh networking** instead of traditional TURN servers
+The Tailscale-only architecture provides:
+
+- **Tailscale mesh networking** ONLY (no TURN server option)
 - **Direct peer-to-peer connections** over the Tailscale network
 - **Automatic NAT traversal** handled by Tailscale's infrastructure
 - **Enhanced security** with WireGuard encryption
-- **Simplified deployment** without complex port forwarding
+- **Fail-fast** if Tailscale is not connected
 
-## 📋 Architecture Changes
+## 📋 Architecture
 
-### Before (Traditional)
-```
-Camera Device ←→ TURN Server ←→ Internet ←→ Viewer
-```
-
-### After (Tailscale)
+### Tailscale-Only (Current)
 ```
 Camera Device ←→ Tailscale Network ←→ Viewer
 ```
 
+**Key Points:**
+- No TURN server involved
+- ICE candidates restricted to Tailscale interface only
+- Host candidates rewritten to use Tailscale IP
+- Application fails immediately if Tailscale not connected
+
 ## 🚀 Quick Start
 
-### 1. Run the Setup Script
+### Prerequisites
+
+**IMPORTANT: You must provision Tailscale externally before starting the application.**
+
+1. **Install Tailscale:**
+   ```bash
+   # macOS
+   brew install tailscale
+
+   # Linux
+   curl -fsSL https://tailscale.com/install.sh | sh
+   ```
+
+2. **Connect to your tailnet:**
+   ```bash
+   sudo tailscale up --hostname=webcam-security
+   ```
+
+3. **Verify connection:**
+   ```bash
+   tailscale status
+   tailscale ip -4  # Should show your Tailscale IP
+   ```
+
+### Starting the Application
+
+**With infrastructure services (PostgreSQL, MinIO, ion-sfu):**
 ```bash
-./setup-tailscale.sh
-```
+# Start storage infrastructure
+./scripts/setup-storage.sh
 
-This will:
-- Install Tailscale if needed
-- Configure Tailscale with appropriate hostname
-- Create environment configuration
-- Update ion-sfu settings
-- Generate startup scripts
-
-### 2. Start the Services
-
-**Server (Node.js proxy):**
-```bash
-./start-tailscale-server.sh
+# Start servers
+./startServers.sh
 ```
 
 **Camera Application (Go):**
 ```bash
-./start-tailscale-camera.sh
+go run cmd/security-camera/main.go
 ```
 
-### 3. Access the Interface
+If Tailscale is not connected, the application will exit with an error:
+```
+tailscale is not running (state: <state>) - please start Tailscale externally
+```
 
-- **Local access**: http://localhost:3000/index-tailscale.html
-- **Remote access**: http://YOUR_TAILSCALE_IP:3000/index-tailscale.html
+### Access the Interface
+
+- **Via Tailscale**: http://YOUR_TAILSCALE_IP:3000/index-tailscale.html
+- **Local only**: http://localhost:3000/index-tailscale.html
 
 ## 📁 File Structure
 
@@ -110,43 +145,51 @@ type TailscaleConfig struct {
 
 ## 🔧 How It Works
 
-### 1. Tailscale Network Detection
-- Go backend initializes `TailscaleManager` if enabled
-- Node.js server queries Tailscale status via CLI
-- Frontend receives network configuration from server
+### 1. Tailscale Requirement Enforcement
+- Go backend requires `TailscaleConfig.Enabled = true`
+- Validates Tailscale configuration on startup
+- Fails immediately if Tailscale not running or not connected
+- Queries Tailscale status (read-only, no `tailscale up` execution)
 
-### 2. WebRTC Configuration Adaptation
-- **With Tailscale**: Uses minimal STUN servers, relies on direct connections
-- **Without Tailscale**: Falls back to traditional TURN server configuration
-- ICE candidate gathering optimized for local mesh networks
+### 2. WebRTC ICE Configuration
+- **SetInterfaceFilter**: Forces ICE gathering on tailscale0/utun* interfaces only
+- **SetNAT1To1IPs**: Rewrites host candidates to use Tailscale IP address
+- **Network restrictions**: UDP4/UDP6 only on Tailscale network
+- **Optional STUN**: stun.l.google.com for initial discovery (though not required with Tailscale)
 
 ### 3. Connection Flow
-1. Tailscale handles NAT traversal and creates secure tunnels
-2. WebRTC establishes peer connections over Tailscale network
-3. Media streams flow directly between devices
-4. DERP servers provide relay fallback if direct connection fails
+1. Application verifies Tailscale connection has a valid IP address
+2. WebRTC ICE gathering restricted to Tailscale interface
+3. Host candidates advertise Tailscale IP only
+4. Peer-to-peer connections established over Tailscale network
+5. Media streams flow directly between devices via WireGuard tunnel
+6. Tailscale DERP servers provide relay fallback if needed
 
 ## 🌟 Benefits
 
 ### Performance
-- **Lower latency** due to direct connections
-- **Higher bandwidth** without TURN relay overhead
-- **Better video quality** on local networks
+- **Direct connections** only - no relay overhead
+- **Lower latency** within Tailscale mesh network
+- **Higher bandwidth** without intermediary servers
+- **Consistent video quality** over secure tunnels
 
 ### Security
-- **WireGuard encryption** for all traffic
+- **WireGuard encryption** for all traffic end-to-end
 - **No exposed ports** on public internet
-- **Device authentication** through Tailscale
+- **Device authentication** through Tailscale identity
+- **Network isolation** - only tailnet members can connect
 
 ### Simplicity
-- **No TURN server maintenance**
-- **Automatic NAT traversal**
-- **Easy multi-device setup**
+- **No TURN server** to configure, run, or maintain
+- **No firewall rules** or port forwarding needed
+- **Automatic NAT traversal** handled by Tailscale
+- **External provisioning** - Tailscale managed outside application
 
 ### Reliability
-- **Automatic reconnection** if network changes
-- **DERP fallback** when direct connections fail
-- **Network resilience** with multiple connection paths
+- **Fail-fast** with clear error messages
+- **Status monitoring** via Tailscale CLI
+- **DERP relay fallback** provided by Tailscale infrastructure
+- **Resilient** to network changes (Tailscale handles reconnection)
 
 ## 🔍 Monitoring and Debugging
 
@@ -180,33 +223,51 @@ The web interface shows:
 
 ### Common Issues
 
-#### 1. Tailscale Not Connected
-**Symptoms**: Application falls back to traditional networking
-**Solution**: 
+#### 1. Application Won't Start - Tailscale Not Connected
+**Symptoms**: Application exits with error "tailscale is not running"
+**Solution**:
 ```bash
+# Check Tailscale status
+tailscale status
+
+# If not running, start it
 sudo tailscale up --hostname=your-device-name
+
+# Verify you have an IP
+tailscale ip -4
 ```
 
-#### 2. Can't Reach Peers  
-**Symptoms**: Connection timeouts, falling back to internet routing
+**Note**: The application will NOT start without Tailscale. This is by design.
+
+#### 2. Application Won't Start - No Tailnet IP
+**Symptoms**: Error "tailscale not connected (no tailnet IP)"
+**Solution**:
+- Ensure Tailscale is fully connected: `tailscale status` should show "Running"
+- Check your account is authenticated
+- Verify you're connected to a tailnet
+
+#### 3. Can't Reach Peers
+**Symptoms**: WebRTC connection timeouts
 **Solution**:
 - Check if peers are online: `tailscale status`
-- Test connectivity: `tailscale ping <peer>`
-- Verify firewall settings
+- Test connectivity: `tailscale ping <peer-hostname>`
+- Verify both devices are on same tailnet
+- Check Tailscale ACLs don't block traffic
 
-#### 3. Video Quality Issues
-**Symptoms**: Poor video quality despite local network
+#### 4. Video Quality Issues
+**Symptoms**: Poor video quality or stuttering
 **Solution**:
-- Check if using Tailscale: Look for 🔗 indicator in web interface
-- Verify direct connection: Check WebRTC stats in browser dev tools
-- Monitor bandwidth: `tailscale web` for network dashboard
+- Verify direct connection: Check WebRTC stats in browser (chrome://webrtc-internals/)
+- Look for "host" candidates with Tailscale IPs (100.x.x.x)
+- Monitor Tailscale network: `tailscale web` for dashboard
+- Check for DERP relay usage (indicates no direct path)
 
-#### 4. Port Conflicts
-**Symptoms**: Services fail to start
+#### 5. Front-End Shows "Tailscale Not Detected"
+**Symptoms**: Red error message in web interface
 **Solution**:
-- Check if ports are in use: `netstat -tulpn | grep :3000`
-- Modify PORT in `.env` file
-- Restart services
+- This is expected behavior when Tailscale not connected
+- Connect to Tailscale and reload the page
+- There is no traditional networking fallback
 
 ### Advanced Debugging
 
@@ -321,10 +382,85 @@ npm test
 
 ---
 
+## 🔄 Migrating from TURN
+
+If you were using the previous TURN-based implementation, follow these steps:
+
+### 1. Install and Configure Tailscale
+```bash
+# Install Tailscale
+brew install tailscale  # macOS
+# or
+curl -fsSL https://tailscale.com/install.sh | sh  # Linux
+
+# Connect to your tailnet
+sudo tailscale up --hostname=webcam-security
+
+# Verify connection
+tailscale status
+tailscale ip -4
+```
+
+### 2. Update Configuration
+
+In your config file, ensure:
+```yaml
+TailscaleConfig:
+  Enabled: true
+  NodeName: "webcam-security"
+  # AuthKey optional for production
+```
+
+### 3. Remove TURN References
+
+The following have been removed and are no longer needed:
+- **stun_server.go** - Deleted completely
+- **TURN server environment variables** - No longer read
+- **WebRTC TURN credentials** - Not used
+- **Port 3478** - TURN port no longer needed
+
+### 4. Update SFU Configuration
+
+If using custom ion-sfu config, ensure:
+```toml
+[turn]
+enabled = false  # MUST be false
+```
+
+### 5. Test Connection
+
+1. Start the application
+2. Verify it detects your Tailscale IP in logs
+3. Access web interface via Tailscale IP
+4. Check browser console shows Tailscale networking active
+
+### Common Migration Issues
+
+**Old config still has `TailscaleConfig.Enabled = false`**
+- Update to `true` - this is now required
+
+**Application tries to start TURN server**
+- Pull latest code - TURN code has been deleted
+
+**Front-end shows traditional networking**
+- Clear browser cache and reload
+- Ensure using `index-tailscale.html`
+
+---
+
 ## 📝 License
 
 This Tailscale integration maintains the same license as the main project. See LICENSE file for details.
 
 ---
 
-*This integration transforms your security camera system into a modern, secure, mesh-networked solution. Enjoy the benefits of direct peer-to-peer connections with the security and simplicity of Tailscale!* 🎉
+## 📚 Additional Resources
+
+- **TAILSCALE_INTEGRATION_TODO.md** - Detailed implementation plan (reference)
+- **configs/sfu.toml** - ion-sfu configuration with TURN disabled
+- **internal/tailscale/tailscale.go** - Tailscale manager implementation
+- **internal/rtcManager/manager.go** - WebRTC manager with Tailscale-only setup
+
+---
+
+*This system enforces Tailscale-only networking for maximum security and simplicity. All WebRTC traffic flows exclusively over your private tailnet with WireGuard encryption.* 🔒

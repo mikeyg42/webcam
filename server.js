@@ -383,31 +383,16 @@ app.get('/api/auth/status', (req, res) => {
     });
 });
 
-// Endpoint to provide WebRTC configuration with proper credentials
+// Endpoint to provide WebRTC configuration (Tailscale-only)
 app.get('/api/webrtc-config', (req, res) => {
-    const webrtcUsername = process.env.WEBRTC_USERNAME || 'camera_user';
-    const webrtcPassword = process.env.WEBRTC_PASSWORD || 'change-this-password';
-    const turnPublicIp = process.env.TURN_PUBLIC_IP || '127.0.0.1';
-    const turnPort = process.env.TURN_PORT || '3478';
-
+    // Tailscale-only configuration - no TURN server needed
     const webrtcConfig = {
         codec: 'vp9',
         iceServers: [
-            // Public STUN server (for NAT traversal assistance)
-            { urls: "stun:stun.l.google.com:19302" },
-            // TURN server configuration with dynamic credentials
-            {
-                urls: `turn:${turnPublicIp}:${turnPort}?transport=udp`,
-                username: webrtcUsername,
-                credential: webrtcPassword
-            },
-            {
-                urls: `turn:${turnPublicIp}:${turnPort}?transport=tcp`,
-                username: webrtcUsername,
-                credential: webrtcPassword
-            }
+            // STUN for initial discovery (optional with Tailscale)
+            { urls: "stun:stun.l.google.com:19302" }
         ],
-        iceTransportPolicy: 'all' // Allow both direct and relayed connections
+        iceTransportPolicy: 'all' // Tailscale handles NAT traversal
     };
 
     res.json(webrtcConfig);

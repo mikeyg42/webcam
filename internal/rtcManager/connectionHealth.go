@@ -1180,7 +1180,6 @@ func (cd *ConnectionDoctor) analyzeNetworkStability() {
 	}
 }
 func (cd *ConnectionDoctor) analyzeInfrastructureHealth(metrics QualityMetrics) {
-	// Check TURN server health
 	// Check WebSocket connection health
 	if metrics.WSLatency > criticalWSLatency {
 		cd.warnings <- Warning{

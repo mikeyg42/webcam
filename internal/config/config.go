@@ -59,13 +59,6 @@ type MotionConfig struct {
 	MinConsecutiveFrames int           //
 }
 
-type TURNConfigs struct {
-	PublicIP  string
-	Port      int
-	Users     string //"user=pass,user=pass, ..."
-	Realm     string
-	ThreadNum int
-}
 type WebRTCAuth struct {
 	Username string
 	Password string
@@ -164,17 +157,6 @@ func NewDefaultConfig() *Config {
 			Hostname:   getEnvString("TAILSCALE_HOSTNAME", ""),
 			ListenPort: getEnvInt("TAILSCALE_LISTEN_PORT", 41641),
 		},
-	}
-}
-
-// GetTurnConfigs returns TURN server configuration (fallback when Tailscale is disabled)
-func GetTurnConfigs() *TURNConfigs {
-	return &TURNConfigs{
-		PublicIP:  getEnvString("TURN_PUBLIC_IP", "127.0.0.1"), // Set to your local IP for network access
-		Port:      getEnvInt("TURN_PORT", 3479),
-		Users:     getEnvString("TURN_USERS", "camera_user=change-this-password"), // Should match WEBRTC_* vars
-		Realm:     getEnvString("TURN_REALM", "pion.ly"),
-		ThreadNum: getEnvInt("TURN_THREADS", 4),
 	}
 }
 
