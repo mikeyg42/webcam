@@ -109,24 +109,38 @@ func (p *Pipeline) consumeWebRTCFrames() {
 	}
 }
 
-// runMotionDetection handles motion detection pipeline (calibration now done in main)
+// runMotionDetection handles motion detection pipeline
 func (p *Pipeline) runMotionDetection() {
 	motionChannel := p.frameDistributor.GetMotionChannel()
-	log.Println("[Pipeline] Starting motion detection pipeline (detector already calibrated)")
+	log.Println("[Pipeline] Motion detection pipeline ready (waiting for detector to start)")
 
 	// Create persistent channels for motion detection with larger buffers
 	frameChan := make(chan gocv.Mat, 200)   // Larger buffer to handle processing delays
 	motionChan := make(chan bool, 50)
 
-	// Start motion detector in goroutine (detector is already calibrated from main)
+	// Start motion detector in goroutine - but wait until it's actually started
 	go func() {
-		defer close(motionChan)
-		log.Println("[Pipeline] Starting motion detector Detect() loop")
+		// NOTE: Don't close motionChan here - Detect() already closes it
 
-		// Detector is already started and calibrated in main.go
-		// Just run the Detect loop
-		p.motionDetector.Detect(frameChan, motionChan)
-		log.Println("[Pipeline] Motion detector stopped")
+		// Wait for detector to be started via GUI
+		log.Println("[Pipeline] Waiting for motion detector to be calibrated and started via GUI...")
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-p.ctx.Done():
+				log.Println("[Pipeline] Context cancelled while waiting for detector start")
+				return
+			case <-ticker.C:
+				if p.motionDetector.IsRunning() {
+					log.Println("[Pipeline] Motion detector started - beginning Detect() loop")
+					p.motionDetector.Detect(frameChan, motionChan)
+					log.Println("[Pipeline] Motion detector stopped")
+					return
+				}
+			}
+		}
 	}()
 
 	// Motion events are handled via callback to recorder service
@@ -156,6 +170,12 @@ func (p *Pipeline) runMotionDetection() {
 			}
 
 			if frame != nil {
+				// Only process frames if detector is actually running
+				if !p.motionDetector.IsRunning() {
+					// Detector not started yet - just discard frames silently
+					continue
+				}
+
 				frameCount++
 
 				// Log progress every 5 seconds

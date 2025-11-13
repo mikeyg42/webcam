@@ -260,31 +260,38 @@ func (h *rtcHandler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonr
 func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
 	ctx, cancel := context.WithCancel(appCtx)
 
-	// Require Tailscale - no fallback to TURN
-	if !myconfig.TailscaleConfig.Enabled {
-		cancel()
-		return nil, fmt.Errorf("tailscale is required for WebRTC (TailscaleConfig.Enabled must be true)")
+	// TODO: Re-enable Tailscale requirement for production
+	// TEMPORARY: Bypassed for local development/testing
+	var tailscaleManager *tailscale.TailscaleManager
+	if myconfig.TailscaleConfig.Enabled {
+		if err := tailscale.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {
+			cancel()
+			return nil, fmt.Errorf("tailscale configuration invalid: %w", err)
+		}
+
+		var err error
+		tailscaleManager, err = tailscale.NewTailscaleManager(ctx, &myconfig.TailscaleConfig)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to initialize tailscale: %w", err)
+		}
+		log.Println("Tailscale networking initialized for WebRTC")
+	} else {
+		log.Println("WARNING: Running WebRTC without Tailscale (local development only)")
 	}
 
-	if err := tailscale.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {
-		cancel()
-		return nil, fmt.Errorf("tailscale configuration invalid: %w", err)
+	// Require Tailscale connection (only if enabled)
+	var tsIP string
+	if tailscaleManager != nil {
+		tsIP = tailscaleManager.GetLocalTailscaleIP()
+		if tsIP == "" {
+			cancel()
+			return nil, fmt.Errorf("tailscale not connected (no tailnet IP)")
+		}
+		log.Printf("Tailscale IP: %s", tsIP)
+	} else {
+		log.Println("Skipping Tailscale IP check (Tailscale disabled)")
 	}
-
-	tailscaleManager, err := tailscale.NewTailscaleManager(ctx, &myconfig.TailscaleConfig)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("failed to initialize tailscale: %w", err)
-	}
-	log.Println("Tailscale networking initialized for WebRTC")
-
-	// Require Tailscale connection
-	tsIP := tailscaleManager.GetLocalTailscaleIP()
-	if tsIP == "" {
-		cancel()
-		return nil, fmt.Errorf("tailscale not connected (no tailnet IP)")
-	}
-	log.Printf("Tailscale IP: %s", tsIP)
 
 	// Create ICE configuration - Tailscale only, optional STUN
 	pcConfig := webrtc.Configuration{
@@ -454,10 +461,14 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	})
 
 	// Rewrite host candidates to Tailscale IP (pin to tailnet)
-	tsIP := m.tailscaleManager.GetLocalTailscaleIP()
-	if tsIP != "" {
-		settingEngine.SetNAT1To1IPs([]string{tsIP}, webrtc.ICECandidateTypeHost)
-		log.Printf("ICE configured to use Tailscale IP: %s", tsIP)
+	if m.tailscaleManager != nil {
+		tsIP := m.tailscaleManager.GetLocalTailscaleIP()
+		if tsIP != "" {
+			settingEngine.SetNAT1To1IPs([]string{tsIP}, webrtc.ICECandidateTypeHost)
+			log.Printf("ICE configured to use Tailscale IP: %s", tsIP)
+		}
+	} else {
+		log.Println("Skipping Tailscale ICE configuration (Tailscale disabled)")
 	}
 
 	// Restrict to UDP only

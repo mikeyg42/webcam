@@ -11,12 +11,14 @@ import (
 	"time"
 
 	"github.com/mikeyg42/webcam/internal/config"
+	"github.com/mikeyg42/webcam/internal/crypto"
 )
 
 // ConfigHandler handles configuration API requests
 type ConfigHandler struct {
 	config     *config.Config
 	configFile string
+	masterKey  string // AES-256-GCM master key for password encryption
 }
 
 // NewConfigHandler creates a new configuration handler
@@ -28,9 +30,30 @@ func NewConfigHandler(cfg *config.Config) *ConfigHandler {
 		configFile = filepath.Join(homeDir, ".webcam2", "config.json")
 	}
 
+	// Get or generate master key
+	masterKey := os.Getenv("CONFIG_MASTER_KEY")
+	if masterKey == "" {
+		// Generate new master key
+		var err error
+		masterKey, err = crypto.GenerateMasterKey()
+		if err != nil {
+			log.Printf("[WARN] Failed to generate master key: %v. Password encryption disabled.", err)
+			masterKey = ""
+		} else {
+			log.Println("=======================================================================")
+			log.Println("[IMPORTANT] No CONFIG_MASTER_KEY found. Generated new master key:")
+			log.Printf("  CONFIG_MASTER_KEY=%s", masterKey)
+			log.Println("")
+			log.Println("Add this to your environment variables to encrypt/decrypt passwords.")
+			log.Println("Without this key, encrypted passwords cannot be decrypted!")
+			log.Println("=======================================================================")
+		}
+	}
+
 	return &ConfigHandler{
 		config:     cfg,
 		configFile: configFile,
+		masterKey:  masterKey,
 	}
 }
 
@@ -331,7 +354,7 @@ func (h *ConfigHandler) validateConfigRequest(req *ConfigResponse) error {
 	return nil
 }
 
-// saveConfig saves the current configuration to a file
+// saveConfig saves the current configuration to a file with encrypted passwords
 func (h *ConfigHandler) saveConfig() error {
 	// Ensure config directory exists
 	configDir := filepath.Dir(h.configFile)
@@ -339,8 +362,27 @@ func (h *ConfigHandler) saveConfig() error {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
+	// Get config response (which doesn't include passwords for security)
+	configResp := h.configToResponse()
+
+	// Add encrypted passwords if master key is available
+	if h.masterKey != "" {
+		// Encrypt WebRTC password
+		if h.config.WebrtcAuth.Password != "" {
+			encrypted, err := crypto.EncryptPassword(h.config.WebrtcAuth.Password, h.masterKey)
+			if err != nil {
+				log.Printf("[WARN] Failed to encrypt WebRTC password: %v", err)
+			} else {
+				configResp.WebRTC.Password = encrypted
+			}
+		}
+
+		// Note: MinIO and PostgreSQL passwords are not stored in config struct
+		// They come from the frontend request directly and should be encrypted there
+	}
+
 	// Convert config to JSON
-	data, err := json.MarshalIndent(h.configToResponse(), "", "  ")
+	data, err := json.MarshalIndent(configResp, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}

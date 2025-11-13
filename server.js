@@ -95,8 +95,18 @@ if (process.env.TAILSCALE_ENABLED === 'true') {
     app.use(tailscaleAuthMiddleware);
 }
 
-// Serve static files
-app.use(express.static(path.join(__dirname, 'public')));
+// Serve static files from the new React build (or fallback to old public if not built yet)
+const publicDir = path.join(__dirname, 'public-new');
+const fallbackDir = path.join(__dirname, 'public');
+const fs = require('fs');
+
+if (fs.existsSync(publicDir)) {
+    console.log('Serving React app from public-new/');
+    app.use(express.static(publicDir));
+} else {
+    console.log('React build not found, serving from public/ (old interface)');
+    app.use(express.static(fallbackDir));
+}
 
 // Create HTTP server
 const server = http.createServer(app);
@@ -496,6 +506,37 @@ if (process.env.NODE_ENV === 'development') {
         });
     });
 }
+
+// General API proxy - forward all other /api/* requests to Go backend
+app.use('/api', async (req, res) => {
+    try {
+        // req.url here has /api stripped by Express, so we need to add it back
+        const url = `${goBackendUrl}/api${req.url}`;
+        const options = {
+            method: req.method,
+            headers: { 'Content-Type': 'application/json' },
+        };
+
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+            options.body = JSON.stringify(req.body);
+        }
+
+        const response = await fetch(url, options);
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch (error) {
+        console.error(`Error proxying ${req.method} /api${req.url} to Go backend:`, error);
+        res.status(500).json({ error: 'Failed to proxy request to backend' });
+    }
+});
+
+// SPA catch-all route - serve index.html for all non-API routes
+app.get('*', (req, res) => {
+    const indexPath = fs.existsSync(publicDir)
+        ? path.join(publicDir, 'index.html')
+        : path.join(fallbackDir, 'index.html');
+    res.sendFile(indexPath);
+});
 
 // Error handling middleware
 app.use((err, req, res, next) => {

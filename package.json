@@ -16,5 +16,8 @@
     "uuid": "^11.1.0",
     "ws": "^8.18.1"
   },
-  "description": ""
+  "description": "",
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.17"
+  }
 }

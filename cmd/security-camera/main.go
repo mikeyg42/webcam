@@ -22,9 +22,9 @@ import (
 	"gocv.io/x/gocv"
 
 	"github.com/mikeyg42/webcam/internal/api"
+	"github.com/mikeyg42/webcam/internal/calibration"
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/framestream"
-	"github.com/mikeyg42/webcam/internal/gui"
 	"github.com/mikeyg42/webcam/internal/integration"
 	"github.com/mikeyg42/webcam/internal/motion"
 	"github.com/mikeyg42/webcam/internal/notification"
@@ -44,6 +44,7 @@ type Application struct {
 	webrtcManager      *rtcManager.Manager
 	motionDetector     *motion.Detector
 	recorderService    *recorder.RecordingService
+	calibrationService *calibration.Service
 	wsConnection       *websocket.Conn
 	notifier           *notification.Notifier
 	frameDistributor   *framestream.FrameDistributor
@@ -100,8 +101,8 @@ func main() {
 		log.Fatalf("Failed to initialize: %v", err)
 	}
 
-	// Start API server for configuration management
-	apiServer := api.NewServer(cfg, ":8081")
+	// Start API server with calibration and detection endpoints
+	apiServer := api.NewServer(ctx, cfg, ":8081", app.calibrationService, app.motionDetector, app.frameDistributor)
 	apiServer.StartInBackground()
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -109,20 +110,18 @@ func main() {
 		apiServer.Shutdown(shutdownCtx)
 	}()
 
-	// Run calibration phase
-	calibration := app.runCalibrationPhase()
+	// DON'T start frame distributor yet - it will be started when user clicks "Calibrate Camera"
+	// This prevents the camera from running before calibration
 
-	// Apply calibration to detector
-	app.motionDetector.SetCalibration(calibration.Baseline, calibration.Threshold)
+	// Start main processing (but nothing will happen until calibration starts the camera)
+	log.Println("\n================================")
+	log.Println("SECURITY CAMERA READY")
+	log.Println("================================")
+	log.Println("Web GUI available at: http://localhost:8081")
+	log.Println("Video viewer: http://localhost:3000")
+	log.Println("Camera is OFF - click 'Calibrate Camera' in the web interface to begin")
+	log.Println("================================\n")
 
-	// Wait for user to start detection
-	fmt.Println("\n================================")
-	fmt.Println("CALIBRATION COMPLETE")
-	fmt.Println("================================")
-	fmt.Print("Press ENTER to start motion detection: ")
-	bufio.NewReader(os.Stdin).ReadString('\n')
-
-	// Start main processing
 	errChan := make(chan error, 1)
 	go func() {
 		errChan <- app.startProcessing()
@@ -219,17 +218,21 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 		}
 	}
 
+	// Create calibration service
+	calibrationService := calibration.NewService(cfg.VideoConfig.OutputPath)
+
 	app := &Application{
-		config:          cfg,
-		ctx:             appCtx,
-		cancel:          cancel,
-		motionDetector:  motionDetector,
-		recorderService: recorderService,
-		notifier:        notifier,
-		wsConnection:    wsConn,
-		webrtcManager:   webrtcManager,
-		testingMode:     testingMode,
-		logger:          logger,
+		config:             cfg,
+		ctx:                appCtx,
+		cancel:             cancel,
+		motionDetector:     motionDetector,
+		recorderService:    recorderService,
+		calibrationService: calibrationService,
+		notifier:           notifier,
+		wsConnection:       wsConn,
+		webrtcManager:      webrtcManager,
+		testingMode:        testingMode,
+		logger:             logger,
 	}
 
 	// Wire motion detector callback to recorder service
@@ -584,7 +587,7 @@ func calculateCalibrationResult(samples []float64) CalibrationResult {
 func (app *Application) startProcessing() error {
 	log.Println("Starting main processing...")
 
-	// Frame distributor is ALREADY running from calibration phase!
+	// Frame distributor is ALREADY running from main()!
 	// Don't start it again - that would cause "panic: close of closed channel"
 
 	// Start recorder service
@@ -593,23 +596,22 @@ func (app *Application) startProcessing() error {
 	}
 	app.logger.Info("Recording service started")
 
-	// Start motion detector
-	if err := app.motionDetector.Start(); err != nil {
-		return fmt.Errorf("failed to start motion detector: %v", err)
-	}
+	// DON'T start motion detector automatically - it requires calibration first
+	// The GUI will start it via API after calibration is complete
+	log.Println("Motion detector ready (waiting for calibration and GUI trigger)")
 
 	// Start integration pipeline
 	if err := app.pipeline.Start(); err != nil {
 		return fmt.Errorf("failed to start pipeline: %v", err)
 	}
 
-	// NOW stop the drain goroutine - pipeline is consuming frames
+	// Stop the drain goroutine if it was running
 	if app.drainDoneChannel != nil {
 		close(app.drainDoneChannel)
 		app.drainDoneChannel = nil
 	}
 
-	log.Println("All systems running")
+	log.Println("All systems running - waiting for calibration via web interface")
 
 	// Wait for context cancellation
 	<-app.ctx.Done()

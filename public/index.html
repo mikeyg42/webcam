@@ -83,12 +83,229 @@
             padding: 5px;
             text-align: center;
         }
+
+        /* Calibration Controls */
+        #calibration-controls {
+            margin: 20px 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        .control-panel {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 14px;
+            background: white;
+            color: #333;
+        }
+
+        .status-badge.uncalibrated {
+            background: #fbbf24;
+            color: #78350f;
+        }
+
+        .status-badge.calibrated {
+            background: #10b981;
+            color: white;
+        }
+
+        .status-badge.running {
+            background: #3b82f6;
+            color: white;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+
+        .btn {
+            padding: 10px 24px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s;
+            color: white;
+        }
+
+        .btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-primary {
+            background: #3b82f6;
+        }
+
+        .btn-success {
+            background: #10b981;
+        }
+
+        .btn-danger {
+            background: #ef4444;
+        }
+
+        .btn-secondary {
+            background: #6b7280;
+        }
+
+        /* Calibration Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 2000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.7);
+        }
+
+        .modal.active {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-content {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            max-width: 800px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+
+        .modal-header {
+            margin-bottom: 20px;
+        }
+
+        .modal-header h2 {
+            margin: 0 0 10px 0;
+            color: #333;
+        }
+
+        .progress-container {
+            margin: 20px 0;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 24px;
+            background: #e5e7eb;
+            border-radius: 12px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+            transition: width 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 600;
+            font-size: 12px;
+        }
+
+        .calibration-result {
+            background: #f3f4f6;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+
+        .calibration-result h3 {
+            margin: 0 0 15px 0;
+            color: #333;
+        }
+
+        .result-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+        }
+
+        .result-item {
+            padding: 10px;
+            background: white;
+            border-radius: 6px;
+        }
+
+        .result-item label {
+            display: block;
+            font-size: 12px;
+            color: #6b7280;
+            margin-bottom: 4px;
+        }
+
+        .result-item value {
+            display: block;
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        #calibration-video {
+            width: 100%;
+            max-height: 400px;
+            border-radius: 8px;
+            background: #000;
+            margin: 15px 0;
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 20px;
+        }
+
+        .info-text {
+            color: white;
+            font-size: 14px;
+            margin: 0;
+        }
     </style>
     <title>Security Camera Viewer</title>
 </head>
 <body>
     <a href="/config.html" class="config-link">⚙️ Settings</a>
     <div id="status">Connection Status: Initializing...</div>
+
+    <!-- Calibration Controls -->
+    <div id="calibration-controls">
+        <div class="control-panel">
+            <span class="status-badge uncalibrated" id="detector-status">Uncalibrated</span>
+            <button class="btn btn-primary" id="calibrate-btn" onclick="startCalibration()">Calibrate Camera</button>
+            <button class="btn btn-success" id="start-detection-btn" onclick="startDetection()" disabled>Start Detection</button>
+            <button class="btn btn-danger" id="stop-detection-btn" onclick="stopDetection()" disabled style="display:none;">Stop Detection</button>
+            <p class="info-text" id="calibration-info">Calibrate the camera before starting motion detection</p>
+        </div>
+    </div>
 
     <div id="video-container" class="video-container">
         <div id="stream-info">
@@ -98,6 +315,61 @@
         <div id="remotes"></div>
     </div>
     <div id="debug">Debug Messages:</div>
+
+    <!-- Calibration Modal -->
+    <div id="calibration-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-title">Camera Calibration</h2>
+                <p id="modal-description">Ensure the camera view is empty (no people, pets, or moving objects)</p>
+            </div>
+
+            <div id="calibration-progress" style="display:none;">
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill" style="width: 0%;">
+                            <span id="progress-text">0%</span>
+                        </div>
+                    </div>
+                </div>
+                <p id="progress-message" style="text-align:center; margin-top:10px; color:#666;">Starting calibration...</p>
+            </div>
+
+            <div id="calibration-complete" style="display:none;">
+                <div class="calibration-result">
+                    <h3>Calibration Results</h3>
+                    <div class="result-grid">
+                        <div class="result-item">
+                            <label>Baseline</label>
+                            <value id="result-baseline">-</value>
+                        </div>
+                        <div class="result-item">
+                            <label>Threshold</label>
+                            <value id="result-threshold">-</value>
+                        </div>
+                        <div class="result-item">
+                            <label>Samples Collected</label>
+                            <value id="result-samples">-</value>
+                        </div>
+                        <div class="result-item">
+                            <label>Mean Motion</label>
+                            <value id="result-mean">-</value>
+                        </div>
+                    </div>
+                </div>
+
+                <h3>Preview Recording</h3>
+                <video id="calibration-video" controls></video>
+                <p style="color:#666; font-size:14px; text-align:center;">Review the 10-second calibration recording to ensure the video looks correct</p>
+            </div>
+
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="recalibrate-btn" onclick="startCalibration()" style="display:none;">Recalibrate</button>
+                <button class="btn btn-success" id="apply-btn" onclick="applyCalibration()" style="display:none;">Apply & Start Detection</button>
+                <button class="btn btn-secondary" id="close-modal-btn" onclick="closeCalibrationModal()">Close</button>
+            </div>
+        </div>
+    </div>
 
     <script src="https://unpkg.com/ion-sdk-js@1.5.5/dist/ion-sdk.min.js"></script>
     <script src="https://unpkg.com/ion-sdk-js@1.5.5/dist/json-rpc.min.js"></script>

@@ -61,6 +61,7 @@ type Detector struct {
 	// Detection parameters (fixed after calibration)
 	baselineFlow   float64 // Baseline motion level from calibration
 	fixedThreshold float64 // Detection threshold
+	isCalibrated   bool    // Whether calibration has been performed
 
 	// State management
 	stateMu   sync.RWMutex
@@ -119,8 +120,12 @@ func NewDetector(config *config.MotionConfig, notifier *notification.Notifier) (
 
 // SetCalibration sets the baseline and threshold from calibration
 func (d *Detector) SetCalibration(baseline, threshold float64) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+
 	d.baselineFlow = baseline
 	d.fixedThreshold = threshold
+	d.isCalibrated = true
 	log.Printf("[Detector] Calibration applied - Baseline: %.4f%%, Threshold: %.4f%%", baseline, threshold)
 }
 
@@ -152,6 +157,11 @@ func (d *Detector) Start() error {
 
 	if d.isRunning {
 		return nil
+	}
+
+	// Validate calibration has been performed
+	if !d.isCalibrated {
+		return fmt.Errorf("cannot start motion detector without calibration - call SetCalibration() first")
 	}
 
 	// Reset state
@@ -196,6 +206,20 @@ func (d *Detector) IsRunning() bool {
 	d.stateMu.RLock()
 	defer d.stateMu.RUnlock()
 	return d.isRunning
+}
+
+// IsCalibrated returns whether calibration has been performed
+func (d *Detector) IsCalibrated() bool {
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	return d.isCalibrated
+}
+
+// GetCalibration returns the current calibration values
+func (d *Detector) GetCalibration() (baseline, threshold float64, calibrated bool) {
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	return d.baselineFlow, d.fixedThreshold, d.isCalibrated
 }
 
 // Detect is the main detection loop processing frames

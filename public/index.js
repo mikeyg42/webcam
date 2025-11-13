@@ -319,4 +319,282 @@ window.addEventListener("load", () => {
     logDebug("Security Camera Viewer loaded. Starting connection.");
     updateStreamInfo("Initializing security camera viewer...");
     initializeConnections();
+
+    // Start polling detection status
+    updateDetectionStatus();
+    setInterval(updateDetectionStatus, 2000); // Poll every 2 seconds
 });
+
+// ============================================================================
+// CALIBRATION WORKFLOW
+// ============================================================================
+
+let calibrationPollInterval = null;
+
+// Update detection status badge and buttons
+async function updateDetectionStatus() {
+    try {
+        const response = await fetch('http://localhost:8081/api/detection/status');
+        if (!response.ok) return;
+
+        const data = await response.json();
+        const statusBadge = document.getElementById('detector-status');
+        const calibrateBtn = document.getElementById('calibrate-btn');
+        const startBtn = document.getElementById('start-detection-btn');
+        const stopBtn = document.getElementById('stop-detection-btn');
+        const infoText = document.getElementById('calibration-info');
+
+        if (data.running) {
+            // Detection is running
+            statusBadge.className = 'status-badge running';
+            statusBadge.textContent = 'Detection Active';
+            calibrateBtn.disabled = true;
+            startBtn.style.display = 'none';
+            stopBtn.style.display = 'inline-block';
+            stopBtn.disabled = false;
+            infoText.textContent = `Motion detection active - ${data.stats.motionEvents} events detected`;
+        } else if (data.calibrated) {
+            // Calibrated but not running
+            statusBadge.className = 'status-badge calibrated';
+            statusBadge.textContent = 'Calibrated';
+            calibrateBtn.disabled = false;
+            startBtn.style.display = 'inline-block';
+            startBtn.disabled = false;
+            stopBtn.style.display = 'none';
+            infoText.textContent = 'Ready to start motion detection';
+        } else {
+            // Not calibrated
+            statusBadge.className = 'status-badge uncalibrated';
+            statusBadge.textContent = 'Uncalibrated';
+            calibrateBtn.disabled = false;
+            startBtn.style.display = 'inline-block';
+            startBtn.disabled = true;
+            stopBtn.style.display = 'none';
+            infoText.textContent = 'Calibrate the camera before starting motion detection';
+        }
+    } catch (error) {
+        console.error('Failed to update detection status:', error);
+    }
+}
+
+// Start calibration workflow
+async function startCalibration() {
+    logDebug('Starting calibration workflow...');
+
+    // Open modal
+    const modal = document.getElementById('calibration-modal');
+    modal.classList.add('active');
+
+    // Reset modal state
+    document.getElementById('calibration-progress').style.display = 'block';
+    document.getElementById('calibration-complete').style.display = 'none';
+    document.getElementById('progress-fill').style.width = '0%';
+    document.getElementById('progress-text').textContent = '0%';
+    document.getElementById('progress-message').textContent = 'Preparing calibration...';
+    document.getElementById('recalibrate-btn').style.display = 'none';
+    document.getElementById('apply-btn').style.display = 'none';
+
+    try {
+        // Start calibration
+        const response = await fetch('http://localhost:8081/api/calibration/start', {
+            method: 'POST'
+        });
+
+        if (!response.ok) {
+            const error = await response.text();
+            throw new Error(error);
+        }
+
+        const data = await response.json();
+        logDebug(data.message);
+
+        // Start polling for progress
+        pollCalibrationProgress();
+
+    } catch (error) {
+        logDebug(`Calibration start failed: ${error.message}`);
+        alert(`Failed to start calibration: ${error.message}`);
+        closeCalibrationModal();
+    }
+}
+
+// Poll calibration progress
+function pollCalibrationProgress() {
+    if (calibrationPollInterval) {
+        clearInterval(calibrationPollInterval);
+    }
+
+    calibrationPollInterval = setInterval(async () => {
+        try {
+            const response = await fetch('http://localhost:8081/api/calibration/status');
+            if (!response.ok) return;
+
+            const status = await response.json();
+
+            // Update progress UI
+            const progressFill = document.getElementById('progress-fill');
+            const progressText = document.getElementById('progress-text');
+            const progressMessage = document.getElementById('progress-message');
+
+            progressFill.style.width = `${status.progress}%`;
+            progressText.textContent = `${Math.round(status.progress)}%`;
+            progressMessage.textContent = status.message || 'Processing...';
+
+            // Check if complete
+            if (status.state === 'complete') {
+                clearInterval(calibrationPollInterval);
+                calibrationPollInterval = null;
+                await showCalibrationResult();
+            } else if (status.state === 'error') {
+                clearInterval(calibrationPollInterval);
+                calibrationPollInterval = null;
+                alert(`Calibration error: ${status.error}`);
+                closeCalibrationModal();
+            }
+
+        } catch (error) {
+            console.error('Failed to poll calibration status:', error);
+        }
+    }, 500); // Poll every 500ms
+}
+
+// Show calibration result
+async function showCalibrationResult() {
+    logDebug('Calibration complete, loading result...');
+
+    try {
+        // Fetch calibration result
+        const response = await fetch('http://localhost:8081/api/calibration/result');
+        if (!response.ok) throw new Error('Failed to fetch calibration result');
+
+        const result = await response.json();
+
+        // Update result display
+        document.getElementById('result-baseline').textContent = result.baseline.toFixed(4) + '%';
+        document.getElementById('result-threshold').textContent = result.threshold.toFixed(4) + '%';
+        document.getElementById('result-samples').textContent = result.samples;
+        document.getElementById('result-mean').textContent = result.mean.toFixed(4) + '%';
+
+        // Load calibration video
+        const videoElement = document.getElementById('calibration-video');
+        videoElement.src = 'http://localhost:8081/api/calibration/video?t=' + Date.now();
+
+        // Show result section
+        document.getElementById('calibration-progress').style.display = 'none';
+        document.getElementById('calibration-complete').style.display = 'block';
+        document.getElementById('recalibrate-btn').style.display = 'inline-block';
+        document.getElementById('apply-btn').style.display = 'inline-block';
+
+        logDebug(`Calibration complete - Baseline: ${result.baseline.toFixed(4)}%, Threshold: ${result.threshold.toFixed(4)}%`);
+
+    } catch (error) {
+        logDebug(`Failed to load calibration result: ${error.message}`);
+        alert(`Failed to load calibration result: ${error.message}`);
+        closeCalibrationModal();
+    }
+}
+
+// Apply calibration and start detection
+async function applyCalibration() {
+    logDebug('Applying calibration...');
+
+    try {
+        // Apply calibration
+        const applyResponse = await fetch('http://localhost:8081/api/calibration/apply', {
+            method: 'POST'
+        });
+
+        if (!applyResponse.ok) {
+            const error = await applyResponse.text();
+            throw new Error(error);
+        }
+
+        const applyData = await applyResponse.json();
+        logDebug(applyData.message);
+
+        // Close modal
+        closeCalibrationModal();
+
+        // Update status
+        await updateDetectionStatus();
+
+        alert('Calibration applied successfully! You can now start motion detection.');
+
+    } catch (error) {
+        logDebug(`Failed to apply calibration: ${error.message}`);
+        alert(`Failed to apply calibration: ${error.message}`);
+    }
+}
+
+// Start motion detection
+async function startDetection() {
+    logDebug('Starting motion detection...');
+
+    try {
+        const response = await fetch('http://localhost:8081/api/detection/start', {
+            method: 'POST'
+        });
+
+        if (!response.ok) {
+            const error = await response.text();
+            throw new Error(error);
+        }
+
+        const data = await response.json();
+        logDebug(data.message);
+
+        // Update status
+        await updateDetectionStatus();
+
+    } catch (error) {
+        logDebug(`Failed to start detection: ${error.message}`);
+        alert(`Failed to start detection: ${error.message}`);
+    }
+}
+
+// Stop motion detection
+async function stopDetection() {
+    if (!confirm('Are you sure you want to stop motion detection?')) {
+        return;
+    }
+
+    logDebug('Stopping motion detection...');
+
+    try {
+        const response = await fetch('http://localhost:8081/api/detection/stop', {
+            method: 'POST'
+        });
+
+        if (!response.ok) {
+            const error = await response.text();
+            throw new Error(error);
+        }
+
+        const data = await response.json();
+        logDebug(data.message);
+
+        // Update status
+        await updateDetectionStatus();
+
+    } catch (error) {
+        logDebug(`Failed to stop detection: ${error.message}`);
+        alert(`Failed to stop detection: ${error.message}`);
+    }
+}
+
+// Close calibration modal
+function closeCalibrationModal() {
+    const modal = document.getElementById('calibration-modal');
+    modal.classList.remove('active');
+
+    // Stop polling if active
+    if (calibrationPollInterval) {
+        clearInterval(calibrationPollInterval);
+        calibrationPollInterval = null;
+    }
+
+    // Pause video
+    const videoElement = document.getElementById('calibration-video');
+    videoElement.pause();
+    videoElement.src = '';
+}
