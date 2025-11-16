@@ -1,0 +1,580 @@
+package encoder
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"image"
+	"io"
+	"log"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/go-gst/go-gst/gst"
+	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v4"
+)
+
+// Manager binds a GStreamerPipeline to a WebRTC PeerConnection
+type Manager struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	pc   *webrtc.PeerConnection
+	log  *log.Logger
+	conf EncoderConfig
+
+	pipe *GStreamerPipeline
+
+	track  *webrtc.TrackLocalStaticRTP
+	sender *webrtc.RTPSender
+
+	// Negotiated header fields
+	negPT   uint8
+	negSSRC uint32
+
+	// State management
+	mu      sync.RWMutex
+	started bool
+	stopped atomic.Bool
+
+	// Metrics
+	rtpPacketsSent    atomic.Uint64
+	rtpPacketsDropped atomic.Uint64
+	rtcpPacketsRead   atomic.Uint64
+	lastRTPError      atomic.Value
+}
+
+// ManagerStats combines pipeline and manager metrics
+type ManagerStats struct {
+	PipelineStats     EncoderStats
+	RTPPacketsSent    uint64
+	RTPPacketsDropped uint64
+	RTCPPacketsRead   uint64
+	LastRTPError      string
+}
+
+// CodecInfo describes a detected codec
+type CodecInfo struct {
+	Type        string
+	Hardware    bool
+	EncoderName string
+	Description string
+	Priority    int
+}
+
+// NewManager creates a new encoder manager
+func NewManager(pc *webrtc.PeerConnection, cfg EncoderConfig, logger *log.Logger) *Manager {
+	if logger == nil {
+		logger = log.New(log.Writer(), "[encoder] ", log.LstdFlags)
+	}
+
+	return &Manager{
+		pc:   pc,
+		log:  logger,
+		conf: cfg,
+	}
+}
+
+// Start initializes and starts the encoder pipeline
+func (m *Manager) Start(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.started {
+		return errors.New("manager already started")
+	}
+
+	m.ctx, m.cancel = context.WithCancel(ctx)
+
+	// Choose codec based on hardware capabilities
+	chosenMime, codecInfo := m.chooseCodecForThisHost()
+	m.log.Printf("Selected codec: %s (%s)", chosenMime, codecInfo.Description)
+
+	// Configure pipeline for chosen codec
+	m.configurePipelineForCodec(codecInfo)
+
+	// Create WebRTC track
+	codecCap := m.buildCodecCapability(chosenMime, codecInfo)
+	track, err := webrtc.NewTrackLocalStaticRTP(codecCap, "video", "encstream")
+	if err != nil {
+		return fmt.Errorf("create track: %w", err)
+	}
+
+	// Add transceiver with codec preferences
+	transceiver, err := m.pc.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	})
+	if err != nil {
+		return fmt.Errorf("add transceiver: %w", err)
+	}
+
+	// Set codec preferences
+	if err := transceiver.SetCodecPreferences([]webrtc.RTPCodecCapability{codecCap}); err != nil {
+		m.log.Printf("Warning: failed to set codec preferences: %v", err)
+	}
+
+	sender := transceiver.Sender()
+	m.track = track
+	m.sender = sender
+
+	// Capture negotiated parameters
+	params := sender.GetParameters()
+	if len(params.Encodings) > 0 {
+		m.negSSRC = uint32(params.Encodings[0].SSRC)
+		
+		// Configure sender parameters
+		params.Encodings[0].MaxBitrate = uint32(m.conf.BitrateKbps * 1000)
+		params.Encodings[0].MaxFramerate = float32(m.conf.FrameRate)
+		
+		if err := sender.SetParameters(params); err != nil {
+			m.log.Printf("Warning: failed to set sender parameters: %v", err)
+		}
+	}
+
+	// Get negotiated payload type
+	for _, codec := range params.Codecs {
+		if codec.MimeType == chosenMime {
+			m.negPT = codec.PayloadType
+			break
+		}
+	}
+
+	m.log.Printf("Negotiated SSRC=%d, PT=%d", m.negSSRC, m.negPT)
+
+	// Start RTCP reader
+	m.wg.Add(1)
+	go m.readRTCP()
+
+	// Start GStreamer pipeline
+	pipe, err := NewGStreamerPipeline(m.conf)
+	if err != nil {
+		return fmt.Errorf("create pipeline: %w", err)
+	}
+
+	if err := pipe.Start(m.ctx); err != nil {
+		return fmt.Errorf("start pipeline: %w", err)
+	}
+	m.pipe = pipe
+
+	// Start RTP forwarding
+	m.wg.Add(1)
+	go m.forwardRTP()
+
+	// Start metrics reporter
+	m.wg.Add(1)
+	go m.reportMetrics()
+
+	m.started = true
+	m.log.Printf("Manager started successfully with %s codec", chosenMime)
+	return nil
+}
+
+// Stop gracefully stops the manager
+func (m *Manager) Stop() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.started || m.stopped.Load() {
+		return nil
+	}
+
+	m.stopped.Store(true)
+	m.log.Println("Stopping manager...")
+
+	// Cancel context
+	if m.cancel != nil {
+		m.cancel()
+	}
+
+	// Stop pipeline
+	if m.pipe != nil {
+		m.pipe.Stop()
+		m.pipe = nil
+	}
+
+	// Remove track
+	if m.sender != nil && m.pc != nil {
+		if err := m.pc.RemoveTrack(m.sender); err != nil {
+			m.log.Printf("Warning: failed to remove track: %v", err)
+		}
+	}
+
+	// Wait for goroutines
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		m.log.Println("Manager stopped cleanly")
+	case <-time.After(5 * time.Second):
+		m.log.Println("Warning: manager stop timeout")
+	}
+
+	m.started = false
+
+	// Log final stats
+	m.log.Printf("Final stats: RTP sent=%d, dropped=%d, RTCP read=%d",
+		m.rtpPacketsSent.Load(),
+		m.rtpPacketsDropped.Load(),
+		m.rtcpPacketsRead.Load())
+
+	return nil
+}
+
+// FeedFrame sends a frame to the encoder
+func (m *Manager) FeedFrame(img image.Image) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if !m.started {
+		return errors.New("manager not started")
+	}
+
+	if m.stopped.Load() {
+		return errors.New("manager is stopping")
+	}
+
+	if m.pipe == nil {
+		return errors.New("pipeline not initialized")
+	}
+
+	return m.pipe.FeedFrame(img)
+}
+
+// GetStats returns current statistics
+func (m *Manager) GetStats() ManagerStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	stats := ManagerStats{
+		RTPPacketsSent:    m.rtpPacketsSent.Load(),
+		RTPPacketsDropped: m.rtpPacketsDropped.Load(),
+		RTCPPacketsRead:   m.rtcpPacketsRead.Load(),
+	}
+
+	if m.pipe != nil {
+		stats.PipelineStats = m.pipe.GetStats()
+	}
+
+	if v := m.lastRTPError.Load(); v != nil {
+		stats.LastRTPError = v.(error).Error()
+	}
+
+	return stats
+}
+
+// GetPeerConnection returns the WebRTC peer connection
+func (m *Manager) GetPeerConnection() *webrtc.PeerConnection {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.pc
+}
+
+// SetBitrate dynamically adjusts the encoding bitrate
+func (m *Manager) SetBitrate(kbps int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.started || m.pipe == nil {
+		return errors.New("manager not started")
+	}
+
+	// Update config
+	m.conf.BitrateKbps = kbps
+
+	// Update sender parameters
+	if m.sender != nil {
+		params := m.sender.GetParameters()
+		if len(params.Encodings) > 0 {
+			params.Encodings[0].MaxBitrate = uint32(kbps * 1000)
+			return m.sender.SetParameters(params)
+		}
+	}
+
+	// TODO: Add dynamic bitrate update to GStreamer pipeline
+	return nil
+}
+
+// readRTCP handles incoming RTCP packets
+func (m *Manager) readRTCP() {
+	defer m.wg.Done()
+
+	buf := make([]byte, 1500)
+	consecutiveErrors := 0
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		default:
+		}
+
+		// Set read deadline
+		deadline := time.Now().Add(time.Second)
+		if err := m.sender.SetReadDeadline(deadline); err != nil {
+			if !errors.Is(err, io.EOF) {
+				m.log.Printf("Failed to set RTCP read deadline: %v", err)
+			}
+			return
+		}
+
+		n, _, err := m.sender.Read(buf)
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+				return
+			}
+
+			// Ignore timeout errors
+			if netErr, ok := err.(*net.Error); ok && netErr.Timeout() {
+				continue
+			}
+
+			consecutiveErrors++
+			if consecutiveErrors > 10 {
+				m.log.Printf("Too many RTCP read errors: %v", err)
+				return
+			}
+			continue
+		}
+
+		if n > 0 {
+			m.rtcpPacketsRead.Add(1)
+			consecutiveErrors = 0
+		}
+	}
+}
+
+// forwardRTP forwards RTP packets from the pipeline to WebRTC
+func (m *Manager) forwardRTP() {
+	defer m.wg.Done()
+
+	if m.pipe == nil {
+		m.log.Println("No pipeline available")
+		return
+	}
+
+	rtpChan := m.pipe.GetRTPChannel()
+	if rtpChan == nil {
+		m.log.Println("RTP channel is nil")
+		return
+	}
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	packetsInPeriod := uint64(0)
+	periodStart := time.Now()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+
+		case pkt, ok := <-rtpChan:
+			if !ok {
+				m.log.Println("RTP channel closed")
+				return
+			}
+
+			// Remap SSRC and PayloadType
+			if m.negSSRC != 0 {
+				pkt.SSRC = m.negSSRC
+			}
+			if m.negPT != 0 {
+				pkt.PayloadType = m.negPT
+			}
+
+			// Write to track
+			if err := m.track.WriteRTP(pkt); err != nil {
+				if !errors.Is(err, io.ErrClosedPipe) {
+					m.rtpPacketsDropped.Add(1)
+					m.lastRTPError.Store(err)
+
+					if m.rtpPacketsDropped.Load()%100 == 0 {
+						m.log.Printf("RTP write errors: %d total, latest: %v",
+							m.rtpPacketsDropped.Load(), err)
+					}
+				}
+			} else {
+				m.rtpPacketsSent.Add(1)
+				packetsInPeriod++
+			}
+
+		case <-ticker.C:
+			elapsed := time.Since(periodStart).Seconds()
+			pps := float64(packetsInPeriod) / elapsed
+			m.log.Printf("RTP rate: %.1f packets/sec, sent: %d, dropped: %d",
+				pps, m.rtpPacketsSent.Load(), m.rtpPacketsDropped.Load())
+			packetsInPeriod = 0
+			periodStart = time.Now()
+		}
+	}
+}
+
+// reportMetrics periodically logs metrics
+func (m *Manager) reportMetrics() {
+	defer m.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			stats := m.GetStats()
+			pStats := stats.PipelineStats
+
+			m.log.Printf("Pipeline: frames=%d, packets=%d, dropped=%d, bytes=%d",
+				pStats.GetFramesIn(),
+				pStats.GetPacketsOut(),
+				pStats.GetDroppedFrames(),
+				pStats.GetBytesEncoded())
+
+			if !pStats.GetLastKeyframe().IsZero() {
+				keyframeAge := time.Since(pStats.GetLastKeyframe())
+				if keyframeAge > 10*time.Second {
+					m.log.Printf("Warning: keyframe age: %v", keyframeAge)
+				}
+			}
+		}
+	}
+}
+
+// chooseCodecForThisHost probes available encoders
+func (m *Manager) chooseCodecForThisHost() (string, CodecInfo) {
+	gst.Init(nil)
+
+	// Priority order matching pipeline
+	codecs := []struct {
+		element string
+		mime    string
+		info    CodecInfo
+	}{
+		{
+			element: "nvh264enc",
+			mime:    webrtc.MimeTypeH264,
+			info: CodecInfo{
+				Type:        "h264",
+				Hardware:    true,
+				EncoderName: "nvh264enc",
+				Description: "NVIDIA NVENC H.264",
+				Priority:    1,
+			},
+		},
+		{
+			element: "vah264enc",
+			mime:    webrtc.MimeTypeH264,
+			info: CodecInfo{
+				Type:        "h264",
+				Hardware:    true,
+				EncoderName: "vah264enc",
+				Description: "Intel VA-API H.264",
+				Priority:    2,
+			},
+		},
+		{
+			element: "vaapih264enc",
+			mime:    webrtc.MimeTypeH264,
+			info: CodecInfo{
+				Type:        "h264",
+				Hardware:    true,
+				EncoderName: "vaapih264enc",
+				Description: "VA-API H.264 (legacy)",
+				Priority:    3,
+			},
+		},
+		{
+			element: "vp9enc",
+			mime:    webrtc.MimeTypeVP9,
+			info: CodecInfo{
+				Type:        "vp9",
+				Hardware:    false,
+				EncoderName: "vp9enc",
+				Description: "VP9 (libvpx, software)",
+				Priority:    4,
+			},
+		},
+		{
+			element: "x264enc",
+			mime:    webrtc.MimeTypeH264,
+			info: CodecInfo{
+				Type:        "h264",
+				Hardware:    false,
+				EncoderName: "x264enc",
+				Description: "H.264 (x264, software)",
+				Priority:    5,
+			},
+		},
+	}
+
+	// Probe each encoder
+	for _, codec := range codecs {
+		if elem, err := gst.NewElement(codec.element); err == nil && elem != nil {
+			elem.SetState(gst.StateNull)
+			return codec.mime, codec.info
+		}
+	}
+
+	// Fallback
+	m.log.Println("Warning: no encoders found, defaulting to H.264")
+	return webrtc.MimeTypeH264, CodecInfo{
+		Type:        "h264",
+		Hardware:    false,
+		EncoderName: "unknown",
+		Description: "H.264 (fallback)",
+		Priority:    99,
+	}
+}
+
+// configurePipelineForCodec adjusts config for chosen codec
+func (m *Manager) configurePipelineForCodec(info CodecInfo) {
+	switch info.Type {
+	case "vp9":
+		if m.conf.Threads < 4 {
+			m.conf.Threads = 4
+		}
+		if m.conf.BitrateKbps < 2000 {
+			m.conf.BitrateKbps = 2000
+		}
+
+	case "h264":
+		if info.Hardware {
+			if m.conf.BitrateKbps < 3000 {
+				m.conf.BitrateKbps = 3000
+			}
+		}
+	}
+
+	m.conf.PreferredEncoder = info.EncoderName
+	m.conf.PreferHardware = info.Hardware
+}
+
+// buildCodecCapability creates codec capability
+func (m *Manager) buildCodecCapability(mime string, info CodecInfo) webrtc.RTPCodecCapability {
+	cap := webrtc.RTPCodecCapability{
+		MimeType:  mime,
+		ClockRate: 90000,
+	}
+
+	switch mime {
+	case webrtc.MimeTypeH264:
+		cap.SDPFmtpLine = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+
+	case webrtc.MimeTypeVP9:
+		cap.SDPFmtpLine = "profile-id=0"
+
+	case webrtc.MimeTypeAV1:
+		cap.SDPFmtpLine = "profile=0;level-idx=5;tier=0"
+	}
+
+	return cap
+}

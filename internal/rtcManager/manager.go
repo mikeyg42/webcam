@@ -34,6 +34,7 @@ import (
 
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/tailscale"
+	"github.com/mikeyg42/webcam/internal/validate"
 	"github.com/mikeyg42/webcam/internal/video"
 )
 
@@ -177,6 +178,20 @@ type Manager struct {
 	}
 	rtcpFeedbackBuffer *RTCPFeedbackBuffer
 	signalingReady     atomic.Bool // Track when initial signaling setup is complete
+
+	// External RTP source support (GStreamer pipeline)
+	videoTrack               *webrtc.TrackLocalStaticRTP
+	audioTrack               *webrtc.TrackLocalStaticRTP
+	negotiatedVideoSSRC      uint32
+	negotiatedVideoPayloadType uint8
+	negotiatedAudioSSRC      uint32
+	negotiatedAudioPayloadType uint8
+	rtpForwardingActive      atomic.Bool
+	rtpStatsLock             sync.RWMutex
+	videoPacketsSent         uint64
+	audioPacketsSent         uint64
+	videoPacketsDropped      uint64
+	audioPacketsDropped      uint64
 }
 type MediaConstraints struct {
 	Video struct {
@@ -264,7 +279,7 @@ func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websock
 	// TEMPORARY: Bypassed for local development/testing
 	var tailscaleManager *tailscale.TailscaleManager
 	if myconfig.TailscaleConfig.Enabled {
-		if err := tailscale.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {
+		if err := validate.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {
 			cancel()
 			return nil, fmt.Errorf("tailscale configuration invalid: %w", err)
 		}
@@ -1178,6 +1193,20 @@ func (m *Manager) setupVideoTrack() (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSen
 		return nil, nil, fmt.Errorf("failed to add video track: %v", err)
 	}
 
+	// Store the video track for external RTP source attachment
+	m.videoTrack = videoTrack
+
+	// Extract negotiated SSRC and PayloadType from sender parameters
+	params := videoRtpSender.GetParameters()
+	if len(params.Encodings) > 0 && params.Encodings[0].SSRC != 0 {
+		m.negotiatedVideoSSRC = uint32(params.Encodings[0].SSRC)
+		log.Printf("[setupVideoTrack] Negotiated video SSRC: %d", m.negotiatedVideoSSRC)
+	}
+	if len(params.Codecs) > 0 {
+		m.negotiatedVideoPayloadType = uint8(params.Codecs[0].PayloadType)
+		log.Printf("[setupVideoTrack] Negotiated video PayloadType: %d", m.negotiatedVideoPayloadType)
+	}
+
 	return videoTrack, videoRtpSender, nil
 }
 
@@ -1197,6 +1226,20 @@ func (m *Manager) setupAudioTrack() (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSen
 	audioRtpSender, err := m.PeerConnection.AddTrack(audioTrack)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to add audio track: %v", err)
+	}
+
+	// Store the audio track for external RTP source attachment
+	m.audioTrack = audioTrack
+
+	// Extract negotiated SSRC and PayloadType from sender parameters
+	params := audioRtpSender.GetParameters()
+	if len(params.Encodings) > 0 && params.Encodings[0].SSRC != 0 {
+		m.negotiatedAudioSSRC = uint32(params.Encodings[0].SSRC)
+		log.Printf("[setupAudioTrack] Negotiated audio SSRC: %d", m.negotiatedAudioSSRC)
+	}
+	if len(params.Codecs) > 0 {
+		m.negotiatedAudioPayloadType = uint8(params.Codecs[0].PayloadType)
+		log.Printf("[setupAudioTrack] Negotiated audio PayloadType: %d", m.negotiatedAudioPayloadType)
 	}
 
 	return audioTrack, audioRtpSender, nil
@@ -1401,34 +1444,36 @@ func (m *Manager) SetupMediaTracks(
 	log.Println("[SetupMediaTracks] Media stream generated successfully")
 
 	// Setup local static video track
-	videoTrack, videoSender, err := m.setupVideoTrack()
+	_, videoSender, err := m.setupVideoTrack()
 	if err != nil {
 		// Try to continue with audio only if video fails
 		log.Printf("[SetupMediaTracks] Video track setup failed: %v, attempting audio-only mode", err)
 
 		// Setup audio track only
-		audioTrack, audioSender, err := m.setupAudioTrack()
+		_, audioSender, err := m.setupAudioTrack()
 		if err != nil {
 			return fmt.Errorf("both video and audio track setup failed: %v", err)
 		}
 
 		go m.readRTCP(audioSender, "audio")
-		go m.attachMediaKind(audioTrack, audioSender, false /* isAudio */)
+		// NOTE: attachMediaKind() disabled - using external RTP source (GStreamer)
+		// Tracks are now stored in Manager struct (m.videoTrack, m.audioTrack)
 
-		log.Println("[SetupMediaTracks] Successfully set up audio-only mode")
+		log.Println("[SetupMediaTracks] Successfully set up audio-only mode (awaiting external RTP source)")
 		return nil
 	}
 
 	// Setup local static audio track
-	audioTrack, audioSender, err := m.setupAudioTrack()
+	_, audioSender, err := m.setupAudioTrack()
 	if err != nil {
 		log.Printf("[SetupMediaTracks] Audio track setup failed: %v, continuing with video-only mode", err)
 
 		// Continue with video only
 		go m.readRTCP(videoSender, "video")
-		go m.attachMediaKind(videoTrack, videoSender, true /* isVideo */)
+		// NOTE: attachMediaKind() disabled - using external RTP source (GStreamer)
+		// Tracks are now stored in Manager struct (m.videoTrack, m.audioTrack)
 
-		log.Println("[SetupMediaTracks] Successfully set up video-only mode")
+		log.Println("[SetupMediaTracks] Successfully set up video-only mode (awaiting external RTP source)")
 		return nil
 	}
 
@@ -1436,12 +1481,147 @@ func (m *Manager) SetupMediaTracks(
 	go m.readRTCP(videoSender, "video")
 	go m.readRTCP(audioSender, "audio")
 
-	// Attach the newly captured media to those local tracks
-	go m.attachMediaKind(videoTrack, videoSender, true /* isVideo */)
-	go m.attachMediaKind(audioTrack, audioSender, false /* isAudio */)
+	// NOTE: attachMediaKind() calls disabled - using external RTP source (GStreamer)
+	// The newly captured media from mediadevices is NO LONGER used
+	// Instead, RTP packets from GStreamer pipeline will be forwarded via AttachExternalRTPSource()
+	// go m.attachMediaKind(videoTrack, videoSender, true /* isVideo */)
+	// go m.attachMediaKind(audioTrack, audioSender, false /* isAudio */)
 
-	log.Println("[SetupMediaTracks] Successfully set up both video and audio tracks")
+	log.Println("[SetupMediaTracks] Successfully set up both video and audio tracks (awaiting external RTP source)")
 	return nil
+}
+
+// AttachExternalRTPSource connects external RTP channels (e.g., from GStreamer) to WebRTC tracks
+// This allows using an external encoder (like GStreamer VP9) instead of mediadevices built-in encoder
+func (m *Manager) AttachExternalRTPSource(videoRTP <-chan *rtp.Packet, audioRTP <-chan *rtp.Packet) error {
+	if m.videoTrack == nil && m.audioTrack == nil {
+		return fmt.Errorf("no tracks available - call SetupMediaTracks first")
+	}
+
+	// Mark RTP forwarding as active
+	m.rtpForwardingActive.Store(true)
+	log.Println("[AttachExternalRTPSource] Starting external RTP packet forwarding")
+
+	// Start video RTP forwarding goroutine
+	if videoRTP != nil && m.videoTrack != nil {
+		go m.forwardExternalRTP(videoRTP, m.videoTrack, true, "video")
+		log.Println("[AttachExternalRTPSource] Video RTP forwarding goroutine started")
+	} else if videoRTP == nil {
+		log.Println("[AttachExternalRTPSource] No video RTP channel provided")
+	} else if m.videoTrack == nil {
+		log.Println("[AttachExternalRTPSource] No video track available")
+	}
+
+	// Start audio RTP forwarding goroutine
+	if audioRTP != nil && m.audioTrack != nil {
+		go m.forwardExternalRTP(audioRTP, m.audioTrack, false, "audio")
+		log.Println("[AttachExternalRTPSource] Audio RTP forwarding goroutine started")
+	} else if audioRTP == nil {
+		log.Println("[AttachExternalRTPSource] No audio RTP channel provided")
+	} else if m.audioTrack == nil {
+		log.Println("[AttachExternalRTPSource] No audio track available")
+	}
+
+	return nil
+}
+
+// forwardExternalRTP forwards RTP packets from external source to WebRTC track
+// Handles SSRC and PayloadType remapping based on negotiated values
+func (m *Manager) forwardExternalRTP(rtpChan <-chan *rtp.Packet, track *webrtc.TrackLocalStaticRTP, isVideo bool, mediaKind string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[forwardExternalRTP] Panic in %s forwarding: %v\nStack: %s", mediaKind, r, debug.Stack())
+		}
+	}()
+
+	log.Printf("[forwardExternalRTP] Started forwarding %s RTP packets", mediaKind)
+
+	var ssrc uint32
+	var payloadType uint8
+	var packetsSent *uint64
+	var packetsDropped *uint64
+
+	if isVideo {
+		ssrc = m.negotiatedVideoSSRC
+		payloadType = m.negotiatedVideoPayloadType
+		packetsSent = &m.videoPacketsSent
+		packetsDropped = &m.videoPacketsDropped
+	} else {
+		ssrc = m.negotiatedAudioSSRC
+		payloadType = m.negotiatedAudioPayloadType
+		packetsSent = &m.audioPacketsSent
+		packetsDropped = &m.audioPacketsDropped
+	}
+
+	log.Printf("[forwardExternalRTP] %s remapping: SSRC=%d, PayloadType=%d", mediaKind, ssrc, payloadType)
+
+	// Stats ticker for periodic logging
+	statsTicker := time.NewTicker(10 * time.Second)
+	defer statsTicker.Stop()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			log.Printf("[forwardExternalRTP] Context cancelled, stopping %s forwarding", mediaKind)
+			return
+
+		case pkt, ok := <-rtpChan:
+			if !ok {
+				log.Printf("[forwardExternalRTP] %s RTP channel closed", mediaKind)
+				return
+			}
+
+			if pkt == nil {
+				continue
+			}
+
+			// Create a copy to avoid modifying the original
+			forwardPkt := *pkt
+
+			// Remap SSRC and PayloadType if negotiated values are available
+			if ssrc != 0 {
+				forwardPkt.SSRC = ssrc
+			}
+			if payloadType != 0 {
+				forwardPkt.PayloadType = payloadType
+			}
+
+			// Write to WebRTC track
+			if err := track.WriteRTP(&forwardPkt); err != nil {
+				atomic.AddUint64(packetsDropped, 1)
+
+				// Only log first few errors to avoid spam
+				if atomic.LoadUint64(packetsDropped) <= 5 {
+					log.Printf("[forwardExternalRTP] Error writing %s RTP packet: %v", mediaKind, err)
+				}
+				continue
+			}
+
+			atomic.AddUint64(packetsSent, 1)
+
+		case <-statsTicker.C:
+			// Log stats periodically
+			m.rtpStatsLock.RLock()
+			sent := atomic.LoadUint64(packetsSent)
+			dropped := atomic.LoadUint64(packetsDropped)
+			m.rtpStatsLock.RUnlock()
+
+			if sent > 0 || dropped > 0 {
+				log.Printf("[forwardExternalRTP] %s stats: sent=%d, dropped=%d", mediaKind, sent, dropped)
+			}
+		}
+	}
+}
+
+// GetRTPStats returns current RTP forwarding statistics
+func (m *Manager) GetRTPStats() (videoSent, videoDropped, audioSent, audioDropped uint64) {
+	m.rtpStatsLock.RLock()
+	defer m.rtpStatsLock.RUnlock()
+
+	return atomic.LoadUint64(&m.videoPacketsSent),
+		atomic.LoadUint64(&m.videoPacketsDropped),
+		atomic.LoadUint64(&m.audioPacketsSent),
+		atomic.LoadUint64(&m.audioPacketsDropped)
 }
 
 // attachMediaKind is a helper that takes either "video" or "audio" tracks

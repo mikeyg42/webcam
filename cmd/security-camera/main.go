@@ -24,12 +24,12 @@ import (
 	"github.com/mikeyg42/webcam/internal/api"
 	"github.com/mikeyg42/webcam/internal/calibration"
 	"github.com/mikeyg42/webcam/internal/config"
+	"github.com/mikeyg42/webcam/internal/encoder"
 	"github.com/mikeyg42/webcam/internal/framestream"
 	"github.com/mikeyg42/webcam/internal/integration"
 	"github.com/mikeyg42/webcam/internal/motion"
 	"github.com/mikeyg42/webcam/internal/notification"
 	"github.com/mikeyg42/webcam/internal/recorder"
-	"github.com/mikeyg42/webcam/internal/recorder/adapter"
 	"github.com/mikeyg42/webcam/internal/recorder/recorderlog"
 	"github.com/mikeyg42/webcam/internal/rtcManager"
 	"github.com/mikeyg42/webcam/internal/validate"
@@ -48,6 +48,7 @@ type Application struct {
 	wsConnection       *websocket.Conn
 	notifier           *notification.Notifier
 	frameDistributor   *framestream.FrameDistributor
+	gstPipeline        *encoder.GStreamerPipeline // GStreamer VP9 encoder
 	pipeline           *integration.Pipeline
 	selectedCamera     mediadevices.MediaDeviceInfo
 	selectedMicrophone mediadevices.MediaDeviceInfo
@@ -84,7 +85,7 @@ func main() {
 		debugMode   bool
 		testingMode bool
 	)
-	flag.StringVar(&cfg.WebSocketAddr, "addr", cfg.WebSocketAddr, "WebSocket server address")
+	flag.StringVar(&cfg.WebSocket.ListenAddr, "addr", cfg.WebSocket.ListenAddr, "WebSocket server address")
 	flag.BoolVar(&debugMode, "debug", false, "Enable debug mode")
 	flag.BoolVar(&testingMode, "testing", false, "Testing mode (skip WebRTC)")
 	flag.Parse()
@@ -163,28 +164,15 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 	}
 
 	// Create motion detector
-	motionDetector, err := motion.NewDetector(&cfg.MotionConfig, notifier)
+	motionDetector, err := motion.NewDetector(&cfg.Motion, notifier)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to create motion detector: %v", err)
 	}
 
-	// Create recorder config
-	recorderCfg, err := adapter.CreateRecorderConfig(cfg)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("failed to create recorder config: %w", err)
-	}
-
-	// Validate recorder config
-	if err := adapter.ValidateConfig(recorderCfg); err != nil {
-		cancel()
-		return nil, fmt.Errorf("invalid recorder config: %w", err)
-	}
-
-	// Create recorder service with real storage
+	// Create recorder service with full config (it uses adapter internally)
 	logger.Info("Initializing recording service with MinIO and PostgreSQL")
-	recorderService, err := recorder.NewRecordingService(recorderCfg, logger)
+	recorderService, err := recorder.NewRecordingService(cfg, logger)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to create recorder service: %w", err)
@@ -195,7 +183,7 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 
 	if !testingMode {
 		// Connect to WebSocket server
-		wsURL := fmt.Sprintf("ws://%s/ws?roomId=cameraRoom", cfg.WebSocketAddr)
+		wsURL := fmt.Sprintf("ws://%s/ws?roomId=cameraRoom", cfg.WebSocket.ListenAddr)
 		log.Printf("Connecting to WebSocket: %s", wsURL)
 
 		dialer := websocket.Dialer{
@@ -219,7 +207,7 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 	}
 
 	// Create calibration service
-	calibrationService := calibration.NewService(cfg.VideoConfig.OutputPath)
+	calibrationService := calibration.NewService(cfg.Video.OutputPath)
 
 	app := &Application{
 		config:             cfg,
@@ -253,22 +241,21 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 func (app *Application) Initialize() error {
 	log.Println("Initializing application...")
 
-	var codecSelector *mediadevices.CodecSelector
 	var camera, microphone mediadevices.MediaDeviceInfo
 	var err error
 
+	// Select devices (no codec selector needed - we'll use GStreamer)
 	if app.testingMode {
-		// Testing mode - basic setup
-		codecSelector = &mediadevices.CodecSelector{}
 		camera, microphone, err = app.selectDevicesForTesting()
 	} else {
-		// Production mode - full WebRTC setup
-		codecSelector, err = app.webrtcManager.Initialize()
+		// Initialize WebRTC manager (creates peer connection)
+		_, err = app.webrtcManager.Initialize()
 		if err != nil {
 			return fmt.Errorf("WebRTC initialization failed: %v", err)
 		}
 
-		camera, microphone, err = app.selectDevices(codecSelector)
+		// Select devices without codec selector
+		camera, microphone, err = app.selectDevicesSimple()
 	}
 
 	if err != nil {
@@ -278,21 +265,84 @@ func (app *Application) Initialize() error {
 	app.selectedCamera = camera
 	app.selectedMicrophone = microphone
 
-	// Create frame distributor
-	app.frameDistributor, err = framestream.NewFrameDistributor(app.ctx, camera, codecSelector)
+	// Create frame distributor (captures raw frames only)
+	app.frameDistributor, err = framestream.NewFrameDistributor(app.ctx, camera)
 	if err != nil {
 		return fmt.Errorf("failed to create frame distributor: %v", err)
 	}
 
-	// Create integration pipeline
+	// Start camera at 640x480
+	log.Println("Starting camera for raw frame capture...")
+	if err := app.frameDistributor.Start(640, 480); err != nil {
+		return fmt.Errorf("failed to start camera: %v", err)
+	}
+	log.Println("Camera started successfully at 640x480")
+
+	// Create GStreamer encoder pipeline
+	encoderConfig := encoder.DefaultEncoderConfig()
+	encoderConfig.Width = 640
+	encoderConfig.Height = 480
+	encoderConfig.FrameRate = 15
+	encoderConfig.BitRateKbps = 1500
+	encoderConfig.PreferHardware = true
+
+	app.gstPipeline, err = encoder.NewGStreamerPipeline(encoderConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create GStreamer pipeline: %w", err)
+	}
+
+	if err := app.gstPipeline.Start(app.ctx); err != nil {
+		return fmt.Errorf("failed to start GStreamer pipeline: %w", err)
+	}
+	log.Println("GStreamer VP9 encoder started successfully")
+
+	// Feed frames from distributor to GStreamer pipeline
+	go func() {
+		rawFrames := app.frameDistributor.GetVP9Channel()
+		for {
+			select {
+			case frame, ok := <-rawFrames:
+				if !ok {
+					log.Println("[Main] Raw frame channel closed")
+					return
+				}
+				if err := app.gstPipeline.FeedFrame(frame); err != nil {
+					log.Printf("[Main] Failed to feed frame to pipeline: %v", err)
+				}
+			case <-app.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Connect GStreamer output to motion detector
+	app.motionDetector.SetFrameSource(app.gstPipeline.GetMotionChannel())
+
+	// Note: RecordingService doesn't need SetFrameSource - it receives frames via motion events
+
+	// Create integration pipeline with WebRTC manager
 	app.pipeline = integration.NewPipeline(app.ctx, app.config, app.frameDistributor,
-		app.motionDetector, app.recorderService)
+		app.motionDetector, app.recorderService, app.webrtcManager)
 
 	// Setup WebRTC signaling
 	if !app.testingMode && app.webrtcManager != nil {
+		log.Println("Setting up WebRTC signaling...")
+
+		// Setup signaling
 		if err := app.webrtcManager.SetupSignaling(); err != nil {
 			return fmt.Errorf("signaling setup failed: %v", err)
 		}
+		log.Println("WebRTC signaling setup complete - waiting for browser connection")
+
+		// Wire GStreamer RTP output to WebRTC tracks
+		log.Println("Attaching GStreamer RTP source to WebRTC manager...")
+		videoRTPChan := app.gstPipeline.GetRTPChannel()
+
+		// Note: Audio RTP not yet implemented in GStreamer pipeline, passing nil
+		if err := app.webrtcManager.AttachExternalRTPSource(videoRTPChan, nil); err != nil {
+			return fmt.Errorf("failed to attach external RTP source: %v", err)
+		}
+		log.Println("GStreamer RTP source successfully attached to WebRTC - video streaming active")
 	}
 
 	log.Println("Initialization complete")
@@ -672,8 +722,30 @@ func (app *Application) Cleanup() {
 // selectDevices selects camera and microphone (simplified for brevity)
 func (app *Application) selectDevices(codecSelector *mediadevices.CodecSelector) (
 	camera, microphone mediadevices.MediaDeviceInfo, err error) {
-	
+
 	// Using hardcoded devices as in your original
+	camera = mediadevices.MediaDeviceInfo{
+		DeviceID:   "hardcoded-camera-0",
+		Label:      "0x83330001d6c0103",
+		Kind:       mediadevices.VideoInput,
+		DeviceType: driver.Camera,
+	}
+
+	microphone = mediadevices.MediaDeviceInfo{
+		DeviceID:   "hardcoded-microphone-2",
+		Label:      "4170706c65555342417564696f456e67696e653a4d61727368616c6c20456c656374726f6e69637320202020203a4d584c203939302055534220202020202020202020202020203a383333343030303a31",
+		Kind:       mediadevices.AudioInput,
+		DeviceType: driver.Microphone,
+	}
+
+	return camera, microphone, nil
+}
+
+// selectDevicesSimple selects devices without codec selector (for GStreamer)
+func (app *Application) selectDevicesSimple() (
+	camera, microphone mediadevices.MediaDeviceInfo, err error) {
+
+	// Using hardcoded devices (same as selectDevices but without codec param)
 	camera = mediadevices.MediaDeviceInfo{
 		DeviceID:   "hardcoded-camera-0",
 		Label:      "0x83330001d6c0103",
