@@ -7,6 +7,7 @@ toolchain go1.24.7
 require (
 	github.com/at-wat/ebml-go v0.17.1
 	github.com/cenkalti/backoff/v4 v4.3.0
+	github.com/go-gst/go-gst v1.4.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/jmoiron/sqlx v1.4.0
@@ -14,15 +15,14 @@ require (
 	github.com/minio/minio-go/v7 v7.0.95
 	github.com/pion/mediadevices v0.7.0
 	github.com/pion/rtp v1.8.10
-	github.com/pion/turn/v4 v4.0.0
 	github.com/pion/webrtc/v4 v4.0.7
 	github.com/sourcegraph/jsonrpc2 v0.2.0
 	github.com/zserge/lorca v0.1.10
 	go.uber.org/zap v1.27.0
 	gocv.io/x/gocv v0.42.0
 	golang.org/x/oauth2 v0.31.0
-	golang.org/x/sys v0.35.0
 	google.golang.org/api v0.249.0
+	gopkg.in/yaml.v2 v2.4.0
 )
 
 require (
@@ -33,6 +33,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/gen2brain/malgo v0.11.23 // indirect
+	github.com/go-gst/go-glib v1.4.0 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -42,6 +43,7 @@ require (
 	github.com/googleapis/gax-go/v2 v2.15.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.11 // indirect
+	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/minio/crc64nvme v1.0.2 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
@@ -58,6 +60,7 @@ require (
 	github.com/pion/srtp/v3 v3.0.4 // indirect
 	github.com/pion/stun/v3 v3.0.0 // indirect
 	github.com/pion/transport/v3 v3.0.7 // indirect
+	github.com/pion/turn/v4 v4.0.0 // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/tinylib/msgp v1.3.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
@@ -68,8 +71,10 @@ require (
 	go.opentelemetry.io/otel/trace v1.37.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/crypto v0.41.0 // indirect
+	golang.org/x/exp v0.0.0-20240909161429-701f63a606c0 // indirect
 	golang.org/x/image v0.23.0 // indirect
 	golang.org/x/net v0.43.0 // indirect
+	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250818200422-3122310a409c // indirect
 	google.golang.org/grpc v1.75.0 // indirect

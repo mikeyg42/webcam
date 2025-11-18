@@ -3,6 +3,7 @@
 export interface ConfigResponse {
   recording: RecordingSettings;
   video: VideoSettings;
+  audio: AudioSettings;
   motion: MotionSettings;
   storage: StorageSettings;
   tailscale: TailscaleSettings;
@@ -25,6 +26,15 @@ export interface VideoSettings {
   height: number;
   framerate: number;
   bitRate: number; // Match Go backend capitalization
+  deviceId: string;
+}
+
+export interface AudioSettings {
+  enabled: boolean;
+  deviceId: string;
+  sampleRate: number;
+  channels: number;
+  bitRate: number;
 }
 
 export interface MotionSettings {
@@ -34,7 +44,6 @@ export interface MotionSettings {
   cooldownPeriod: number; // seconds
   noMotionDelay: number; // seconds
   minConsecutiveFrames: number;
-  frameSkip: number;
 }
 
 export interface StorageSettings {
@@ -111,4 +120,17 @@ export interface ApiResponse<T = any> {
 export interface ApiError {
   message: string;
   status: number;
+}
+
+// Device types
+export interface CameraDevice {
+  deviceId: string;
+  label: string;
+  isDefault: boolean;
+}
+
+export interface MicrophoneDevice {
+  deviceId: string;
+  label: string;
+  isDefault: boolean;
 }

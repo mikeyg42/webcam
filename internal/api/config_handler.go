@@ -8,7 +8,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"github.com/pion/mediadevices"
+	_ "github.com/pion/mediadevices/pkg/driver/camera"
 
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/crypto"
@@ -65,6 +69,9 @@ type ConfigResponse struct {
 	// Video settings
 	Video VideoSettings `json:"video"`
 
+	// Audio settings
+	Audio AudioSettings `json:"audio"`
+
 	// Motion detection settings
 	Motion MotionSettings `json:"motion"`
 
@@ -85,17 +92,26 @@ type RecordingSettings struct {
 	ContinuousEnabled bool   `json:"continuousEnabled"`
 	EventEnabled      bool   `json:"eventEnabled"`
 	SaveDirectory     string `json:"saveDirectory"`
-	SegmentDuration   int    `json:"segmentDuration"` // minutes
-	PreMotionBuffer   int    `json:"preMotionBuffer"` // seconds
+	SegmentDuration   int    `json:"segmentDuration"`  // minutes
+	PreMotionBuffer   int    `json:"preMotionBuffer"`  // seconds
 	PostMotionBuffer  int    `json:"postMotionBuffer"` // seconds
 	RetentionDays     int    `json:"retentionDays"`
 }
 
 type VideoSettings struct {
-	Width     int `json:"width"`
-	Height    int `json:"height"`
-	Framerate int `json:"framerate"`
-	BitRate   int `json:"bitrate"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	FrameRate int    `json:"framerate"`
+	BitRate   int    `json:"bitrate"`
+	DeviceID  string `json:"deviceId"`
+}
+
+type AudioSettings struct {
+	Enabled    bool   `json:"enabled"`
+	DeviceID   string `json:"deviceId"`
+	SampleRate int    `json:"sampleRate"`
+	Channels   int    `json:"channels"`
+	BitRate    int    `json:"bitrate"`
 }
 
 type MotionSettings struct {
@@ -105,7 +121,6 @@ type MotionSettings struct {
 	CooldownPeriod       int     `json:"cooldownPeriod"` // seconds
 	NoMotionDelay        int     `json:"noMotionDelay"`  // seconds
 	MinConsecutiveFrames int     `json:"minConsecutiveFrames"`
-	FrameSkip            int     `json:"frameSkip"`
 }
 
 type StorageSettings struct {
@@ -212,26 +227,33 @@ func (h *ConfigHandler) configToResponse() ConfigResponse {
 		Recording: RecordingSettings{
 			ContinuousEnabled: false, // This will be read from recorder config
 			EventEnabled:      true,
-			SaveDirectory:     cfg.VideoConfig.OutputPath,
+			SaveDirectory:     cfg.Video.OutputPath,
 			SegmentDuration:   5,  // minutes, hardcoded in adapter
 			PreMotionBuffer:   10, // seconds, hardcoded in adapter
 			PostMotionBuffer:  30, // seconds, hardcoded in adapter
 			RetentionDays:     7,  // days, hardcoded in adapter
 		},
 		Video: VideoSettings{
-			Width:     cfg.VideoConfig.Width,
-			Height:    cfg.VideoConfig.Height,
-			Framerate: cfg.VideoConfig.Framerate,
-			BitRate:   cfg.VideoConfig.BitRate,
+			Width:     cfg.Video.Width,
+			Height:    cfg.Video.Height,
+			FrameRate: cfg.Video.FrameRate,
+			BitRate:   cfg.Video.BitRate,
+			DeviceID:  cfg.Video.DeviceID,
+		},
+		Audio: AudioSettings{
+			Enabled:    cfg.Audio.Enabled,
+			DeviceID:   cfg.Audio.DeviceID,
+			SampleRate: cfg.Audio.SampleRate,
+			Channels:   cfg.Audio.Channels,
+			BitRate:    cfg.Audio.BitRate,
 		},
 		Motion: MotionSettings{
 			Enabled:              true,
-			Threshold:            cfg.MotionConfig.Threshold,
-			MinimumArea:          cfg.MotionConfig.MinimumArea,
-			CooldownPeriod:       int(cfg.MotionConfig.CooldownPeriod.Seconds()),
-			NoMotionDelay:        int(cfg.MotionConfig.NoMotionDelay.Seconds()),
-			MinConsecutiveFrames: cfg.MotionConfig.MinConsecutiveFrames,
-			FrameSkip:            cfg.MotionConfig.FrameSkip,
+			Threshold:            float32(cfg.Motion.Threshold),
+			MinimumArea:          cfg.Motion.MinArea,
+			CooldownPeriod:       int(cfg.Motion.CooldownPeriod.Seconds()),
+			NoMotionDelay:        int(cfg.Motion.NoMotionDelay.Seconds()),
+			MinConsecutiveFrames: cfg.Motion.MinConsecutiveFrames,
 		},
 		Storage: StorageSettings{
 			MinIO: MinIOSettings{
@@ -251,11 +273,10 @@ func (h *ConfigHandler) configToResponse() ConfigResponse {
 			},
 		},
 		Tailscale: TailscaleSettings{
-			Enabled:    cfg.TailscaleConfig.Enabled,
-			NodeName:   cfg.TailscaleConfig.NodeName,
-			AuthKey:    "", // Don't send auth key
-			Hostname:   cfg.TailscaleConfig.Hostname,
-			ListenPort: cfg.TailscaleConfig.ListenPort,
+			Enabled:  cfg.Tailscale.Enabled,
+			NodeName: cfg.Tailscale.NodeName,
+			AuthKey:  "", // Don't send auth key
+			Hostname: cfg.Tailscale.Hostname,
 		},
 		Email: EmailSettings{
 			Method:            cfg.EmailMethod,
@@ -266,7 +287,7 @@ func (h *ConfigHandler) configToResponse() ConfigResponse {
 			GmailClientSecret: "",
 		},
 		WebRTC: WebRTCSettings{
-			Username: cfg.WebrtcAuth.Username,
+			Username: cfg.WebRTC.Username,
 			Password: "", // Don't send password
 		},
 	}
@@ -277,27 +298,33 @@ func (h *ConfigHandler) updateInternalConfig(req *ConfigResponse) {
 	cfg := h.config
 
 	// Update video settings
-	cfg.VideoConfig.Width = req.Video.Width
-	cfg.VideoConfig.Height = req.Video.Height
-	cfg.VideoConfig.Framerate = req.Video.Framerate
-	cfg.VideoConfig.BitRate = req.Video.BitRate
-	cfg.VideoConfig.OutputPath = req.Recording.SaveDirectory
+	cfg.Video.Width = req.Video.Width
+	cfg.Video.Height = req.Video.Height
+	cfg.Video.FrameRate = req.Video.FrameRate
+	cfg.Video.BitRate = req.Video.BitRate
+	cfg.Video.DeviceID = req.Video.DeviceID
+	cfg.Video.OutputPath = req.Recording.SaveDirectory
+
+	// Update audio settings
+	cfg.Audio.Enabled = req.Audio.Enabled
+	cfg.Audio.DeviceID = req.Audio.DeviceID
+	cfg.Audio.SampleRate = req.Audio.SampleRate
+	cfg.Audio.Channels = req.Audio.Channels
+	cfg.Audio.BitRate = req.Audio.BitRate
 
 	// Update motion settings
-	cfg.MotionConfig.Threshold = req.Motion.Threshold
-	cfg.MotionConfig.MinimumArea = req.Motion.MinimumArea
-	cfg.MotionConfig.CooldownPeriod = time.Duration(req.Motion.CooldownPeriod) * time.Second
-	cfg.MotionConfig.NoMotionDelay = time.Duration(req.Motion.NoMotionDelay) * time.Second
-	cfg.MotionConfig.MinConsecutiveFrames = req.Motion.MinConsecutiveFrames
-	cfg.MotionConfig.FrameSkip = req.Motion.FrameSkip
+	cfg.Motion.Threshold = int(req.Motion.Threshold)
+	cfg.Motion.MinArea = req.Motion.MinimumArea
+	cfg.Motion.CooldownPeriod = time.Duration(req.Motion.CooldownPeriod) * time.Second
+	cfg.Motion.NoMotionDelay = time.Duration(req.Motion.NoMotionDelay) * time.Second
+	cfg.Motion.MinConsecutiveFrames = req.Motion.MinConsecutiveFrames
 
 	// Update Tailscale settings
-	cfg.TailscaleConfig.Enabled = req.Tailscale.Enabled
-	cfg.TailscaleConfig.NodeName = req.Tailscale.NodeName
-	cfg.TailscaleConfig.Hostname = req.Tailscale.Hostname
-	cfg.TailscaleConfig.ListenPort = req.Tailscale.ListenPort
+	cfg.Tailscale.Enabled = req.Tailscale.Enabled
+	cfg.Tailscale.NodeName = req.Tailscale.NodeName
+	cfg.Tailscale.Hostname = req.Tailscale.Hostname
 	if req.Tailscale.AuthKey != "" {
-		cfg.TailscaleConfig.AuthKey = req.Tailscale.AuthKey
+		cfg.Tailscale.AuthKey = req.Tailscale.AuthKey
 	}
 
 	// Update email settings
@@ -319,9 +346,9 @@ func (h *ConfigHandler) updateInternalConfig(req *ConfigResponse) {
 	}
 
 	// Update WebRTC auth
-	cfg.WebrtcAuth.Username = req.WebRTC.Username
+	cfg.WebRTC.Username = req.WebRTC.Username
 	if req.WebRTC.Password != "" {
-		cfg.WebrtcAuth.Password = req.WebRTC.Password
+		cfg.WebRTC.Password = req.WebRTC.Password
 	}
 }
 
@@ -331,8 +358,8 @@ func (h *ConfigHandler) validateConfigRequest(req *ConfigResponse) error {
 	if req.Video.Width <= 0 || req.Video.Height <= 0 {
 		return fmt.Errorf("invalid video dimensions: %dx%d", req.Video.Width, req.Video.Height)
 	}
-	if req.Video.Framerate <= 0 || req.Video.Framerate > 60 {
-		return fmt.Errorf("invalid framerate: %d (must be 1-60)", req.Video.Framerate)
+	if req.Video.FrameRate <= 0 || req.Video.FrameRate > 60 {
+		return fmt.Errorf("invalid framerate: %d (must be 1-60)", req.Video.FrameRate)
 	}
 	if req.Video.BitRate < 100000 || req.Video.BitRate > 10000000 {
 		return fmt.Errorf("invalid bitrate: %d (must be 100000-10000000)", req.Video.BitRate)
@@ -368,8 +395,8 @@ func (h *ConfigHandler) saveConfig() error {
 	// Add encrypted passwords if master key is available
 	if h.masterKey != "" {
 		// Encrypt WebRTC password
-		if h.config.WebrtcAuth.Password != "" {
-			encrypted, err := crypto.EncryptPassword(h.config.WebrtcAuth.Password, h.masterKey)
+		if h.config.WebRTC.Password != "" {
+			encrypted, err := crypto.EncryptPassword(h.config.WebRTC.Password, h.masterKey)
 			if err != nil {
 				log.Printf("[WARN] Failed to encrypt WebRTC password: %v", err)
 			} else {
@@ -394,6 +421,92 @@ func (h *ConfigHandler) saveConfig() error {
 
 	log.Printf("Configuration saved to %s", h.configFile)
 	return nil
+}
+
+// CameraDevice represents an available camera
+type CameraDevice struct {
+	DeviceID  string `json:"deviceId"`
+	Label     string `json:"label"`
+	IsDefault bool   `json:"isDefault"`
+}
+
+// MicrophoneDevice represents an available microphone
+type MicrophoneDevice struct {
+	DeviceID  string `json:"deviceId"`
+	Label     string `json:"label"`
+	IsDefault bool   `json:"isDefault"`
+}
+
+// ListCameras handles GET /api/cameras - returns list of available cameras
+func (h *ConfigHandler) ListCameras(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	devices := mediadevices.EnumerateDevices()
+
+	cameras := []CameraDevice{}
+	cameraIndex := 0
+	for _, device := range devices {
+		if device.Kind == mediadevices.VideoInput {
+			// Create a more user-friendly label
+			label := device.Label
+			if label == "" || strings.HasPrefix(label, "0x") {
+				// If no label or hex address, generate a friendly name
+				label = fmt.Sprintf("Camera %d", cameraIndex+1)
+			}
+
+			cameras = append(cameras, CameraDevice{
+				DeviceID:  device.DeviceID,
+				Label:     label,
+				IsDefault: cameraIndex == 0, // First camera is default
+			})
+			cameraIndex++
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"cameras": cameras,
+	})
+}
+
+// ListMicrophones handles GET /api/microphones - returns list of available microphones
+func (h *ConfigHandler) ListMicrophones(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	devices := mediadevices.EnumerateDevices()
+
+	microphones := []MicrophoneDevice{}
+	micIndex := 0
+	for _, device := range devices {
+		if device.Kind == mediadevices.AudioInput {
+			// Create a more user-friendly label
+			label := device.Label
+			if label == "" || strings.HasPrefix(label, "0x") {
+				// If no label or hex address, generate a friendly name
+				label = fmt.Sprintf("Microphone %d", micIndex+1)
+			}
+
+			microphones = append(microphones, MicrophoneDevice{
+				DeviceID:  device.DeviceID,
+				Label:     label,
+				IsDefault: micIndex == 0, // First microphone is default
+			})
+			micIndex++
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"microphones": microphones,
+	})
 }
 
 // TestNotification handles POST /api/test-notification
@@ -425,5 +538,7 @@ func (h *ConfigHandler) RegisterRoutes(mux *http.ServeMux) {
 		}
 	})
 
+	mux.HandleFunc("/api/cameras", h.ListCameras)
+	mux.HandleFunc("/api/microphones", h.ListMicrophones)
 	mux.HandleFunc("/api/test-notification", h.TestNotification)
 }

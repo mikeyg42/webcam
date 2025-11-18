@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL - Recording Metadata Storage
   postgres:
@@ -72,7 +70,7 @@ services:
     container_name: webcam2-ion-sfu
     restart: unless-stopped
     ports:
-      - "7000:7000"     # WebSocket
+      - "7001:7000"     # WebSocket (host:7001 -> container:7000)
       - "5000-5200:5000-5200/udp"  # WebRTC media
     volumes:
       - ./configs/sfu.toml:/configs/sfu.toml:ro

@@ -561,7 +561,7 @@ func DefaultConfig() *Config {
 		},
 		WebSocket: WebSocketConfig{
 			Enabled:         true,
-			ListenAddr:      ":8080",
+			ListenAddr:      ":3000",
 			Path:            "/ws",
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -647,7 +647,7 @@ func DefaultConfig() *Config {
 				Port:            5432,
 				Database:        "recordings",
 				Username:        "recorder",
-				Password:        "",
+				Password:        "recorder",  // Must match docker-compose.yml
 				SSLMode:         "disable",
 				MaxConnections:  25,
 				MaxIdleConns:    5,

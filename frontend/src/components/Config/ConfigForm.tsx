@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useConfigStore } from '../../stores/configStore';
 import type { ConfigResponse } from '../../types/api';
 import { VideoSection } from './VideoSection';
+import { AudioSection } from './AudioSection';
 import { MotionSection } from './MotionSection';
 import { EmailSection } from './EmailSection';
 
@@ -79,6 +80,11 @@ export function ConfigForm() {
         <VideoSection
           data={formData.video}
           onChange={(data) => updateFormData('video', data)}
+        />
+
+        <AudioSection
+          data={formData.audio}
+          onChange={(data) => updateFormData('audio', data)}
         />
 
         <MotionSection

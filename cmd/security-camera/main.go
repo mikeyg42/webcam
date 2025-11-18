@@ -26,16 +26,20 @@ import (
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/encoder"
 	"github.com/mikeyg42/webcam/internal/framestream"
+	"github.com/mikeyg42/webcam/internal/imgconv"
+	
 	"github.com/mikeyg42/webcam/internal/integration"
 	"github.com/mikeyg42/webcam/internal/motion"
 	"github.com/mikeyg42/webcam/internal/notification"
+	"github.com/mikeyg42/webcam/internal/permissions"
 	"github.com/mikeyg42/webcam/internal/recorder"
 	"github.com/mikeyg42/webcam/internal/recorder/recorderlog"
 	"github.com/mikeyg42/webcam/internal/rtcManager"
 	"github.com/mikeyg42/webcam/internal/validate"
 
-	_ "github.com/pion/mediadevices/pkg/driver/camera"
-	_ "github.com/pion/mediadevices/pkg/driver/microphone"
+	// call these without the "_" identifier so that we can call methods from these drivers
+	"github.com/pion/mediadevices/pkg/driver/camera"
+	"github.com/pion/mediadevices/pkg/driver/microphone"
 )
 
 // Application holds all system components
@@ -69,6 +73,29 @@ func main() {
 	// Create root context for lifecycle management
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// On macOS, ensure we have camera and microphone permissions before proceeding
+	// Check permissions FIRST
+	log.Println("Checking camera and microphone permissions...")
+	if err := permissions.EnsureMediaPermissions(); err != nil {
+		log.Fatalf("Failed to obtain media permissions: %v", err)
+	}
+	log.Println("Media permissions granted")
+
+	// NOW re-initialize the drivers to discover devices AFTER permissions granted
+	log.Println("Re-initializing camera and microphone drivers...")
+	camera.Initialize()     // Re-enumerate camera devices
+	microphone.Initialize() // Re-enumerate microphone devices
+	log.Println("Drivers re-initialized with proper permissions")
+
+	// Brief delay to ensure device enumeration completes, then VERIFY devices are available
+	time.Sleep(100 * time.Millisecond)
+	devices := mediadevices.EnumerateDevices()
+	if len(devices) == 0 {
+		log.Fatal("No devices found even after permissions granted. Please check system settings.")
+	} else {
+		log.Printf("Devices available after initialization: %d", len(devices))
+	}
 
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -183,7 +210,12 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 
 	if !testingMode {
 		// Connect to WebSocket server
-		wsURL := fmt.Sprintf("ws://%s/ws?roomId=cameraRoom", cfg.WebSocket.ListenAddr)
+		// If ListenAddr starts with ":", prepend "localhost"
+		addr := cfg.WebSocket.ListenAddr
+		if len(addr) > 0 && addr[0] == ':' {
+			addr = "localhost" + addr
+		}
+		wsURL := fmt.Sprintf("ws://%s/ws?roomId=cameraRoom", addr)
 		log.Printf("Connecting to WebSocket: %s", wsURL)
 
 		dialer := websocket.Dialer{
@@ -403,16 +435,23 @@ func (app *Application) drainChannelsDuringCalibration(done chan struct{}) {
 
 	for {
 		select {
-		case <-vp9Chan:
-			// Drain VP9 frames silently
-		case <-recordChan:
-			// Drain record frames silently
+		case _, ok := <-vp9Chan:
+			if !ok {
+				vp9Chan = nil // Prevent further reads from closed channel
+			}
+		case _, ok := <-recordChan:
+			if !ok {
+				recordChan = nil
+			}
 		case <-done:
-			// Pipeline started, stop draining
-			log.Println("[Calibration] Stopping channel drain - pipeline taking over")
+			log.Println("[Calibration] Stopping channel drain")
 			return
 		case <-app.ctx.Done():
 			return
+		default:
+			if vp9Chan == nil && recordChan == nil {
+				return // Both channels closed
+			}
 		}
 	}
 }
@@ -422,7 +461,12 @@ func (app *Application) feedCalibrationFrames(calibChan chan<- gocv.Mat) {
 	motionChan := app.frameDistributor.GetMotionChannel()
 	timeout := time.After(11 * time.Second)
 
-	defer close(calibChan)
+	defer func() {
+		close(calibChan)
+		for range motionChan {
+			// drain to prevent leaks
+		}
+	}()
 
 	for {
 		select {
@@ -430,7 +474,7 @@ func (app *Application) feedCalibrationFrames(calibChan chan<- gocv.Mat) {
 			if frame == nil {
 				continue
 			}
-			
+
 			// Convert to Mat
 			mat, err := imageToMat(frame)
 			if err != nil {
@@ -440,7 +484,10 @@ func (app *Application) feedCalibrationFrames(calibChan chan<- gocv.Mat) {
 			// Non-blocking send
 			select {
 			case calibChan <- mat:
+				// Sent successfully
+
 			default:
+				// channel full, close to prevent leaks
 				mat.Close()
 			}
 
@@ -490,7 +537,7 @@ func (app *Application) runCalibrationProcessor(calibChan <-chan gocv.Mat, doneC
 			}
 
 			// Process frame with optical flow
-			motionArea := processCalibrationFrame(frame, &prevSmall, &currSmall, 
+			motionArea := processCalibrationFrame(frame, &prevSmall, &currSmall,
 				&flow, &tempGray, &tempSmall, &magnitude)
 			frame.Close()
 
@@ -515,7 +562,7 @@ func (app *Application) runCalibrationProcessor(calibChan <-chan gocv.Mat, doneC
 }
 
 // processCalibrationFrame analyzes a single frame during calibration
-func processCalibrationFrame(frame gocv.Mat, prevSmall, currSmall, flow, 
+func processCalibrationFrame(frame gocv.Mat, prevSmall, currSmall, flow,
 	tempGray, tempSmall, magnitude *gocv.Mat) float64 {
 
 	// Convert to grayscale
@@ -624,7 +671,7 @@ func calculateCalibrationResult(samples []float64) CalibrationResult {
 	baseline := mean + stddev
 	threshold := baseline + 0.05 // Hair trigger - very sensitive
 
-	log.Printf("[Calibration] Samples: %d, Mean: %.4f, StdDev: %.4f", 
+	log.Printf("[Calibration] Samples: %d, Mean: %.4f, StdDev: %.4f",
 		len(samples), mean, stddev)
 
 	return CalibrationResult{
@@ -743,30 +790,87 @@ func (app *Application) selectDevices(codecSelector *mediadevices.CodecSelector)
 
 // selectDevicesSimple selects devices without codec selector (for GStreamer)
 func (app *Application) selectDevicesSimple() (
-	camera, microphone mediadevices.MediaDeviceInfo, err error) {
+	cameraDevice, microphoneDevice mediadevices.MediaDeviceInfo, err error) {
 
-	// Using hardcoded devices (same as selectDevices but without codec param)
-	camera = mediadevices.MediaDeviceInfo{
-		DeviceID:   "hardcoded-camera-0",
-		Label:      "0x83330001d6c0103",
-		Kind:       mediadevices.VideoInput,
-		DeviceType: driver.Camera,
+	// Enumerate all available devices
+	devices := mediadevices.EnumerateDevices()
+
+	if len(devices) == 0 {
+		// Try re-initializing drivers one more time
+		camera.Initialize()
+		microphone.Initialize()
+		time.Sleep(100 * time.Millisecond) // Brief delay for enumeration
+		devices = mediadevices.EnumerateDevices()
 	}
 
-	microphone = mediadevices.MediaDeviceInfo{
-		DeviceID:   "hardcoded-microphone-2",
-		Label:      "4170706c65555342417564696f456e67696e653a4d61727368616c6c20456c656374726f6e69637320202020203a4d584c203939302055534220202020202020202020202020203a383333343030303a31",
-		Kind:       mediadevices.AudioInput,
-		DeviceType: driver.Microphone,
+	log.Printf("EnumerateDevices found %d total devices", len(devices))
+	for i, dev := range devices {
+		log.Printf("Device %d: Type=%s, Kind=%d, ID=%s, Label=%s", i, dev.DeviceType, dev.Kind, dev.DeviceID, dev.Label)
 	}
 
-	return camera, microphone, nil
+	// Get configured device IDs from config
+	configuredCameraID := app.config.Video.DeviceID
+	configuredMicID := app.config.Audio.DeviceID
+
+	log.Printf("Looking for configured camera: %s", configuredCameraID)
+	log.Printf("Looking for configured microphone: %s", configuredMicID)
+
+	var cameraFound, micFound bool
+
+	// First, try to find devices matching configured IDs
+	for _, device := range devices {
+		if device.Kind == mediadevices.VideoInput && device.DeviceID == configuredCameraID {
+			cameraDevice = device
+			cameraFound = true
+			log.Printf("Found configured camera: %s (%s)", device.Label, device.DeviceID)
+		}
+		if device.Kind == mediadevices.AudioInput && device.DeviceID == configuredMicID {
+			microphoneDevice = device
+			micFound = true
+			log.Printf("Found configured microphone: %s (%s)", device.Label, device.DeviceID)
+		}
+
+		if cameraFound && micFound {
+			return cameraDevice, microphoneDevice, nil
+		}
+	}
+
+	// Fallback: if configured devices not found, use first available devices
+	log.Println("Configured devices not found, falling back to first available devices")
+
+	for _, device := range devices {
+		if device.Kind == mediadevices.VideoInput && !cameraFound {
+			cameraDevice = device
+			cameraFound = true
+			log.Printf("Using fallback camera: %s (%s)", device.Label, device.DeviceID)
+		}
+		if device.Kind == mediadevices.AudioInput && !micFound {
+			microphoneDevice = device
+			micFound = true
+			log.Printf("Using fallback microphone: %s (%s)", device.Label, device.DeviceID)
+		}
+
+		if cameraFound && micFound {
+			break
+		}
+	}
+
+	if !cameraFound {
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
+			fmt.Errorf("no camera found - please check camera permissions and ensure a camera is connected")
+	}
+
+	if !micFound {
+		log.Println("Warning: No microphone found, audio will be disabled")
+	}
+
+	return cameraDevice, microphoneDevice, nil
 }
 
 // selectDevicesForTesting selects devices in testing mode
 func (app *Application) selectDevicesForTesting() (
 	mediadevices.MediaDeviceInfo, mediadevices.MediaDeviceInfo, error) {
-	
+
 	devices := mediadevices.EnumerateDevices()
 
 	var camera, microphone mediadevices.MediaDeviceInfo
@@ -788,7 +892,7 @@ func (app *Application) selectDevicesForTesting() (
 	}
 
 	if !cameraFound {
-		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{}, 
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
 			fmt.Errorf("no camera found")
 	}
 
@@ -848,23 +952,7 @@ func setupEmailNotifications(ctx context.Context, cfg *config.Config) (*notifica
 
 // imageToMat converts image.Image to gocv.Mat
 func imageToMat(img image.Image) (gocv.Mat, error) {
-	bounds := img.Bounds()
-	width := bounds.Dx()
-	height := bounds.Dy()
-
-	mat := gocv.NewMatWithSize(height, width, gocv.MatTypeCV8UC3)
-
-	// Simple conversion - can be optimized further
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			r, g, b, _ := img.At(x, y).RGBA()
-			mat.SetUCharAt(y, x*3+2, uint8(r>>8))
-			mat.SetUCharAt(y, x*3+1, uint8(g>>8))
-			mat.SetUCharAt(y, x*3, uint8(b>>8))
-		}
-	}
-
-	return mat, nil
+	return imgconv.ToMat(img)
 }
 
 // decodeFriendlyDeviceName converts hex-encoded labels

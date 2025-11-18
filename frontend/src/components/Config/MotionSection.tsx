@@ -82,22 +82,6 @@ export function MotionSection({ data, onChange }: MotionSectionProps) {
             min="1"
           />
         </div>
-
-        <div>
-          <label className="block text-sm font-medium text-gray-300 mb-2">
-            Frame Skip
-          </label>
-          <input
-            type="number"
-            value={data.frameSkip}
-            onChange={(e) => onChange({ frameSkip: parseInt(e.target.value) })}
-            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-            min="0"
-          />
-          <p className="text-xs text-gray-400 mt-1">
-            Process every Nth frame
-          </p>
-        </div>
       </div>
     </div>
   );

@@ -8,6 +8,7 @@ import (
 	"image/color"
 	"image/draw"
 	"log"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -403,12 +404,24 @@ const (
 	encVP9 encoderKind = iota
 	encH264NVENC
 	encH264VAAPI
+	encH264VideoToolbox
 	encH264X264
 )
 
 // chooseEncoder selects the best available encoder
 func (g *GStreamerPipeline) chooseEncoder() (*gst.Element, encoderKind) {
-	// Try hardware encoders first
+	// On macOS, prefer H264 VideoToolbox (excellent hardware support)
+	// VP9 has poor VideoToolbox support
+	if runtime.GOOS == "darwin" {
+		// Try VideoToolbox H264 hardware encoder first
+		if e, err := gst.NewElement("vtenc_h264_hw"); err == nil && e != nil {
+			g.configureVideoToolbox(e)
+			log.Println("Using VideoToolbox H.264 hardware encoder")
+			return e, encH264VideoToolbox
+		}
+	}
+
+	// Try hardware encoders first (non-macOS)
 	if g.config.PreferHardware {
 		// NVIDIA NVENC
 		if e, err := gst.NewElement("nvh264enc"); err == nil && e != nil {
@@ -425,14 +438,17 @@ func (g *GStreamerPipeline) chooseEncoder() (*gst.Element, encoderKind) {
 		}
 	}
 
-	// Software VP9
-	if e, err := gst.NewElement("vp9enc"); err == nil && e != nil {
-		g.configureVP9(e)
-		log.Println("Using VP9 software encoder")
-		return e, encVP9
+	// On non-macOS systems, prefer VP9 software encoder
+	// On macOS, skip VP9 and go straight to x264
+	if runtime.GOOS != "darwin" {
+		if e, err := gst.NewElement("vp9enc"); err == nil && e != nil {
+			g.configureVP9(e)
+			log.Println("Using VP9 software encoder")
+			return e, encVP9
+		}
 	}
 
-	// Software H.264
+	// Software H.264 fallback
 	if e, err := gst.NewElement("x264enc"); err == nil && e != nil {
 		g.configureX264(e)
 		log.Println("Using x264 software encoder")
@@ -451,6 +467,12 @@ func (g *GStreamerPipeline) configureNVENC(e *gst.Element) {
 
 func (g *GStreamerPipeline) configureVAAPI(e *gst.Element) {
 	_ = e.SetProperty("bitrate", uint(g.config.BitRateKbps))
+}
+
+func (g *GStreamerPipeline) configureVideoToolbox(e *gst.Element) {
+	_ = e.SetProperty("bitrate", uint(g.config.BitRateKbps))
+	_ = e.SetProperty("max-keyframe-interval", uint(g.config.KeyFrameInterval))
+	_ = e.SetProperty("allow-frame-reordering", false)
 }
 
 func (g *GStreamerPipeline) configureVP9(e *gst.Element) {
@@ -618,7 +640,7 @@ func (g *GStreamerPipeline) isKeyframe(pkt *rtp.Packet, kind encoderKind) bool {
 		// VP9: P bit (inverse of keyframe)
 		return (pkt.Payload[0] & 0x80) == 0
 
-	case encH264NVENC, encH264VAAPI, encH264X264:
+	case encH264NVENC, encH264VAAPI, encH264VideoToolbox, encH264X264:
 		// H.264: NAL unit type 5 = IDR
 		nalType := pkt.Payload[0] & 0x1F
 		return nalType == 5

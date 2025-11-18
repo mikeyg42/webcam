@@ -274,8 +274,9 @@ func (s *PostgresStore) SaveRecording(ctx context.Context, recording *Recording)
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
-	
-	var id, createdAt, updatedAt sql.NullTime
+
+	var dbID string
+	var createdAt, updatedAt time.Time
 	err = s.db.QueryRowContext(
 		ctx, query,
 		recording.ID, recording.Type, recording.Status,
@@ -284,16 +285,20 @@ func (s *PostgresStore) SaveRecording(ctx context.Context, recording *Recording)
 		recording.Resolution, recording.FPS, recording.Codec, recording.Bitrate,
 		recording.MotionConfidence, recording.PreBufferSeconds, recording.PostBufferSeconds, recording.TriggerTime,
 		metadataJSON, pq.Array(recording.Tags),
-	).Scan(&id, &createdAt, &updatedAt)
-	
+	).Scan(&dbID, &createdAt, &updatedAt)
+
 	if err != nil {
 		return fmt.Errorf("failed to save recording: %w", err)
 	}
-	
+
+	// Update the recording timestamps
+	recording.CreatedAt = createdAt
+	recording.UpdatedAt = updatedAt
+
 	s.logger.Info("Recording saved",
 		recorderlog.String("id", recording.ID),
 		recorderlog.String("type", recording.Type))
-	
+
 	return nil
 }
 
