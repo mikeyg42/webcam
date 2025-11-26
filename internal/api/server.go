@@ -16,8 +16,10 @@ import (
 // Server is an HTTP API server
 type Server struct {
 	httpServer         *http.Server
+	mux                *http.ServeMux // Store mux for dynamic route registration
 	configHandler      *ConfigHandler
 	calibrationHandler *CalibrationHandler
+	qualityHandler     *QualityHandler
 }
 
 // NewServer creates a new API server
@@ -29,8 +31,8 @@ func NewServer(ctx context.Context, cfg *config.Config, addr string, calibServic
 }) *Server {
 	mux := http.NewServeMux()
 
-	// Create configuration handler
-	configHandler := NewConfigHandler(cfg)
+	// Create configuration handler with motion detector for runtime updates
+	configHandler := NewConfigHandler(cfg, detector)
 	configHandler.RegisterRoutes(mux)
 
 	// Create calibration handler (if provided)
@@ -41,7 +43,7 @@ func NewServer(ctx context.Context, cfg *config.Config, addr string, calibServic
 	}
 
 	// Health check endpoint
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
@@ -58,8 +60,23 @@ func NewServer(ctx context.Context, cfg *config.Config, addr string, calibServic
 			WriteTimeout:   10 * time.Second,
 			MaxHeaderBytes: 1 << 20, // 1 MB
 		},
+		mux:                mux,
 		configHandler:      configHandler,
 		calibrationHandler: calibrationHandler,
+	}
+}
+
+// GetConfigHandler returns the config handler for external access
+func (s *Server) GetConfigHandler() *ConfigHandler {
+	return s.configHandler
+}
+
+// SetQualityHandler sets the quality handler (called after WebRTC manager is initialized)
+func (s *Server) SetQualityHandler(provider QualityManagerProvider) {
+	if s.qualityHandler == nil && provider != nil {
+		s.qualityHandler = NewQualityHandler(provider)
+		s.qualityHandler.RegisterRoutes(s.mux)
+		log.Println("[APIServer] Quality metrics endpoint registered at /api/quality/metrics")
 	}
 }
 

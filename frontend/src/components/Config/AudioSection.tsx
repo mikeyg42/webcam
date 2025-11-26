@@ -6,6 +6,11 @@ interface AudioSectionProps {
   onChange: (data: Partial<AudioSettings>) => void;
 }
 
+const safeParseInt = (value: string, fallback: number): number => {
+  const parsed = parseInt(value, 10);
+  return isNaN(parsed) || value === '' ? fallback : parsed;
+};
+
 export function AudioSection({ data, onChange }: AudioSectionProps) {
   const [microphones, setMicrophones] = useState<MicrophoneDevice[]>([]);
   const [loadingMicrophones, setLoadingMicrophones] = useState(false);
@@ -81,12 +86,13 @@ export function AudioSection({ data, onChange }: AudioSectionProps) {
           <input
             type="number"
             value={data.sampleRate}
-            onChange={(e) => onChange({ sampleRate: parseInt(e.target.value) })}
+            onChange={(e) => onChange({ sampleRate: safeParseInt(e.target.value, data.sampleRate) })}
             disabled={!data.enabled}
             className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
             min="8000"
             max="48000"
             step="1000"
+            placeholder="e.g., 48000"
           />
         </div>
 
@@ -96,29 +102,13 @@ export function AudioSection({ data, onChange }: AudioSectionProps) {
           </label>
           <select
             value={data.channels}
-            onChange={(e) => onChange({ channels: parseInt(e.target.value) })}
+            onChange={(e) => onChange({ channels: safeParseInt(e.target.value, data.channels) })}
             disabled={!data.enabled}
             className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
           >
             <option value={1}>Mono (1)</option>
             <option value={2}>Stereo (2)</option>
           </select>
-        </div>
-
-        <div>
-          <label className="block text-sm font-medium text-gray-300 mb-2">
-            Bitrate (bits/sec)
-          </label>
-          <input
-            type="number"
-            value={data.bitRate}
-            onChange={(e) => onChange({ bitRate: parseInt(e.target.value) })}
-            disabled={!data.enabled}
-            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
-            min="8000"
-            max="128000"
-            step="8000"
-          />
         </div>
       </div>
     </div>

@@ -380,6 +380,9 @@ type WebRTCConfig struct {
 	DisconnectedTimeout time.Duration `yaml:"disconnected_timeout" json:"disconnected_timeout" default:"5s"`
 	FailedTimeout       time.Duration `yaml:"failed_timeout" json:"failed_timeout" default:"5s"`
 	KeepaliveInterval   time.Duration `yaml:"keepalive_interval" json:"keepalive_interval" default:"10s"`
+
+	// Adaptive quality management
+	QualityPriority string `yaml:"quality_priority" json:"quality_priority" default:"maximize_quality"` // maximize_quality, minimize_latency, minimize_device_strain
 }
 
 // WebRTCAuth is an alias for WebRTCConfig for backward compatibility

@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS recordings (
     post_buffer_seconds INTEGER,
     trigger_time TIMESTAMP,
 
+    -- Additional metadata
+    metadata JSONB DEFAULT '{}',
+    tags TEXT[] DEFAULT '{}',
+
     -- Audit fields
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),

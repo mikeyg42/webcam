@@ -7,12 +7,14 @@ import { CalibrationWizard } from './components/Calibration';
 type Tab = 'camera' | 'config' | 'calibration';
 
 function App() {
-  const [activeTab, setActiveTab] = useState<Tab>('camera');
+  const [activeTab, setActiveTab] = useState<Tab>('config');
+  const [configCompleted, setConfigCompleted] = useState(false);
+  const [calibrationCompleted, setCalibrationCompleted] = useState(false);
 
-  const tabs: { id: Tab; label: string }[] = [
-    { id: 'camera', label: 'Camera' },
+  const tabs: { id: Tab; label: string; disabled?: boolean }[] = [
     { id: 'config', label: 'Configuration' },
-    { id: 'calibration', label: 'Calibration' },
+    { id: 'calibration', label: 'Calibration', disabled: !configCompleted },
+    { id: 'camera', label: 'Camera', disabled: !calibrationCompleted },
   ];
 
   return (
@@ -31,10 +33,13 @@ function App() {
                 {tabs.map((tab) => (
                   <button
                     key={tab.id}
-                    onClick={() => setActiveTab(tab.id)}
+                    onClick={() => !tab.disabled && setActiveTab(tab.id)}
+                    disabled={tab.disabled}
                     className={`px-4 py-2 rounded-lg font-medium transition-colors ${
                       activeTab === tab.id
                         ? 'bg-blue-600 text-white'
+                        : tab.disabled
+                        ? 'text-gray-500 cursor-not-allowed opacity-50'
                         : 'text-gray-300 hover:bg-gray-700 hover:text-white'
                     }`}
                   >
@@ -56,9 +61,13 @@ function App() {
               </div>
             )}
 
-            {activeTab === 'config' && <ConfigForm />}
+            {activeTab === 'config' && (
+              <ConfigForm onConfigComplete={() => setConfigCompleted(true)} />
+            )}
 
-            {activeTab === 'calibration' && <CalibrationWizard />}
+            {activeTab === 'calibration' && (
+              <CalibrationWizard onCalibrationComplete={() => setCalibrationCompleted(true)} />
+            )}
           </div>
         </main>
 

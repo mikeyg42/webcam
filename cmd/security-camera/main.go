@@ -11,7 +11,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
-
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -27,11 +27,12 @@ import (
 	"github.com/mikeyg42/webcam/internal/encoder"
 	"github.com/mikeyg42/webcam/internal/framestream"
 	"github.com/mikeyg42/webcam/internal/imgconv"
-	
+
 	"github.com/mikeyg42/webcam/internal/integration"
 	"github.com/mikeyg42/webcam/internal/motion"
 	"github.com/mikeyg42/webcam/internal/notification"
 	"github.com/mikeyg42/webcam/internal/permissions"
+	"github.com/mikeyg42/webcam/internal/quality"
 	"github.com/mikeyg42/webcam/internal/recorder"
 	"github.com/mikeyg42/webcam/internal/recorder/recorderlog"
 	"github.com/mikeyg42/webcam/internal/rtcManager"
@@ -52,7 +53,7 @@ type Application struct {
 	wsConnection       *websocket.Conn
 	notifier           *notification.Notifier
 	frameDistributor   *framestream.FrameDistributor
-	gstPipeline        *encoder.GStreamerPipeline // GStreamer VP9 encoder
+	gstPipeline        *encoder.GStreamerPipeline // GStreamer H.264 encoder
 	pipeline           *integration.Pipeline
 	selectedCamera     mediadevices.MediaDeviceInfo
 	selectedMicrophone mediadevices.MediaDeviceInfo
@@ -88,13 +89,21 @@ func main() {
 	microphone.Initialize() // Re-enumerate microphone devices
 	log.Println("Drivers re-initialized with proper permissions")
 
-	// Brief delay to ensure device enumeration completes, then VERIFY devices are available
-	time.Sleep(100 * time.Millisecond)
-	devices := mediadevices.EnumerateDevices()
+	// Poll for devices with exponential backoff instead of fixed delay (faster on modern systems)
+	var devices []mediadevices.MediaDeviceInfo
+	for i := 0; i < 5; i++ {
+		devices = mediadevices.EnumerateDevices()
+		if len(devices) > 0 {
+			log.Printf("Devices available after initialization: %d", len(devices))
+			break
+		}
+		if i < 4 {
+			delay := 20 * time.Millisecond * time.Duration(1<<uint(i)) // Exponential backoff: 20, 40, 80, 160ms
+			time.Sleep(delay)
+		}
+	}
 	if len(devices) == 0 {
 		log.Fatal("No devices found even after permissions granted. Please check system settings.")
-	} else {
-		log.Printf("Devices available after initialization: %d", len(devices))
 	}
 
 	// Setup signal handling for graceful shutdown
@@ -102,7 +111,35 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	// Load and validate configuration
+	// Try to load saved config, fall back to defaults if not found
 	cfg := config.NewDefaultConfig()
+
+	// Determine config file path
+	configFile := os.Getenv("CONFIG_FILE")
+	if configFile == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			log.Printf("Warning: Could not determine home directory: %v", err)
+		} else {
+			configFile = filepath.Join(homeDir, ".webcam2", "config.json")
+			// Ensure config directory exists
+			configDir := filepath.Dir(configFile)
+			if err := os.MkdirAll(configDir, 0755); err != nil {
+				log.Printf("Warning: Could not create config directory: %v", err)
+			}
+		}
+	}
+
+	// Load saved config if it exists
+	if configFile != "" {
+		if savedCfg, err := config.LoadConfig(configFile); err == nil {
+			cfg = savedCfg
+			log.Printf("✓ Loaded configuration from %s", configFile)
+		} else {
+			log.Printf("Using default configuration (no saved config found: %v)", err)
+		}
+	}
+
 	if err := validate.ValidateConfig(cfg); err != nil {
 		log.Fatalf("Configuration validation failed: %v", err)
 	}
@@ -129,7 +166,8 @@ func main() {
 		log.Fatalf("Failed to initialize: %v", err)
 	}
 
-	// Start API server with calibration and detection endpoints
+	// Start API server AFTER Initialize() completes to avoid race conditions
+	// API endpoints need fully initialized components (calibrationService, motionDetector, frameDistributor)
 	apiServer := api.NewServer(ctx, cfg, ":8081", app.calibrationService, app.motionDetector, app.frameDistributor)
 	apiServer.StartInBackground()
 	defer func() {
@@ -137,6 +175,29 @@ func main() {
 		defer cancel()
 		apiServer.Shutdown(shutdownCtx)
 	}()
+
+	// Wire quality priority callback to allow runtime updates from API
+	if app.webrtcManager != nil && app.webrtcManager.ConnectionDoctor != nil {
+		configHandler := apiServer.GetConfigHandler()
+		configHandler.SetQualityPriorityCallback(func(priorityStr string) error {
+			qm := app.webrtcManager.ConnectionDoctor.GetQualityManager()
+			if qm == nil {
+				return fmt.Errorf("quality manager not initialized")
+			}
+
+			priority, err := quality.ParsePriority(priorityStr)
+			if err != nil {
+				return fmt.Errorf("invalid priority: %v", err)
+			}
+
+			qm.SetPriority(priority)
+			return nil
+		})
+		log.Println("[Main] Quality priority callback wired to config API")
+
+		// Register quality metrics API endpoint
+		apiServer.SetQualityHandler(app.webrtcManager.ConnectionDoctor)
+	}
 
 	// DON'T start frame distributor yet - it will be started when user clicks "Calibrate Camera"
 	// This prevents the camera from running before calibration
@@ -183,34 +244,57 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 	// Create logger for recorder service
 	logger := recorderlog.NewStdLogger().Named("security-camera")
 
-	// Setup email notifications
-	notifier, err := setupEmailNotifications(appCtx, cfg)
-	if err != nil {
-		log.Printf("Email setup failed: %v", err)
-		notifier = nil
+	// Use channels to collect results from concurrent initialization
+	type initResult struct {
+		name  string
+		err   error
+		value interface{}
 	}
+	resultChan := make(chan initResult, 3) // 3 concurrent tasks: motionDetector+notifier, recorderService, webrtc
 
-	// Create motion detector
-	motionDetector, err := motion.NewDetector(&cfg.Motion, notifier)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("failed to create motion detector: %v", err)
-	}
+	// Start concurrent initialization tasks
 
-	// Create recorder service with full config (it uses adapter internally)
-	logger.Info("Initializing recording service with MinIO and PostgreSQL")
-	recorderService, err := recorder.NewRecordingService(cfg, logger)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("failed to create recorder service: %w", err)
-	}
+	// 1. Setup email notifications + motion detector (sequential due to dependency, but async from other tasks)
+	go func() {
+		// Setup notifier first
+		notifier, err := setupEmailNotifications(appCtx, cfg)
+		if err != nil {
+			log.Printf("Email setup failed: %v", err)
+			notifier = nil
+		}
 
-	var wsConn *websocket.Conn
-	var webrtcManager *rtcManager.Manager
+		// Create motion detector with notifier
+		motionDetector, err := motion.NewDetector(&cfg.Motion, notifier)
+		if err != nil {
+			resultChan <- initResult{name: "motionDetector", err: err, value: nil}
+			return
+		}
 
-	if !testingMode {
+		// Return both in a single result
+		resultChan <- initResult{name: "motionDetector", err: nil, value: map[string]interface{}{
+			"detector": motionDetector,
+			"notifier": notifier,
+		}}
+	}()
+
+	// 3. Create recorder service with MinIO/PostgreSQL (async - this is the slow one)
+	go func() {
+		logger.Info("Initializing recording service with MinIO and PostgreSQL (async)")
+		recorderService, err := recorder.NewRecordingService(cfg, logger)
+		if err != nil {
+			log.Printf("Failed to initialize recorder service: %v", err)
+		}
+		resultChan <- initResult{name: "recorderService", err: err, value: recorderService}
+	}()
+
+	// 4. WebSocket and WebRTC setup (async if not testing mode)
+	go func() {
+		if testingMode {
+			resultChan <- initResult{name: "webrtc", err: nil, value: nil}
+			return
+		}
+
 		// Connect to WebSocket server
-		// If ListenAddr starts with ":", prepend "localhost"
 		addr := cfg.WebSocket.ListenAddr
 		if len(addr) > 0 && addr[0] == ':' {
 			addr = "localhost" + addr
@@ -221,24 +305,64 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 		dialer := websocket.Dialer{
 			HandshakeTimeout: 10 * time.Second,
 		}
-		wsConn, _, err = dialer.Dial(wsURL, nil)
+		wsConn, _, err := dialer.Dial(wsURL, nil)
 		if err != nil {
-			cancel()
-			return nil, fmt.Errorf("WebSocket connection failed: %v", err)
+			resultChan <- initResult{name: "webrtc", err: fmt.Errorf("WebSocket connection failed: %v", err), value: nil}
+			return
 		}
 		log.Println("WebSocket connected")
 
-		// Note: WebRTC manager no longer needs videoRecorder
-		// (recording is handled independently by recorderService)
-		webrtcManager, err = rtcManager.NewManager(appCtx, cfg, wsConn, nil)
+		// Create WebRTC manager
+		webrtcManager, err := rtcManager.NewManager(appCtx, cfg, wsConn, nil)
 		if err != nil {
-			cancel()
 			wsConn.Close()
-			return nil, fmt.Errorf("failed to create WebRTC manager: %v", err)
+			resultChan <- initResult{name: "webrtc", err: fmt.Errorf("failed to create WebRTC manager: %v", err), value: nil}
+			return
+		}
+
+		resultChan <- initResult{name: "webrtc", err: nil, value: map[string]interface{}{
+			"conn":    wsConn,
+			"manager": webrtcManager,
+		}}
+	}()
+
+	// Collect results
+	var (
+		notifier           *notification.Notifier
+		motionDetector     *motion.Detector
+		recorderService    *recorder.RecordingService
+		wsConn             *websocket.Conn
+		webrtcManager      *rtcManager.Manager
+	)
+
+	// Wait for all 3 goroutines to complete (motionDetector+notifier, recorderService, webrtc)
+	for i := 0; i < 3; i++ {
+		result := <-resultChan
+		if result.err != nil {
+			cancel()
+			return nil, fmt.Errorf("%s initialization failed: %w", result.name, result.err)
+		}
+
+		switch result.name {
+		case "motionDetector":
+			// Extract both detector and notifier
+			detectorData := result.value.(map[string]interface{})
+			motionDetector = detectorData["detector"].(*motion.Detector)
+			if detectorData["notifier"] != nil {
+				notifier = detectorData["notifier"].(*notification.Notifier)
+			}
+		case "recorderService":
+			recorderService = result.value.(*recorder.RecordingService)
+		case "webrtc":
+			if result.value != nil {
+				webrtcData := result.value.(map[string]interface{})
+				wsConn = webrtcData["conn"].(*websocket.Conn)
+				webrtcManager = webrtcData["manager"].(*rtcManager.Manager)
+			}
 		}
 	}
 
-	// Create calibration service
+	// Create calibration service (fast, no need to parallelize)
 	calibrationService := calibration.NewService(cfg.Video.OutputPath)
 
 	app := &Application{
@@ -265,13 +389,24 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 		})
 	})
 
-	logger.Info("Application initialized successfully")
+	logger.Info("Application initialized successfully (concurrent initialization complete)")
 	return app, nil
 }
 
 // Initialize sets up all components
 func (app *Application) Initialize() error {
 	log.Println("Initializing application...")
+
+	// Defensive nil checks for components from concurrent initialization
+	if app.motionDetector == nil {
+		return fmt.Errorf("motion detector not initialized")
+	}
+	if app.recorderService == nil {
+		return fmt.Errorf("recorder service not initialized")
+	}
+	if !app.testingMode && app.webrtcManager == nil {
+		return fmt.Errorf("WebRTC manager not initialized")
+	}
 
 	var camera, microphone mediadevices.MediaDeviceInfo
 	var err error
@@ -326,11 +461,26 @@ func (app *Application) Initialize() error {
 	if err := app.gstPipeline.Start(app.ctx); err != nil {
 		return fmt.Errorf("failed to start GStreamer pipeline: %w", err)
 	}
-	log.Println("GStreamer VP9 encoder started successfully")
+	log.Println("GStreamer H.264 encoder started successfully")
+
+	// Update device capability with actual hardware encoder detection
+	if app.webrtcManager != nil && app.webrtcManager.ConnectionDoctor != nil {
+		qm := app.webrtcManager.ConnectionDoctor.GetQualityManager()
+		if qm != nil {
+			hasHWEncoder := app.gstPipeline.IsHardwareEncoder()
+			deviceCap := quality.DetectDeviceCapability(
+				app.config.Video.Width,
+				app.config.Video.Height,
+				app.config.Video.FrameRate,
+				hasHWEncoder,
+			)
+			qm.UpdateDeviceCapability(deviceCap)
+		}
+	}
 
 	// Feed frames from distributor to GStreamer pipeline
 	go func() {
-		rawFrames := app.frameDistributor.GetVP9Channel()
+		rawFrames := app.frameDistributor.GetWebRTCChannel()
 		for {
 			select {
 			case frame, ok := <-rawFrames:
@@ -358,9 +508,21 @@ func (app *Application) Initialize() error {
 
 	// Setup WebRTC signaling
 	if !app.testingMode && app.webrtcManager != nil {
+		// Setup passthrough tracks for external RTP input from GStreamer FIRST
+		// These tracks don't capture from devices - they're just conduits for RTP packets
+		// IMPORTANT: Tracks must exist on peer connection BEFORE signaling creates the SDP offer
+		log.Println("Setting up WebRTC passthrough tracks for GStreamer RTP...")
+
+		// Get the actual codec from GStreamer to ensure track matches encoder output
+		videoCodec := app.gstPipeline.GetCodecMimeType()
+		if err := app.webrtcManager.SetupPassthroughTracks(videoCodec); err != nil {
+			return fmt.Errorf("failed to setup passthrough tracks: %v", err)
+		}
+		log.Printf("WebRTC passthrough tracks setup complete (video codec: %s)", videoCodec)
+
 		log.Println("Setting up WebRTC signaling...")
 
-		// Setup signaling
+		// Setup signaling (creates SDP offer with the tracks we just added)
 		if err := app.webrtcManager.SetupSignaling(); err != nil {
 			return fmt.Errorf("signaling setup failed: %v", err)
 		}
@@ -375,6 +537,46 @@ func (app *Application) Initialize() error {
 			return fmt.Errorf("failed to attach external RTP source: %v", err)
 		}
 		log.Println("GStreamer RTP source successfully attached to WebRTC - video streaming active")
+
+		// Wire up quality manager callbacks for dynamic bitrate/profile adjustment
+		if app.webrtcManager.ConnectionDoctor != nil {
+			qm := app.webrtcManager.ConnectionDoctor.GetQualityManager()
+			if qm == nil {
+				log.Println("[QualityManager] Warning: Quality manager not initialized")
+			} else {
+				// Callback for bitrate adjustments
+				qm.SetBitrateCallback(func(newBitrateKbps int) error {
+					if app.gstPipeline != nil && app.gstPipeline.SupportsDynamicBitrate() {
+						if err := app.gstPipeline.SetBitrate(newBitrateKbps); err != nil {
+							log.Printf("[QualityManager] Failed to adjust encoder bitrate: %v", err)
+							return err
+						}
+						log.Printf("[QualityManager] Encoder bitrate adjusted to %d Kbps", newBitrateKbps)
+						return nil
+					}
+					return nil
+				})
+
+				// Callback for profile changes (resolution/framerate adjustments)
+				// NOTE: Runtime resolution changes are complex and not yet implemented
+				// They would require: 1) Stop GStreamer pipeline, 2) Reconfigure encoder,
+				// 3) Restart pipeline, 4) Renegotiate WebRTC SDP
+				// For MVP, bitrate-only adaptation is sufficient
+				qm.SetProfileCallback(func(newProfile *quality.QualityProfile) error {
+					log.Printf("[QualityManager] Profile change requested: %s (%dx%d@%dfps, %d-%d Kbps) - NOT IMPLEMENTED",
+						newProfile.Name,
+						newProfile.Resolution.Width,
+						newProfile.Resolution.Height,
+						newProfile.FrameRate,
+						newProfile.BitrateRange.Min,
+						newProfile.BitrateRange.Max)
+					log.Println("[QualityManager] Runtime resolution changes not yet implemented - bitrate adaptation only")
+					return nil
+				})
+
+				log.Println("[QualityManager] Dynamic quality adjustment callbacks wired successfully")
+			}
+		}
 	}
 
 	log.Println("Initialization complete")
@@ -430,14 +632,14 @@ func (app *Application) runCalibrationPhase() CalibrationResult {
 // drainChannelsDuringCalibration prevents channel overflow
 // Runs until pipeline is ready to consume frames
 func (app *Application) drainChannelsDuringCalibration(done chan struct{}) {
-	vp9Chan := app.frameDistributor.GetVP9Channel()
+	webrtcChan := app.frameDistributor.GetWebRTCChannel()
 	recordChan := app.frameDistributor.GetRecordChannel()
 
 	for {
 		select {
-		case _, ok := <-vp9Chan:
+		case _, ok := <-webrtcChan:
 			if !ok {
-				vp9Chan = nil // Prevent further reads from closed channel
+				webrtcChan = nil // Prevent further reads from closed channel
 			}
 		case _, ok := <-recordChan:
 			if !ok {
@@ -449,7 +651,7 @@ func (app *Application) drainChannelsDuringCalibration(done chan struct{}) {
 		case <-app.ctx.Done():
 			return
 		default:
-			if vp9Chan == nil && recordChan == nil {
+			if webrtcChan == nil && recordChan == nil {
 				return // Both channels closed
 			}
 		}
@@ -725,6 +927,12 @@ func (app *Application) Shutdown(ctx context.Context) error {
 		// Stop components in reverse order
 		if app.pipeline != nil {
 			app.pipeline.Stop()
+		}
+
+		// Stop GStreamer pipeline
+		if app.gstPipeline != nil {
+			log.Println("Stopping GStreamer pipeline...")
+			app.gstPipeline.Stop()
 		}
 
 		if app.frameDistributor != nil {

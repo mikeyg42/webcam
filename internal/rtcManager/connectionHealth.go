@@ -6,15 +6,13 @@ import (
 	"log"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pion/mediadevices"
-	"github.com/pion/mediadevices/pkg/codec/opus"
-	"github.com/pion/mediadevices/pkg/codec/vpx"
-	"github.com/pion/mediadevices/pkg/frame"
-	"github.com/pion/mediadevices/pkg/prop"
 	"github.com/pion/webrtc/v4"
+
+	"github.com/mikeyg42/webcam/internal/quality"
 )
 
 const (
@@ -48,14 +46,26 @@ type ConnectionDoctor struct {
 	metrics  *CircularMetricsBuffer
 	done     chan struct{}
 	warnings chan Warning // Channel for communicating issues
+
+	// Quality management for adaptive streaming
+	qualityManager *quality.QualityManager
+
+	// Shutdown synchronization
+	shutdownOnce sync.Once
+	isShutdown   atomic.Bool
+}
+
+// GetQualityManager returns the quality manager for callback wiring
+func (cd *ConnectionDoctor) GetQualityManager() *quality.QualityManager {
+	return cd.qualityManager
 }
 
 type Warning struct {
 	Level       WarningLevel
 	Type        WarningType
 	Message     string
-	Timestamp   string
-	Measurement float64 // Optional measurement associated with warning
+	Timestamp   time.Time // Changed from string to time.Time for efficiency
+	Measurement float64   // Optional measurement associated with warning
 }
 
 type WarningLevel int
@@ -178,10 +188,10 @@ func (m *Manager) RespondToDoctorsWarnings() {
 			case ICEWarning:
 				m.handleConnectionFailure()
 			case PacketLossWarning, LatencyWarning:
-				if warningFrequency >= 3 {
-					// If we've seen multiple critical warnings, be more aggressive
-					m.adjustMediaConstraints(true) // aggressive mode
-				}
+				// OBSOLETE: mediadevices constraint adjustment removed
+				// Quality adaptation is now handled by QualityManager via GStreamer SetBitrate()
+				log.Printf("[ConnectionDoctor] Critical %s warning (frequency: %d) - handled by QualityManager",
+					warning.Type, warningFrequency)
 			case SignalingWarning:
 				if warningFrequency >= 2 {
 					m.handleDisconnection()
@@ -190,15 +200,11 @@ func (m *Manager) RespondToDoctorsWarnings() {
 
 		case SuggestionLevel:
 			switch warning.Type {
-			case PacketLossWarning, BitrateWarning:
-				if warningFrequency >= 3 {
-					m.adjustMediaConstraints(false) // moderate adjustments
-				}
-			case LatencyWarning:
-				if warningFrequency >= 4 {
-					// If latency issues persist, try moderate adjustments
-					m.adjustMediaConstraints(false)
-				}
+			case PacketLossWarning, BitrateWarning, LatencyWarning:
+				// OBSOLETE: mediadevices constraint adjustment removed
+				// Quality adaptation is now handled by QualityManager via GStreamer SetBitrate()
+				log.Printf("[ConnectionDoctor] Suggestion %s warning (frequency: %d) - handled by QualityManager",
+					warning.Type, warningFrequency)
 			default:
 				// Log for monitoring but don't take action yet
 				log.Printf("Monitoring suggestion: %s (count: %d)",
@@ -206,28 +212,8 @@ func (m *Manager) RespondToDoctorsWarnings() {
 			}
 
 		case InfoLevel:
-			// Check if we can relax constraints
-			if warningFrequency < 2 &&
-				tracker.GetWarningCount(PacketLossWarning, 5*time.Minute) == 0 &&
-				tracker.GetWarningCount(LatencyWarning, 5*time.Minute) == 0 {
-
-				currentMode := m.getCurrentMediaMode()
-				timeSinceLastCritical := time.Since(tracker.LastCriticalWarning())
-				timeSinceLastChange := time.Since(m.LastConstraintChange())
-
-				switch currentMode {
-				case "aggressive":
-					if timeSinceLastCritical > 5*time.Minute {
-						m.adjustMediaConstraints(false) // Switch to moderate
-					}
-				case "moderate":
-					if timeSinceLastCritical > 8*time.Minute &&
-						timeSinceLastChange > 2*time.Minute {
-						m.resetMediaConstraints() // Return to default
-					}
-				}
-			}
-
+			// OBSOLETE: mediadevices constraint "relaxing" removed
+			// Quality adaptation is bidirectional in QualityManager (can upgrade when conditions improve)
 			// Log info for monitoring
 			log.Printf("[ConnectionDoctor Info] %s (Recent count: %d)",
 				warning.Message, warningFrequency)
@@ -244,12 +230,8 @@ func (wt *WarningTracker) GetWarningCount(warningType WarningType, duration time
 
 	for _, warnings := range wt.warnings {
 		for _, w := range warnings {
-			if w.Type == warningType {
-				if t, err := time.Parse("15:04:05.000", w.Timestamp); err == nil {
-					if t.After(cutoff) {
-						count++
-					}
-				}
+			if w.Type == warningType && w.Timestamp.After(cutoff) {
+				count++
 			}
 		}
 	}
@@ -269,201 +251,10 @@ func (m *Manager) LastConstraintChange() time.Time {
 	return m.LastConstraintChangeTime
 }
 
-func (m *Manager) resetMediaConstraints() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Initialize default constraints if not already set
-	if m.MediaConstraints.base.Video.Width == 0 {
-		m.MediaConstraints.base = MediaConstraints{
-			Video: struct {
-				Width     int
-				Height    int
-				FrameRate float32
-				BitRate   uint
-			}{
-				Width:     640,
-				Height:    480,
-				FrameRate: 30,
-				BitRate:   800_000,
-			},
-			Audio: struct {
-				SampleRate   int
-				ChannelCount int
-				BitRate      uint
-			}{
-				SampleRate:   48000,
-				ChannelCount: 1,
-				BitRate:      64000,
-			},
-		}
-	}
-
-	// Apply default constraints
-	constraints := mediadevices.MediaStreamConstraints{
-		Video: func(c *mediadevices.MediaTrackConstraints) {
-			c.DeviceID = prop.String(m.camera.DeviceID)
-			c.FrameFormat = prop.FrameFormat(frame.FormatI420)
-			c.Width = prop.Int(m.MediaConstraints.base.Video.Width)
-			c.Height = prop.Int(m.MediaConstraints.base.Video.Height)
-			c.FrameRate = prop.Float(m.MediaConstraints.base.Video.FrameRate)
-			c.DiscardFramesOlderThan = 500 * time.Millisecond
-		},
-		Audio: func(c *mediadevices.MediaTrackConstraints) {
-			c.DeviceID = prop.String(m.microphone.DeviceID)
-			c.SampleRate = prop.Int(m.MediaConstraints.base.Audio.SampleRate)
-			c.ChannelCount = prop.Int(m.MediaConstraints.base.Audio.ChannelCount)
-			c.Latency = prop.Duration(time.Millisecond * 50)
-		},
-	}
-
-	// Apply new stream with default constraints
-	stream, err := mediadevices.GetUserMedia(constraints)
-	if err != nil {
-		log.Printf("Failed to reset media constraints: %v", err)
-		return
-	}
-
-	// Clean up old stream
-	if m.mediaStream != nil {
-		for _, track := range m.mediaStream.GetTracks() {
-			track.Close()
-		}
-	}
-
-	m.mediaStream = stream
-	m.MediaMode = "default"
-	m.LastConstraintChangeTime = time.Now()
-
-	log.Printf("Media constraints reset to default values")
-}
-
-func (m *Manager) adjustMediaConstraints(aggressive bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Define constraint values based on aggressive mode
-	videoConstraints := struct {
-		width     int
-		height    int
-		frameRate float32
-		bitRate   uint
-	}{}
-	// Set values based on aggressive mode
-	if aggressive {
-		videoConstraints.width = 320
-		videoConstraints.height = 240
-		videoConstraints.frameRate = minAcceptableFramerate
-		videoConstraints.bitRate = 150_000
-	} else {
-		videoConstraints.width = 480
-		videoConstraints.height = 360
-		videoConstraints.frameRate = 20
-		videoConstraints.bitRate = 500_000
-	}
-
-	audioConstraints := struct {
-		sampleRate   int
-		channelCount int
-		bitRate      uint
-	}{}
-
-	// Set audio constraints based on aggressive mode
-	if aggressive {
-		audioConstraints.sampleRate = 8000
-		audioConstraints.bitRate = 16000
-	} else {
-		audioConstraints.sampleRate = 16000
-		audioConstraints.bitRate = 32000
-	}
-	audioConstraints.channelCount = 1 // Always mono
-
-	// Create VP9 parameters
-	vpxParams, err := vpx.NewVP9Params()
-	if err != nil {
-		log.Printf("Failed to create VP9 params: %v", err)
-		return
-	}
-	vpxParams.BitRate = int(videoConstraints.bitRate)
-	if aggressive {
-		vpxParams.KeyFrameInterval = 30
-	} else {
-		vpxParams.KeyFrameInterval = 15
-	}
-	vpxParams.RateControlEndUsage = vpx.RateControlVBR
-	
-	// Set reasonable quantizer ranges (don't make min=max)
-	vpxParams.RateControlMinQuantizer = 20
-	vpxParams.RateControlMaxQuantizer = 40
-
-	// Create Opus parameters
-	opusParams, err := opus.NewParams()
-	if err != nil {
-		log.Printf("Failed to create Opus params: %v", err)
-		return
-	}
-	opusParams.BitRate = int(audioConstraints.bitRate)
-	opusParams.Latency = opus.Latency20ms
-
-	// Create codec selector
-	codecSelector := mediadevices.NewCodecSelector(
-		mediadevices.WithVideoEncoders(&vpxParams),
-		mediadevices.WithAudioEncoders(&opusParams),
-	)
-
-	constraints := mediadevices.MediaStreamConstraints{
-		Video: func(c *mediadevices.MediaTrackConstraints) {
-			c.DeviceID = prop.String(m.camera.DeviceID)
-			c.FrameFormat = prop.FrameFormat(frame.FormatI420)
-			c.Width = prop.Int(videoConstraints.width)
-			c.Height = prop.Int(videoConstraints.height)
-			c.FrameRate = prop.Float(videoConstraints.frameRate)
-			c.DiscardFramesOlderThan = 500 * time.Millisecond
-		},
-		Audio: func(c *mediadevices.MediaTrackConstraints) {
-			c.DeviceID = prop.String(m.microphone.DeviceID)
-			c.SampleRate = prop.Int(audioConstraints.sampleRate)
-			c.ChannelCount = prop.Int(audioConstraints.channelCount)
-			c.Latency = prop.Duration(time.Millisecond * 50)
-		},
-		Codec: codecSelector,
-	}
-
-	// Get new media stream
-	stream, err := mediadevices.GetUserMedia(constraints)
-	if err != nil {
-		log.Printf("Failed to get user media with adjusted constraints: %v", err)
-		return
-	}
-
-	// Gracefully close old stream
-	if m.mediaStream != nil {
-		for _, track := range m.mediaStream.GetTracks() {
-			track.Close()
-		}
-	}
-
-	// Update stream and log changes
-	m.mediaStream = stream
-	log.Printf("Media constraints adjusted - Aggressive mode: %v", aggressive)
-	log.Printf("Video: %dx%d @%dfps, BitRate: %d",
-		videoConstraints.width,
-		videoConstraints.height,
-		int(videoConstraints.frameRate),
-		videoConstraints.bitRate)
-	log.Printf("Audio: %dHz, Channels: %d, BitRate: %d",
-		audioConstraints.sampleRate,
-		audioConstraints.channelCount,
-		audioConstraints.bitRate)
-
-	// Update mode and timestamp
-	if aggressive {
-		m.MediaMode = "aggressive"
-	} else {
-		m.MediaMode = "moderate"
-	}
-	m.LastConstraintChangeTime = time.Now()
-}
+// OBSOLETE FUNCTIONS REMOVED: resetMediaConstraints() and adjustMediaConstraints()
+// These used mediadevices VP9 encoding which has been replaced by GStreamer H.264/H.265 encoding.
+// Quality adaptation is now handled by QualityManager calling GStreamer's SetBitrate() method.
+// See internal/quality/manager.go for the new adaptive streaming implementation.
 
 // ------------------
 type WarningTracker struct {
@@ -508,12 +299,8 @@ func (wt *WarningTracker) LastCriticalWarning() time.Time {
 	var lastCritical time.Time
 	for _, warnings := range wt.warnings {
 		for _, w := range warnings {
-			if w.Level == CriticalLevel {
-				if t, err := time.Parse("15:04:05.000", w.Timestamp); err == nil {
-					if t.After(lastCritical) {
-						lastCritical = t
-					}
-				}
+			if w.Level == CriticalLevel && w.Timestamp.After(lastCritical) {
+				lastCritical = w.Timestamp
 			}
 		}
 	}
@@ -527,7 +314,7 @@ func (wt *WarningTracker) cleanup(key string, timeSince int) {
 	cutoff := time.Now().Add(time.Duration(timeSince) * time.Minute)
 	filtered := make([]Warning, 0)
 	for _, w := range wt.warnings[key] {
-		if t, err := time.Parse("15:04:05.000", w.Timestamp); err == nil && t.After(cutoff) {
+		if w.Timestamp.After(cutoff) {
 			filtered = append(filtered, w)
 		}
 	}
@@ -538,13 +325,81 @@ func (wt *WarningTracker) cleanup(key string, timeSince int) {
 
 func (m *Manager) NewConnectionDoctor(ctx context.Context) *ConnectionDoctor {
 	CDctx, cancel := context.WithCancel(ctx)
+
+	// Initialize QualityManager with detected device capability
+	// Note: Hardware encoder detection will be updated after GStreamer pipeline is created
+	hasHWEncoder := quality.DetectHardwareEncoder() // OS-based heuristic
+	deviceCap := quality.DetectDeviceCapability(
+		m.config.Video.Width,
+		m.config.Video.Height,
+		m.config.Video.FrameRate,
+		hasHWEncoder,
+	)
+
+	// Parse priority from config, default to maximize quality if invalid
+	priority := quality.PriorityMaximizeQuality
+	if m.config.WebRTC.QualityPriority != "" {
+		if parsed, err := quality.ParsePriority(m.config.WebRTC.QualityPriority); err == nil {
+			priority = parsed
+		} else {
+			log.Printf("[ConnectionDoctor] Invalid quality priority '%s', using default 'maximize_quality': %v",
+				m.config.WebRTC.QualityPriority, err)
+		}
+	}
+
+	qm := quality.NewQualityManager(priority, deviceCap)
+
+	log.Printf("[ConnectionDoctor] Quality manager initialized: priority=%s, resolution=%dx%d@%dfps",
+		priority.String(), deviceCap.MaxResolution.Width, deviceCap.MaxResolution.Height, deviceCap.MaxFrameRate)
+
 	return &ConnectionDoctor{
-		manager:  m,
-		ctx:      CDctx,
-		cancel:   cancel,
-		metrics:  NewCircularMetricsBuffer(circularBufferCapacity),
-		done:     make(chan struct{}),
-		warnings: make(chan Warning),
+		manager:        m,
+		ctx:            CDctx,
+		cancel:         cancel,
+		metrics:        NewCircularMetricsBuffer(circularBufferCapacity),
+		done:           make(chan struct{}),
+		warnings:       make(chan Warning, 100), // Buffered to prevent blocking during shutdown
+		qualityManager: qm,
+	}
+}
+
+// Shutdown gracefully shuts down the ConnectionDoctor and releases resources
+func (cd *ConnectionDoctor) Shutdown() {
+	cd.shutdownOnce.Do(func() {
+		log.Println("[ConnectionDoctor] Initiating shutdown...")
+		cd.isShutdown.Store(true)
+
+		// Cancel context first to signal all goroutines to stop
+		cd.cancel()
+
+		// Wait a brief moment for goroutines to drain
+		time.Sleep(100 * time.Millisecond)
+
+		// Now safe to close channels
+		close(cd.warnings)
+		close(cd.done)
+
+		log.Println("[ConnectionDoctor] Shutdown complete")
+	})
+}
+
+// sendWarning safely sends a warning, checking shutdown status first
+func (cd *ConnectionDoctor) sendWarning(w Warning) {
+	// Don't send if shutdown is in progress
+	if cd.isShutdown.Load() {
+		return
+	}
+
+	// Use non-blocking send with timeout
+	select {
+	case cd.warnings <- w:
+		// Successfully sent
+	case <-cd.ctx.Done():
+		// Context cancelled, don't block
+		return
+	case <-time.After(10 * time.Millisecond):
+		// Channel blocked for too long, drop the warning
+		log.Printf("[ConnectionDoctor] Warning channel blocked, dropping: %s", w.Message)
 	}
 }
 
@@ -565,10 +420,25 @@ func (cd *ConnectionDoctor) StartStatsCollection(interval time.Duration) {
 	}()
 }
 func (cd *ConnectionDoctor) AccumulateNewStats() QualityMetrics {
+	// Check if PeerConnection exists first
+	if cd.manager.PeerConnection == nil {
+		return QualityMetrics{
+			Timestamp: time.Now(),
+		}
+	}
+
+	// Safely get DTLS state with nil checks
+	var dtlsState webrtc.DTLSTransportState
+	if sctp := cd.manager.PeerConnection.SCTP(); sctp != nil {
+		if transport := sctp.Transport(); transport != nil {
+			dtlsState = transport.State()
+		}
+	}
+
 	metrics := QualityMetrics{
 		Timestamp:      time.Now(),
 		ICEState:       cd.manager.PeerConnection.ICEConnectionState(),
-		DTLSState:      cd.manager.PeerConnection.SCTP().Transport().State(),
+		DTLSState:      dtlsState,
 		SignalingState: cd.manager.PeerConnection.SignalingState(),
 	}
 
@@ -605,9 +475,9 @@ func (cd *ConnectionDoctor) AccumulateNewStats() QualityMetrics {
 		case *webrtc.ICECandidateStats:
 			// Log candidate information
 			if stat.Type == "local" {
-				log.Printf("[@%s] Local ICE Candidate: %s (%s)", metrics.Timestamp.Format("15:04:05.000"), stat.Protocol, stat.CandidateType)
+				log.Printf("[@%s] Local ICE Candidate: %s (%s)", metrics.Timestamp.Format(time.TimeOnly), stat.Protocol, stat.CandidateType)
 			} else {
-				log.Printf("[@%s] Remote ICE Candidate: %s (%s)", metrics.Timestamp.Format("15:04:05.000"), stat.Protocol, stat.CandidateType)
+				log.Printf("[@%s] Remote ICE Candidate: %s (%s)", metrics.Timestamp.Format(time.TimeOnly), stat.Protocol, stat.CandidateType)
 			}
 
 		case *webrtc.DataChannelStats:
@@ -615,7 +485,7 @@ func (cd *ConnectionDoctor) AccumulateNewStats() QualityMetrics {
 			if stat.State != webrtc.DataChannelStateOpen {
 				select {
 				case cd.warnings <- Warning{
-					Timestamp: metrics.Timestamp.Format("15:04:05.000"),
+					Timestamp: metrics.Timestamp,
 					Level:     InfoLevel,
 					Type:      SignalingWarning,
 					Message:   fmt.Sprintf("Data channel %s in state: %s", stat.Label, stat.State),
@@ -660,6 +530,10 @@ func (cd *ConnectionDoctor) processRTCPStats(stat *RTCPFeedbackStats) {
 
 	// Get time period since last stats
 	recent := cd.metrics.GetRecent(1)
+	if len(recent) == 0 {
+		// No previous stats, skip rate calculation
+		return
+	}
 	lastTime := recent[0].Timestamp
 	timePeriod := time.Now().Sub(lastTime).Seconds()
 
@@ -672,7 +546,7 @@ func (cd *ConnectionDoctor) processRTCPStats(stat *RTCPFeedbackStats) {
 	if nackRate > nackThreshold {
 		select {
 		case cd.warnings <- Warning{
-			Timestamp:   time.Now().Format("15:04:05.000"),
+			Timestamp:   time.Now(),
 			Level:       CriticalLevel,
 			Type:        PacketLossWarning,
 			Message:     fmt.Sprintf("High NACK rate: %.2f/s", nackRate),
@@ -686,7 +560,7 @@ func (cd *ConnectionDoctor) processRTCPStats(stat *RTCPFeedbackStats) {
 	if pliRate > pliThreshold {
 		select {
 		case cd.warnings <- Warning{
-			Timestamp:   time.Now().Format("15:04:05.000"),
+			Timestamp:   time.Now(),
 			Level:       CriticalLevel,
 			Type:        FramerateWarning,
 			Message:     fmt.Sprintf("High PLI rate: %.2f/s", pliRate),
@@ -700,7 +574,7 @@ func (cd *ConnectionDoctor) processRTCPStats(stat *RTCPFeedbackStats) {
 	if firRate > firThreshold {
 		select {
 		case cd.warnings <- Warning{
-			Timestamp:   time.Now().Format("15:04:05.000"),
+			Timestamp:   time.Now(),
 			Level:       CriticalLevel,
 			Type:        FramerateWarning,
 			Message:     fmt.Sprintf("High FIR rate: %.2f/s", firRate),
@@ -723,7 +597,7 @@ func (cd *ConnectionDoctor) processInboundStats(metrics *QualityMetrics, stat *w
 			if avgDecodeTime > 0.033 { // More than 33ms per frame
 				select {
 				case cd.warnings <- Warning{
-					Timestamp: time.Now().Format("15:04:05.000"),
+					Timestamp: time.Now(),
 					Level:     SuggestionLevel,
 					Type:      FramerateWarning,
 					Message:   fmt.Sprintf("High decode time: %.2fms", avgDecodeTime*1000),
@@ -754,6 +628,11 @@ func (cd *ConnectionDoctor) processTransportStats(metrics *QualityMetrics, stat 
 }
 
 func (cd *ConnectionDoctor) collectWSMetrics(metrics *QualityMetrics) {
+	// Early exit if shutdown is in progress to prevent sending on closed channels
+	if cd.isShutdown.Load() {
+		return
+	}
+
 	if cd.manager.wsConnection == nil {
 		return
 	}
@@ -763,9 +642,13 @@ func (cd *ConnectionDoctor) collectWSMetrics(metrics *QualityMetrics) {
 	err := cd.manager.wsConnection.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(time.Second))
 	if err != nil {
 		metrics.WSState = "Error"
+		// Check shutdown again before trying to send
+		if cd.isShutdown.Load() {
+			return
+		}
 		select {
 		case cd.warnings <- Warning{
-			Timestamp: time.Now().Format("15:04:05.000"),
+			Timestamp: time.Now(),
 			Level:     CriticalLevel,
 			Type:      SignalingWarning,
 			Message:   fmt.Sprintf("WebSocket ping failed: %v", err),
@@ -783,9 +666,13 @@ func (cd *ConnectionDoctor) collectWSMetrics(metrics *QualityMetrics) {
 	if cd.manager.rpcConn != nil {
 		jsonrpc_latency, err := cd.checkJSONRPCHealth()
 		if err != nil {
+			// Check shutdown again before trying to send
+			if cd.isShutdown.Load() {
+				return
+			}
 			select {
 			case cd.warnings <- Warning{
-				Timestamp: time.Now().Format("15:04:05.000"),
+				Timestamp: time.Now(),
 				Level:     CriticalLevel,
 				Type:      SignalingWarning,
 				Message:   fmt.Sprintf("JSON-RPC health check failed: %v", err),
@@ -841,21 +728,21 @@ func (cd *ConnectionDoctor) checkPackageLostRate(metrics QualityMetrics) {
 
 	// Packet Loss
 	if metrics.PacketLossRate >= criticalPacketLoss {
-		cd.warnings <- Warning{
-			Timestamp:   time.Now().Format("15:04:05.000"),
+		cd.sendWarning(Warning{
+			Timestamp:   time.Now(),
 			Level:       CriticalLevel,
 			Type:        PacketLossWarning,
 			Message:     fmt.Sprintf("Critical packet loss: %.2f%%", metrics.PacketLossRate*100),
 			Measurement: metrics.PacketLossRate,
-		}
+		})
 	} else if metrics.PacketLossRate >= warningPacketLoss {
-		cd.warnings <- Warning{
-			Timestamp:   time.Now().Format("15:04:05.000"),
+		cd.sendWarning(Warning{
+			Timestamp:   time.Now(),
 			Level:       SuggestionLevel,
 			Type:        PacketLossWarning,
 			Message:     fmt.Sprintf("High packet loss: %.2f%%", metrics.PacketLossRate*100),
 			Measurement: metrics.PacketLossRate,
-		}
+		})
 	}
 }
 
@@ -864,7 +751,7 @@ func (cd *ConnectionDoctor) checkConnectionStates(metrics QualityMetrics) {
 	if metrics.ICEState == webrtc.ICEConnectionStateFailed {
 		select {
 		case cd.warnings <- Warning{
-			Timestamp: time.Now().Format("15:04:05.000"),
+			Timestamp: time.Now(),
 			Level:     CriticalLevel,
 			Type:      ICEWarning,
 			Message:   "ICE connection failed",
@@ -876,12 +763,12 @@ func (cd *ConnectionDoctor) checkConnectionStates(metrics QualityMetrics) {
 
 	// Check DTLS State
 	if metrics.DTLSState == webrtc.DTLSTransportStateFailed {
-		cd.warnings <- Warning{
-			Timestamp: time.Now().Format("15:04:05.000"),
+		cd.sendWarning(Warning{
+			Timestamp: time.Now(),
 			Level:     CriticalLevel,
 			Type:      SignalingWarning,
 			Message:   "DTLS transport failed",
-		}
+		})
 	}
 }
 
@@ -902,13 +789,13 @@ func (cd *ConnectionDoctor) detectPeriodicIssues() {
 	})
 
 	if packetLossPattern.isPeriodic || rttPattern.isPeriodic {
-		cd.warnings <- Warning{
-			Timestamp:   time.Now().Format("15:04:05.000"),
+		cd.sendWarning(Warning{
+			Timestamp:   time.Now(),
 			Level:       SuggestionLevel,
 			Type:        LatencyWarning,
 			Message:     "Detected periodic network issues",
 			Measurement: packetLossPattern.period,
-		}
+		})
 	}
 }
 
@@ -1170,26 +1057,107 @@ func (cd *ConnectionDoctor) analyzeNetworkStability() {
 	stabilityScore := (packetLossStability + rttStability + bitrateStability) / 3.0
 
 	if stabilityScore < 0.5 {
-		cd.warnings <- Warning{
-			Timestamp:   time.Now().Format("15:04:05.000"),
+		cd.sendWarning(Warning{
+			Timestamp:   time.Now(),
 			Level:       SuggestionLevel,
 			Type:        BitrateWarning,
 			Message:     fmt.Sprintf("Network instability detected (score: %.2f)", stabilityScore),
 			Measurement: stabilityScore,
-		}
+		})
 	}
 }
 func (cd *ConnectionDoctor) analyzeInfrastructureHealth(metrics QualityMetrics) {
 	// Check WebSocket connection health
 	if metrics.WSLatency > criticalWSLatency {
-		cd.warnings <- Warning{
-			Timestamp:   time.Now().Format("15:04:05.000"),
+		cd.sendWarning(Warning{
+			Timestamp:   time.Now(),
 			Level:       CriticalLevel,
 			Type:        SignalingWarning,
 			Message:     fmt.Sprintf("WebSocket latency critical: %v", metrics.WSLatency),
 			Measurement: metrics.WSLatency.Seconds(),
+		})
+	}
+}
+
+// estimateBandwidth calculates available bandwidth based on recent throughput
+// Does NOT factor in loss - that's handled by the PID controller to avoid double-counting
+func (cd *ConnectionDoctor) estimateBandwidth(recent []QualityMetrics) int {
+	if len(recent) == 0 {
+		return 0
+	}
+
+	// Calculate average bitrate from recent measurements
+	var totalBitrate uint64
+	for _, m := range recent {
+		totalBitrate += m.Bitrate
+	}
+	avgBitrate := totalBitrate / uint64(len(recent))
+
+	// Simple throughput-based estimate with conservative headroom
+	// The PID controller will handle loss/congestion signals separately
+	availableBandwidth := float64(avgBitrate)
+
+	// Only add headroom if we're consistently achieving good throughput
+	if len(recent) >= 3 {
+		// Check if bitrate is stable/growing (not dropping)
+		stable := true
+		for i := 1; i < len(recent); i++ {
+			if recent[i].Bitrate < recent[i-1].Bitrate*9/10 { // >10% drop
+				stable = false
+				break
+			}
+		}
+		if stable {
+			availableBandwidth *= 1.1 // Add 10% headroom when stable
 		}
 	}
+
+	// Convert from bps to Kbps
+	return int(availableBandwidth / 1000)
+}
+
+// calculateBufferHealth computes overall buffer health score (0.0-1.0)
+func (cd *ConnectionDoctor) calculateBufferHealth(recent []QualityMetrics) float64 {
+	if len(recent) == 0 {
+		return 1.0 // Assume healthy if no data
+	}
+
+	latest := recent[0]
+
+	// Jitter score (40% weight)
+	// Ideal jitter is 0, critical is 100ms
+	jitterScore := 1.0 - math.Min(latest.JitterBuffer/0.1, 1.0)
+
+	// Packet loss score (40% weight)
+	// Ideal is 0%, critical is 5%
+	lossScore := 1.0 - math.Min(latest.PacketLossRate/0.05, 1.0)
+
+	// Framerate stability score (20% weight)
+	// Calculate variance of recent framerates
+	framerateVariance := 0.0
+	if len(recent) >= 3 {
+		var sum float64
+		for _, m := range recent {
+			sum += m.Framerate
+		}
+		mean := sum / float64(len(recent))
+
+		var variance float64
+		for _, m := range recent {
+			diff := m.Framerate - mean
+			variance += diff * diff
+		}
+		variance /= float64(len(recent))
+		framerateVariance = math.Sqrt(variance)
+	}
+
+	// Ideal variance is 0, critical is 5fps deviation
+	framerateScore := 1.0 - math.Min(framerateVariance/5.0, 1.0)
+
+	// Weighted combination
+	bufferHealth := (jitterScore * 0.4) + (lossScore * 0.4) + (framerateScore * 0.2)
+
+	return math.Max(0.0, math.Min(1.0, bufferHealth))
 }
 
 func (cd *ConnectionDoctor) AnalyzeStats() {
@@ -1201,6 +1169,32 @@ func (cd *ConnectionDoctor) AnalyzeStats() {
 
 	latest := recent[0]
 
+	// Update quality manager with current network state
+	if cd.qualityManager != nil {
+		networkState := quality.NetworkState{
+			AvailableBandwidth: cd.estimateBandwidth(recent),
+			PacketLoss:         latest.PacketLossRate,
+			RTT:                latest.RTT,
+			JitterBuffer:       latest.JitterBuffer,
+			BurstLossRate:      latest.BurstLossRate,
+			Framerate:          latest.Framerate,
+			FramerateVariance:  cd.calculateFramerateVariance(recent),
+			NACKCount:          latest.Network.Nacks,
+			PLICount:           latest.Network.Plis,
+			FIRCount:           latest.Network.Firs,
+			WSLatency:          latest.WSLatency,
+			CurrentBitrate:     int(latest.Bitrate / 1000), // Convert to Kbps
+			CurrentResolution: quality.Resolution{
+				Width:  cd.manager.config.Video.Width,
+				Height: cd.manager.config.Video.Height,
+			},
+			CurrentFramerate: cd.manager.config.Video.FrameRate,
+			Timestamp:        time.Now(),
+		}
+
+		cd.qualityManager.UpdateNetworkState(networkState)
+	}
+
 	// Check package loss rate issues
 	cd.checkPackageLostRate(latest)
 
@@ -1211,6 +1205,28 @@ func (cd *ConnectionDoctor) AnalyzeStats() {
 
 	// Check connection states
 	cd.checkConnectionStates(latest)
+}
+
+// calculateFramerateVariance computes the variance in framerate
+func (cd *ConnectionDoctor) calculateFramerateVariance(recent []QualityMetrics) float64 {
+	if len(recent) < 2 {
+		return 0.0
+	}
+
+	var sum float64
+	for _, m := range recent {
+		sum += m.Framerate
+	}
+	mean := sum / float64(len(recent))
+
+	var variance float64
+	for _, m := range recent {
+		diff := m.Framerate - mean
+		variance += diff * diff
+	}
+	variance /= float64(len(recent))
+
+	return math.Sqrt(variance)
 }
 
 func (cd *ConnectionDoctor) analyzeTrends(recent []QualityMetrics) {
@@ -1230,7 +1246,7 @@ func (cd *ConnectionDoctor) analyzeTrends(recent []QualityMetrics) {
 	if bitrateEMA < float64(warningBitrate) {
 		if bitrateEMA < float64(criticalBitrate) {
 			cd.warnings <- Warning{
-				Timestamp:   time.Now().Format("15:04:05.000"),
+				Timestamp:   time.Now(),
 				Level:       CriticalLevel,
 				Type:        BitrateWarning,
 				Message:     fmt.Sprintf("Bitrate warning -- way too slow!: %.3f Kbps", bitrateEMA),
@@ -1238,7 +1254,7 @@ func (cd *ConnectionDoctor) analyzeTrends(recent []QualityMetrics) {
 			}
 		} else {
 			cd.warnings <- Warning{
-				Timestamp:   time.Now().Format("15:04:05.000"),
+				Timestamp:   time.Now(),
 				Level:       SuggestionLevel,
 				Type:        BitrateWarning,
 				Message:     fmt.Sprintf(" Bitrate is getting slow... dangerzone: %.3f Kbps", bitrateEMA),
@@ -1248,32 +1264,32 @@ func (cd *ConnectionDoctor) analyzeTrends(recent []QualityMetrics) {
 	}
 
 	if jitterEMA > 0.1 { // 100ms jitter threshold
-		cd.warnings <- Warning{
-			Timestamp:   time.Now().Format("15:04:05.000"),
+		cd.sendWarning(Warning{
+			Timestamp:   time.Now(),
 			Level:       SuggestionLevel,
 			Type:        LatencyWarning,
 			Message:     fmt.Sprintf("Sustained high jitter: %.2fms", jitterEMA*1000),
 			Measurement: jitterEMA,
-		}
+		})
 	}
 
 	if wsLatencyEMA > warningWSLatency {
 		if wsLatencyEMA > criticalWSLatency {
-			cd.warnings <- Warning{
-				Timestamp:   time.Now().Format("15:04:05.000"),
+			cd.sendWarning(Warning{
+				Timestamp:   time.Now(),
 				Level:       CriticalLevel,
 				Type:        LatencyWarning,
 				Message:     fmt.Sprintf("Sustained critically high latency: %.3fms", wsLatencyEMA*1000),
 				Measurement: wsLatencyEMA,
-			}
+			})
 		} else {
-			cd.warnings <- Warning{
-				Timestamp:   time.Now().Format("15:04:05.000"),
+			cd.sendWarning(Warning{
+				Timestamp:   time.Now(),
 				Level:       SuggestionLevel,
 				Type:        LatencyWarning,
 				Message:     fmt.Sprintf("Sustained borderline dangerous latency: %.3fms", wsLatencyEMA*1000),
 				Measurement: wsLatencyEMA,
-			}
+			})
 		}
 	}
 
@@ -1315,7 +1331,7 @@ func (cd *ConnectionDoctor) detectAnomalies(metrics []QualityMetrics,
 
 		if packetLossZScore > zScoreThreshold {
 			cd.warnings <- Warning{
-				Timestamp: time.Now().Format("15:04:05.000"),
+				Timestamp: time.Now(),
 				Level:     SuggestionLevel,
 				Type:      PacketLossWarning,
 				Message:   fmt.Sprintf("Anomalous packet loss detected: %.2f%%", m.PacketLossRate*100),
@@ -1324,7 +1340,7 @@ func (cd *ConnectionDoctor) detectAnomalies(metrics []QualityMetrics,
 
 		if rttZScore > zScoreThreshold {
 			cd.warnings <- Warning{
-				Timestamp: time.Now().Format("15:04:05.000"),
+				Timestamp: time.Now(),
 				Level:     SuggestionLevel,
 				Type:      LatencyWarning,
 				Message:   fmt.Sprintf("Anomalous RTT detected: %v", m.RTT),
@@ -1333,7 +1349,7 @@ func (cd *ConnectionDoctor) detectAnomalies(metrics []QualityMetrics,
 
 		if wsLatencyZScore > zScoreThreshold {
 			cd.warnings <- Warning{
-				Timestamp: time.Now().Format("15:04:05.000"),
+				Timestamp: time.Now(),
 				Level:     SuggestionLevel,
 				Type:      LatencyWarning,
 				Message:   fmt.Sprintf("Anomalous websocket latency detected: %v", m.WSLatency.Seconds()),

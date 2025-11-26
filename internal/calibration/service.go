@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mikeyg42/webcam/internal/imgconv"
 	"gocv.io/x/gocv"
 )
 
@@ -432,23 +433,5 @@ func (s *Service) Cancel() {
 
 // imageToMat converts image.Image to gocv.Mat
 func imageToMat(img image.Image) (gocv.Mat, error) {
-	bounds := img.Bounds()
-	width := bounds.Dx()
-	height := bounds.Dy()
-
-	// Create Mat with BGR color space (OpenCV default)
-	mat := gocv.NewMatWithSize(height, width, gocv.MatTypeCV8UC3)
-
-	// Convert image to BGR format
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			r, g, b, _ := img.At(x, y).RGBA()
-			// Convert from 16-bit to 8-bit color
-			mat.SetUCharAt(y-bounds.Min.Y, (x-bounds.Min.X)*3+0, uint8(b>>8)) // B
-			mat.SetUCharAt(y-bounds.Min.Y, (x-bounds.Min.X)*3+1, uint8(g>>8)) // G
-			mat.SetUCharAt(y-bounds.Min.Y, (x-bounds.Min.X)*3+2, uint8(r>>8)) // R
-		}
-	}
-
-	return mat, nil
+	return imgconv.ToMat(img)
 }

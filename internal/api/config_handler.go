@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,17 +17,20 @@ import (
 
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/crypto"
+	"github.com/mikeyg42/webcam/internal/motion"
 )
 
 // ConfigHandler handles configuration API requests
 type ConfigHandler struct {
-	config     *config.Config
-	configFile string
-	masterKey  string // AES-256-GCM master key for password encryption
+	config                *config.Config
+	configFile            string
+	masterKey             string // AES-256-GCM master key for password encryption
+	motionDetector        *motion.Detector
+	onQualityPriorityChange func(priority string) error // Callback for dynamic priority updates
 }
 
 // NewConfigHandler creates a new configuration handler
-func NewConfigHandler(cfg *config.Config) *ConfigHandler {
+func NewConfigHandler(cfg *config.Config, motionDetector *motion.Detector) *ConfigHandler {
 	// Determine config file location
 	configFile := os.Getenv("CONFIG_FILE")
 	if configFile == "" {
@@ -55,10 +59,17 @@ func NewConfigHandler(cfg *config.Config) *ConfigHandler {
 	}
 
 	return &ConfigHandler{
-		config:     cfg,
-		configFile: configFile,
-		masterKey:  masterKey,
+		config:         cfg,
+		configFile:     configFile,
+		masterKey:      masterKey,
+		motionDetector: motionDetector,
+		onQualityPriorityChange: nil,
 	}
+}
+
+// SetQualityPriorityCallback registers a callback for quality priority changes
+func (h *ConfigHandler) SetQualityPriorityCallback(cb func(priority string) error) {
+	h.onQualityPriorityChange = cb
 }
 
 // ConfigResponse represents the configuration sent to the frontend
@@ -163,8 +174,9 @@ type EmailSettings struct {
 }
 
 type WebRTCSettings struct {
-	Username string `json:"username"`
-	Password string `json:"password,omitempty"` // Don't send to frontend by default
+	Username        string `json:"username"`
+	Password        string `json:"password,omitempty"` // Don't send to frontend by default
+	QualityPriority string `json:"qualityPriority"`    // maximize_quality, minimize_latency, minimize_device_strain
 }
 
 // GetConfig handles GET /api/config
@@ -209,13 +221,24 @@ func (h *ConfigHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 		// Don't fail the request, just log the warning
 	}
 
-	// Return success with updated config
+	// Return success with updated config and restart requirements
 	response := h.configToResponse()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
-		"message": "Configuration updated successfully. Restart the application for all changes to take effect.",
-		"config":  response,
+		"message": "Configuration saved. Motion detection settings applied immediately. Video, audio, recording, and WebRTC changes require application restart.",
+		"appliedImmediately": map[string]bool{
+			"motion": true,
+		},
+		"requiresRestart": map[string]bool{
+			"video":     true,
+			"audio":     true,
+			"recording": true,
+			"webrtc":    true,
+			"storage":   true,
+			"email":     true,
+		},
+		"config": response,
 	})
 }
 
@@ -287,8 +310,9 @@ func (h *ConfigHandler) configToResponse() ConfigResponse {
 			GmailClientSecret: "",
 		},
 		WebRTC: WebRTCSettings{
-			Username: cfg.WebRTC.Username,
-			Password: "", // Don't send password
+			Username:        cfg.WebRTC.Username,
+			Password:        "", // Don't send password
+			QualityPriority: cfg.WebRTC.QualityPriority,
 		},
 	}
 }
@@ -345,10 +369,28 @@ func (h *ConfigHandler) updateInternalConfig(req *ConfigResponse) {
 		cfg.GmailOAuth2Config.ClientSecret = req.Email.GmailClientSecret
 	}
 
-	// Update WebRTC auth
+	// Update WebRTC auth and quality settings
 	cfg.WebRTC.Username = req.WebRTC.Username
 	if req.WebRTC.Password != "" {
 		cfg.WebRTC.Password = req.WebRTC.Password
+	}
+	if req.WebRTC.QualityPriority != "" && req.WebRTC.QualityPriority != cfg.WebRTC.QualityPriority {
+		oldPriority := cfg.WebRTC.QualityPriority
+		cfg.WebRTC.QualityPriority = req.WebRTC.QualityPriority
+
+		// Apply priority change to running quality manager
+		if h.onQualityPriorityChange != nil {
+			if err := h.onQualityPriorityChange(req.WebRTC.QualityPriority); err != nil {
+				log.Printf("[ConfigHandler] Failed to apply quality priority change: %v", err)
+			} else {
+				log.Printf("[ConfigHandler] Quality priority updated: %s -> %s", oldPriority, req.WebRTC.QualityPriority)
+			}
+		}
+	}
+
+	// Apply motion config updates to running detector
+	if h.motionDetector != nil {
+		h.motionDetector.UpdateConfig(&cfg.Motion)
 	}
 }
 
@@ -525,6 +567,48 @@ func (h *ConfigHandler) TestNotification(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// RestartBackend handles POST /api/restart - triggers backend restart to reload config
+func (h *ConfigHandler) RestartBackend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Respond immediately that restart is starting
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Backend restart initiated. Please wait while configuration changes are applied...",
+	})
+
+	// Trigger restart script in background after response is sent
+	go func() {
+		time.Sleep(500 * time.Millisecond) // Brief delay to ensure response is delivered
+
+		// Determine project root (where restart script is located)
+		projectRoot := os.Getenv("PROJECT_ROOT")
+		if projectRoot == "" {
+			// Try to find it relative to config file
+			configDir := filepath.Dir(h.configFile)
+			projectRoot = filepath.Join(configDir, "..", "projects", "webcam2")
+			// This is a fallback; ideally PROJECT_ROOT should be set
+		}
+
+		scriptPath := filepath.Join(projectRoot, "restart-backend-fast.sh")
+		log.Printf("[Restart] Executing: %s", scriptPath)
+
+		// Execute restart script (this will kill the current process)
+		cmd := exec.Command("/bin/bash", scriptPath)
+		cmd.Dir = projectRoot
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			log.Printf("[Restart] Failed to execute restart script: %v", err)
+		}
+	}()
+}
+
 // RegisterRoutes registers HTTP routes for configuration API
 func (h *ConfigHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
@@ -541,4 +625,5 @@ func (h *ConfigHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/cameras", h.ListCameras)
 	mux.HandleFunc("/api/microphones", h.ListMicrophones)
 	mux.HandleFunc("/api/test-notification", h.TestNotification)
+	mux.HandleFunc("/api/restart", h.RestartBackend)
 }

@@ -80,6 +80,10 @@ type Detector struct {
 	flowDataMu    sync.Mutex
 	flowDataCount int
 	maxDataPoints int
+
+	// Frame source from GStreamer
+	frameChan <-chan image.Image
+	frameChMu sync.RWMutex
 }
 
 // NewDetector creates a detector that will be calibrated later
@@ -134,6 +138,16 @@ func (d *Detector) SetMotionCallback(callback MotionCallback) {
 	d.callbackMu.Lock()
 	defer d.callbackMu.Unlock()
 	d.motionCallback = callback
+}
+
+// SetFrameSource connects the motion detector to a frame source channel
+func (d *Detector) SetFrameSource(frameChan <-chan image.Image) error {
+	d.frameChMu.Lock()
+	defer d.frameChMu.Unlock()
+
+	d.frameChan = frameChan
+	log.Println("[MotionDetector] Frame source connected")
+	return nil
 }
 
 // triggerMotionCallback safely calls the motion callback if set
@@ -259,8 +273,12 @@ func (d *Detector) Detect(frameChan <-chan gocv.Mat, motionChan chan<- bool) {
 			d.consecutiveMotionFrames = 0
 		}
 
-		// Require minimum consecutive frames to confirm motion
-		motionConfirmed := d.consecutiveMotionFrames >= d.config.MinConsecutiveFrames
+		// Require minimum consecutive frames to confirm motion (default 3 if not set)
+		minFrames := d.config.MinConsecutiveFrames
+		if minFrames == 0 {
+			minFrames = 3
+		}
+		motionConfirmed := d.consecutiveMotionFrames >= minFrames
 
 		now := time.Now()
 
@@ -302,8 +320,12 @@ func (d *Detector) Detect(frameChan <-chan gocv.Mat, motionChan chan<- bool) {
 				}
 			}
 		} else if inMotionState {
-			// Check if motion has stopped
-			if now.Sub(lastMotionDetected) >= d.config.NoMotionDelay {
+			// Check if motion has stopped (default 2s if not set)
+			noMotionDelay := d.config.NoMotionDelay
+			if noMotionDelay == 0 {
+				noMotionDelay = 2 * time.Second
+			}
+			if now.Sub(lastMotionDetected) >= noMotionDelay {
 				inMotionState = false
 
 				// Send motion stopped event
@@ -505,6 +527,21 @@ func (d *Detector) ResetStats() {
 	defer d.statsMu.Unlock()
 	d.stats = MotionStats{}
 	d.frameCount = 0
+}
+
+// UpdateConfig updates the motion detector configuration at runtime
+func (d *Detector) UpdateConfig(newConfig *config.MotionConfig) {
+	if newConfig == nil {
+		log.Println("[MotionDetector] Ignoring nil config update")
+		return
+	}
+
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+
+	d.config = newConfig
+	log.Printf("[MotionDetector] Configuration updated: MinConsecutiveFrames=%d, CooldownPeriod=%v, NoMotionDelay=%v, Threshold=%d",
+		newConfig.MinConsecutiveFrames, newConfig.CooldownPeriod, newConfig.NoMotionDelay, newConfig.Threshold)
 }
 
 // Close releases all resources

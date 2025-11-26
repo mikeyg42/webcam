@@ -110,11 +110,10 @@ func (h *CalibrationHandler) GetCalibrationStatus(w http.ResponseWriter, r *http
 	// Get progress from calibration service
 	progress := h.calibService.GetProgress()
 
-	// If calibration just completed, stop the camera
+	// Keep camera running after calibration for WebRTC streaming
+	// (Previously we stopped it, but WebRTC needs continuous video feed)
 	if progress.State == "complete" && h.frameDistributor.IsRunning() {
-		log.Println("[API] Calibration complete - stopping camera")
-		h.frameDistributor.Stop()
-		log.Println("[API] Camera stopped - waiting for user to click 'Start Detection'")
+		log.Println("[API] Calibration complete - camera staying active for WebRTC streaming")
 	}
 
 	// Check if detector is calibrated

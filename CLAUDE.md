@@ -102,3 +102,4 @@ nodemon server.js
 - WebRTC connection includes automatic reconnection and health monitoring
 - System supports multiple concurrent room-based video sessions
 - All components use context-based cancellation for clean shutdown
+- you should be stopping and starting this code with stop-all.sh and start-all.sh as much as possible, to ensure complete, reliable, consistent tear down and run  process

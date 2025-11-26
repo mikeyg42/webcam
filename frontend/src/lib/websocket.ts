@@ -141,7 +141,7 @@ export class WebSocketManager {
   private setupSignalListeners(): void {
     if (!this.signal) return;
 
-    this.signal.onopen = () => {
+    this.signal.onopen = async () => {
       this.setConnectionState('connected');
       this.reconnectAttempts = 0;
       this.emit('debug', 'WebSocket connection established');
@@ -149,7 +149,14 @@ export class WebSocketManager {
       this.emit('connected');
 
       // Join the room to receive streams
-      this.client.join(this.roomId);
+      try {
+        await this.client.join(this.roomId);
+        this.emit('debug', `Joined room: ${this.roomId}`);
+      } catch (error) {
+        console.error('[WebSocket] Failed to join room:', error);
+        this.emit('error', error);
+        this.emit('debug', `Failed to join room ${this.roomId}: ${error}`);
+      }
     };
 
     this.signal.onclose = (event: CloseEvent) => {

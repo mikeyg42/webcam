@@ -5,9 +5,9 @@ import type { ApiResponse, ApiError, ConfigResponse, CalibrationStatus } from '.
 // API configuration
 const API_CONFIG = {
   baseURL: '/api', // Proxied through Vite dev server
-  timeout: 10000,
-  retryAttempts: 3,
-  retryDelay: 1000,
+  timeout: 15000, // Increased timeout for slower starts
+  retryAttempts: 5, // More retry attempts for backend startup
+  retryDelay: 2000, // Longer delay between retries
 };
 
 class ApiClient {
@@ -80,6 +80,11 @@ class ApiClient {
 
   async testNotification(): Promise<ApiResponse> {
     const response = await this.client.post<ApiResponse>('/test-notification');
+    return response.data;
+  }
+
+  async restartBackend(): Promise<ApiResponse> {
+    const response = await this.client.post<ApiResponse>('/restart');
     return response.data;
   }
 

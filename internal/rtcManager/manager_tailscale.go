@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/tailscale"
+	"github.com/mikeyg42/webcam/internal/validate"
 	"github.com/mikeyg42/webcam/internal/video"
 )
 
@@ -31,7 +33,7 @@ func legacyNewManagerWithTailscale(appCtx context.Context, myconfig *config.Conf
 		return nil, fmt.Errorf("tailscale is required (TailscaleConfig.Enabled must be true)")
 	}
 
-	if err := tailscale.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {
+	if err := validate.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {
 		cancel()
 		return nil, fmt.Errorf("tailscale configuration invalid: %w", err)
 	}
@@ -83,6 +85,11 @@ func legacyNewManagerWithTailscale(appCtx context.Context, myconfig *config.Conf
 	m.rpcConn = jsonrpc2.NewConn(ctx, stream, m.handler)
 
 	m.ConnectionDoctor = m.NewConnectionDoctor(ctx)
+
+	// Start ConnectionDoctor monitoring goroutines
+	m.ConnectionDoctor.StartStatsCollection(1 * time.Second)
+	go m.RespondToDoctorsWarnings()
+	log.Println("[Manager] ConnectionDoctor stats collection and warning responder started")
 
 	return m, nil
 }

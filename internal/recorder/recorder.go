@@ -14,8 +14,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/recorder/buffer"
-	"github.com/mikeyg42/webcam/internal/recorder/config"
 	"github.com/mikeyg42/webcam/internal/recorder/encoder"
 	"github.com/mikeyg42/webcam/internal/recorder/pipeline"
 	"github.com/mikeyg42/webcam/internal/recorder/recorderlog"
@@ -74,62 +74,29 @@ type Metrics struct {
 
 // NewRecordingService creates a new recording service
 func NewRecordingService(cfg *config.Config, logger recorderlog.Logger) (*RecordingService, error) {
-	// Initialize encoder (no fallback to undefined symbol)
-	enc, err := encoder.NewVideoToolboxEncoder(encoder.EncoderConfig{
+	// Create GStreamer AV1 encoder for maximum quality recording
+	enc, err := encoder.NewGStreamerAV1Encoder(encoder.EncoderConfig{
 		Width:            cfg.Video.Width,
 		Height:           cfg.Video.Height,
-		FrameRate:        cfg.Video.FrameRate,
-		Bitrate:          cfg.Encoder.Bitrate,
-		KeyframeInterval: cfg.Encoder.KeyframeInterval,
-		Codec:            cfg.Encoder.Codec,
-		Profile:          cfg.Encoder.Profile,
-		MaxBFrames:       cfg.Encoder.MaxBFrames,
+		FrameRate:        float64(cfg.Video.FrameRate),
+		Bitrate:          cfg.Video.BitRate * 1000, // Convert kbps to bps
+		KeyframeInterval: 60,                        // 2 seconds at 30fps
+		Codec:            "av1",
+		RealTime:         false, // Recording mode for maximum quality
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create encoder: %w", err)
+		return nil, fmt.Errorf("failed to create AV1 encoder: %w", err)
 	}
 
-	// Initialize storage
-	// Build storage.MinIOConfig from cfg.Storage.MinIO (note: PartSize in storage is BYTES)
-	minioCfg := storage.MinIOConfig{
-		Endpoint:        cfg.Storage.MinIO.Endpoint,
-		AccessKeyID:     cfg.Storage.MinIO.AccessKeyID,
-		SecretAccessKey: cfg.Storage.MinIO.SecretAccessKey,
-		UseSSL:          cfg.Storage.MinIO.UseSSL,
-		Bucket:          cfg.Storage.MinIO.Bucket,
-		Region:          cfg.Storage.MinIO.Region,
-
-		// Connection pooling
-		MaxUploads:   cfg.Storage.MinIO.MaxUploads,
-		MaxDownloads: cfg.Storage.MinIO.MaxDownloads,
-
-		// Timeouts
-		ConnectTimeout: cfg.Storage.MinIO.ConnectTimeout,
-		RequestTimeout: cfg.Storage.MinIO.RequestTimeout,
-
-		// Multipart settings (config is MB, storage expects bytes)
-		PartSize:    cfg.Storage.MinIO.PartSize * 1024 * 1024,
-		Concurrency: cfg.Storage.MinIO.Concurrency,
+	// Initialize storage using adapter helper
+	minioCfg, pgCfg, err := config.CreateStorageConfigs(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create storage configs: %w", err)
 	}
 
 	objectStore, err := storage.NewMinIOStore(minioCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create object store: %w", err)
-	}
-	
-	// Build storage.PostgresConfig from cfg.Storage.Postgres
-	pg := cfg.Storage.Postgres
-	pgCfg := storage.PostgresConfig{
-		Host:            pg.Host,
-		Port:            pg.Port,
-		Database:        pg.Database,
-		Username:        pg.Username,
-		Password:        pg.Password,
-		SSLMode:         pg.SSLMode,
-		MaxConnections:  pg.MaxConnections,
-		MaxIdleConns:    pg.MaxIdleConns,
-		ConnMaxLifetime: pg.ConnMaxLifetime,
-		ConnMaxIdleTime: pg.ConnMaxIdleTime,
 	}
 
 	metadataStore, err := storage.NewPostgresStore(pgCfg)
@@ -138,7 +105,7 @@ func NewRecordingService(cfg *config.Config, logger recorderlog.Logger) (*Record
 	}
 
 	// Ring buffer sized by time * fps
-	bufferFrames := int(cfg.Recording.RingBufferSize.Seconds() * cfg.Video.FrameRate)
+	bufferFrames := int(cfg.Recording.RingBufferSize.Seconds() * float64(cfg.Video.FrameRate))
 	ringBuffer := buffer.NewRingBuffer(bufferFrames)
 
 	// Segmenter
@@ -298,6 +265,18 @@ func (r *RecordingService) frameProcessor(ctx context.Context) {
 func (r *RecordingService) processFrame(frame *buffer.Frame) {
 	r.metrics.FramesProcessed.Add(1)
 
+	// Validate frame before processing
+	if frame == nil || frame.Image == nil {
+		r.metrics.Errors.Add(1)
+		return
+	}
+
+	// Validate encoder is initialized
+	if r.encoder == nil {
+		r.metrics.Errors.Add(1)
+		return
+	}
+
 	// Always write to ring buffer (best effort)
 	_ = r.ringBuffer.Write(frame)
 
@@ -374,12 +353,12 @@ func (r *RecordingService) handleMotionEvent(ev MotionEvent, timer *time.Timer) 
 
 		recID := uuid.New().String()
 		rec := &storage.Recording{
-			ID:        recID,
-			Type:      "event",
-			Status:    "recording",
-			StartedAt: ev.Timestamp,
-			Bucket:    r.config.Storage.MinIO.Bucket,
-			BaseKey:   fmt.Sprintf("event/%s/%s", ev.Timestamp.Format("2006-01-02"), recID),
+			ID:               recID,
+			Type:             "event",
+			Status:           "recording",
+			StartedAt:        ev.Timestamp,
+			Bucket:           r.config.Storage.MinIO.Bucket,
+			BaseKey:          fmt.Sprintf("event/%s/%s", ev.Timestamp.Format("2006-01-02"), recID),
 			MotionConfidence: sql.NullFloat64{Float64: ev.Confidence, Valid: true},
 		}
 
@@ -612,6 +591,21 @@ func (r *RecordingService) metricsReporter(ctx context.Context) {
 
 // reportMetrics logs current service metrics
 func (r *RecordingService) reportMetrics() {
+	// Validate encoder is initialized before accessing metrics
+	if r.encoder == nil {
+		r.logger.Info("Recording service metrics",
+			recorderlog.Uint64("frames_received", r.metrics.FramesReceived.Load()),
+			recorderlog.Uint64("frames_processed", r.metrics.FramesProcessed.Load()),
+			recorderlog.Uint64("frames_dropped", r.metrics.FramesDropped.Load()),
+			recorderlog.Uint64("recordings_started", r.metrics.RecordingsStarted.Load()),
+			recorderlog.Uint64("recordings_ended", r.metrics.RecordingsEnded.Load()),
+			recorderlog.Uint64("segments_created", r.metrics.SegmentsCreated.Load()),
+			recorderlog.Uint64("bytes_written", r.metrics.BytesWritten.Load()),
+			recorderlog.Uint64("errors", r.metrics.Errors.Load()),
+		)
+		return
+	}
+
 	em := r.encoder.GetMetrics()
 	r.logger.Info("Recording service metrics",
 		recorderlog.Uint64("frames_received", r.metrics.FramesReceived.Load()),
@@ -669,6 +663,35 @@ func (r *RecordingService) GenerateStreamURL(ctx context.Context, recordingID st
 		return "", fmt.Errorf("failed to generate URL: %w", err)
 	}
 	return url, nil
+}
+
+// UpdateConfig updates the recording service configuration at runtime
+// Only safe parameters (continuous/event enabled flags) are updated.
+// Other parameters like segment duration, ring buffer size require restart.
+func (r *RecordingService) UpdateConfig(newConfig *config.RecordingConfig) {
+	if newConfig == nil {
+		r.logger.Warn("Ignoring nil recording config update")
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Update safe runtime parameters
+	oldContinuous := r.continuousEnabled
+	oldEvent := r.eventEnabled
+
+	r.continuousEnabled = newConfig.ContinuousEnabled
+	r.eventEnabled = newConfig.EventEnabled
+
+	r.logger.Info("Recording configuration updated",
+		recorderlog.Bool("continuous_enabled", r.continuousEnabled),
+		recorderlog.Bool("event_enabled", r.eventEnabled),
+		recorderlog.Bool("continuous_changed", oldContinuous != r.continuousEnabled),
+		recorderlog.Bool("event_changed", oldEvent != r.eventEnabled))
+
+	// Note: Changes to segment duration, ring buffer size, temp dir, etc.
+	// require application restart to take effect
 }
 
 // checkDiskSpace verifies sufficient disk space is available

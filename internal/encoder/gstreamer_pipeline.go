@@ -62,6 +62,10 @@ type GStreamerPipeline struct {
 
 	// Thread safety
 	mu sync.Mutex
+
+	// Dynamic bitrate control
+	encoder     *gst.Element
+	encoderKind encoderKind
 }
 
 // NewGStreamerPipeline creates a new encoder pipeline
@@ -150,13 +154,26 @@ func (g *GStreamerPipeline) Stop() {
 
 	// Stop pipeline
 	g.pipeline.SetState(gst.StateNull)
-	g.wg.Wait()
+
+	// Wait for goroutines with timeout
+	done := make(chan struct{})
+	go func() {
+		g.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Goroutines completed successfully
+	case <-time.After(5 * time.Second):
+		log.Println("Warning: Pipeline stop timeout - force closing")
+	}
 
 	// Close channels
 	close(g.motionChan)
 	close(g.recordChan)
 	close(g.rtpChan)
-	
+
 	g.pipeline = nil
 
 	// Log final statistics
@@ -285,6 +302,10 @@ func (g *GStreamerPipeline) buildPipeline(pipe *gst.Pipeline) error {
 		return fmt.Errorf("no usable encoder found")
 	}
 
+	// Store encoder reference for dynamic bitrate control
+	g.encoder = enc
+	g.encoderKind = encKind
+
 	// Create RTP payloader
 	rtpPay, caps, err := g.makeRTPPay(encKind)
 	if err != nil {
@@ -401,19 +422,93 @@ func (g *GStreamerPipeline) configureAppSrc() error {
 type encoderKind int
 
 const (
-	encVP9 encoderKind = iota
-	encH264NVENC
+	encH264NVENC encoderKind = iota
 	encH264VAAPI
 	encH264VideoToolbox
 	encH264X264
+	encH265NVENC
+	encH265VAAPI
+	encH265VideoToolbox
+	encH265X265
+	encAV1SVT
+	encAV1RAV1E
 )
 
-// chooseEncoder selects the best available encoder
+// IsHardwareEncoder returns true if the encoder uses hardware acceleration
+func (g *GStreamerPipeline) IsHardwareEncoder() bool {
+	switch g.encoderKind {
+	case encH264NVENC, encH264VAAPI, encH264VideoToolbox,
+		encH265NVENC, encH265VAAPI, encH265VideoToolbox:
+		return true
+	default:
+		return false
+	}
+}
+
+// GetCodecMimeType returns the WebRTC MIME type for the current encoder
+func (g *GStreamerPipeline) GetCodecMimeType() string {
+	switch g.encoderKind {
+	case encH265NVENC, encH265VAAPI, encH265VideoToolbox, encH265X265:
+		return "video/H265"
+	case encH264NVENC, encH264VAAPI, encH264VideoToolbox, encH264X264:
+		return "video/H264"
+	case encAV1SVT, encAV1RAV1E:
+		return "video/AV1"
+	default:
+		return "video/H264" // Default fallback
+	}
+}
+
+// chooseEncoder selects the best available encoder based on resolution
 func (g *GStreamerPipeline) chooseEncoder() (*gst.Element, encoderKind) {
-	// On macOS, prefer H264 VideoToolbox (excellent hardware support)
-	// VP9 has poor VideoToolbox support
+	// Check if resolution is 4K or higher
+	is4K := g.config.Width*g.config.Height >= 3840*2160
+
+	// For 4K+ resolutions, prefer H.265/HEVC
+	if is4K {
+		log.Printf("4K+ resolution detected (%dx%d), trying H.265 encoders", g.config.Width, g.config.Height)
+
+		// On macOS, prefer H265 VideoToolbox
+		if runtime.GOOS == "darwin" {
+			if e, err := gst.NewElement("vtenc_h265_hw"); err == nil && e != nil {
+				g.configureVideoToolboxH265(e)
+				log.Println("Using VideoToolbox H.265 hardware encoder")
+				return e, encH265VideoToolbox
+			}
+		}
+
+		// Try hardware H.265 encoders (non-macOS)
+		if g.config.PreferHardware {
+			// NVIDIA NVENC H.265
+			if e, err := gst.NewElement("nvh265enc"); err == nil && e != nil {
+				g.configureNVENCH265(e)
+				log.Println("Using NVENC H.265 hardware encoder")
+				return e, encH265NVENC
+			}
+
+			// Intel/AMD VAAPI H.265
+			if e, err := gst.NewElement("vah265enc"); err == nil && e != nil {
+				g.configureVAAPIH265(e)
+				log.Println("Using VA-API H.265 hardware encoder")
+				return e, encH265VAAPI
+			}
+		}
+
+		// Software H.265 fallback for 4K
+		if e, err := gst.NewElement("x265enc"); err == nil && e != nil {
+			g.configureX265(e)
+			log.Println("Using x265 software encoder for 4K")
+			return e, encH265X265
+		}
+
+		log.Println("H.265 encoders not available, falling back to H.264 for 4K")
+	}
+
+	// For sub-4K resolutions or H.265 fallback, use H.264
+	log.Printf("Using H.264 encoder for %dx%d resolution", g.config.Width, g.config.Height)
+
+	// On macOS, prefer H264 VideoToolbox
 	if runtime.GOOS == "darwin" {
-		// Try VideoToolbox H264 hardware encoder first
 		if e, err := gst.NewElement("vtenc_h264_hw"); err == nil && e != nil {
 			g.configureVideoToolbox(e)
 			log.Println("Using VideoToolbox H.264 hardware encoder")
@@ -421,30 +516,20 @@ func (g *GStreamerPipeline) chooseEncoder() (*gst.Element, encoderKind) {
 		}
 	}
 
-	// Try hardware encoders first (non-macOS)
+	// Try hardware H.264 encoders (non-macOS)
 	if g.config.PreferHardware {
-		// NVIDIA NVENC
+		// NVIDIA NVENC H.264
 		if e, err := gst.NewElement("nvh264enc"); err == nil && e != nil {
 			g.configureNVENC(e)
 			log.Println("Using NVENC H.264 hardware encoder")
 			return e, encH264NVENC
 		}
 
-		// Intel VAAPI
+		// Intel/AMD VAAPI H.264
 		if e, err := gst.NewElement("vah264enc"); err == nil && e != nil {
 			g.configureVAAPI(e)
 			log.Println("Using VA-API H.264 hardware encoder")
 			return e, encH264VAAPI
-		}
-	}
-
-	// On non-macOS systems, prefer VP9 software encoder
-	// On macOS, skip VP9 and go straight to x264
-	if runtime.GOOS != "darwin" {
-		if e, err := gst.NewElement("vp9enc"); err == nil && e != nil {
-			g.configureVP9(e)
-			log.Println("Using VP9 software encoder")
-			return e, encVP9
 		}
 	}
 
@@ -475,36 +560,61 @@ func (g *GStreamerPipeline) configureVideoToolbox(e *gst.Element) {
 	_ = e.SetProperty("allow-frame-reordering", false)
 }
 
-func (g *GStreamerPipeline) configureVP9(e *gst.Element) {
-	_ = e.SetProperty("end-usage", 1) // VBR
-	_ = e.SetProperty("target-bitrate", uint(g.config.BitRateKbps*1000))
-	_ = e.SetProperty("cpu-used", g.config.CPUUsed)
-	_ = e.SetProperty("lag-in-frames", max(1, g.config.FrameRate))
-	_ = e.SetProperty("threads", max(1, g.config.Threads))
-	_ = e.SetProperty("tile-columns", g.config.TileColumns)
-	_ = e.SetProperty("row-mt", g.config.RowMT)
-	_ = e.SetProperty("keyframe-max-dist", g.config.KeyFrameInterval)
-}
-
 func (g *GStreamerPipeline) configureX264(e *gst.Element) {
 	_ = e.SetProperty("bitrate", uint(g.config.BitRateKbps))
 	_ = e.SetProperty("key-int-max", uint(g.config.KeyFrameInterval))
 	_ = e.SetProperty("speed-preset", "medium")
 }
 
+// H.265/HEVC encoder configurations
+func (g *GStreamerPipeline) configureNVENCH265(e *gst.Element) {
+	_ = e.SetProperty("rc-mode", uint32(0))
+	_ = e.SetProperty("bitrate", uint(g.config.BitRateKbps))
+	_ = e.SetProperty("gop-size", int(g.config.KeyFrameInterval))
+}
+
+func (g *GStreamerPipeline) configureVAAPIH265(e *gst.Element) {
+	_ = e.SetProperty("bitrate", uint(g.config.BitRateKbps))
+}
+
+func (g *GStreamerPipeline) configureVideoToolboxH265(e *gst.Element) {
+	_ = e.SetProperty("bitrate", uint(g.config.BitRateKbps))
+	_ = e.SetProperty("max-keyframe-interval", uint(g.config.KeyFrameInterval))
+	_ = e.SetProperty("allow-frame-reordering", false)
+}
+
+func (g *GStreamerPipeline) configureX265(e *gst.Element) {
+	_ = e.SetProperty("bitrate", uint(g.config.BitRateKbps))
+	_ = e.SetProperty("key-int-max", uint(g.config.KeyFrameInterval))
+	_ = e.SetProperty("speed-preset", "medium")
+}
+
+// AV1 encoder configurations
+func (g *GStreamerPipeline) configureSVTAV1(e *gst.Element) {
+	_ = e.SetProperty("target-bitrate", uint(g.config.BitRateKbps*1000))
+	_ = e.SetProperty("gop-size", int(g.config.KeyFrameInterval))
+	_ = e.SetProperty("preset", uint(7))
+}
+
+func (g *GStreamerPipeline) configureRAV1E(e *gst.Element) {
+	_ = e.SetProperty("bitrate", uint(g.config.BitRateKbps))
+	_ = e.SetProperty("keyframe-interval", uint(g.config.KeyFrameInterval))
+	_ = e.SetProperty("speed-preset", uint(7))
+}
+
 // makeRTPPay creates the RTP payloader
 func (g *GStreamerPipeline) makeRTPPay(kind encoderKind) (*gst.Element, *gst.Caps, error) {
 	switch kind {
-	case encVP9:
-		pay, err := gst.NewElement("rtpvp9pay")
+	case encH265NVENC, encH265VAAPI, encH265VideoToolbox, encH265X265:
+		pay, err := gst.NewElement("rtph265pay")
 		if err != nil {
-			return nil, nil, fmt.Errorf("create rtpvp9pay: %w", err)
+			return nil, nil, fmt.Errorf("create rtph265pay: %w", err)
 		}
-		_ = pay.SetProperty("picture-id-mode", 1)
-		c := gst.NewCapsFromString("application/x-rtp,media=video,encoding-name=VP9,clock-rate=90000")
+		_ = pay.SetProperty("config-interval", 1)
+		c := gst.NewCapsFromString("application/x-rtp,media=video,encoding-name=H265,clock-rate=90000")
 		return pay, c, nil
-		
-	default:
+
+	default: // H.264 encoders
 		pay, err := gst.NewElement("rtph264pay")
 		if err != nil {
 			return nil, nil, fmt.Errorf("create rtph264pay: %w", err)
@@ -631,19 +741,22 @@ func (g *GStreamerPipeline) handleRTPSample(s *app.Sink, kind encoderKind) gst.F
 
 // isKeyframe detects keyframes in RTP packets
 func (g *GStreamerPipeline) isKeyframe(pkt *rtp.Packet, kind encoderKind) bool {
-	if len(pkt.Payload) < 1 {
+	if len(pkt.Payload) < 2 {
 		return false
 	}
 
 	switch kind {
-	case encVP9:
-		// VP9: P bit (inverse of keyframe)
-		return (pkt.Payload[0] & 0x80) == 0
-
 	case encH264NVENC, encH264VAAPI, encH264VideoToolbox, encH264X264:
 		// H.264: NAL unit type 5 = IDR
 		nalType := pkt.Payload[0] & 0x1F
 		return nalType == 5
+
+	case encH265NVENC, encH265VAAPI, encH265VideoToolbox, encH265X265:
+		// H.265: NAL unit types for keyframes
+		// Extract NAL unit type from first two bytes
+		nalType := (pkt.Payload[0] >> 1) & 0x3F
+		// IDR_W_RADL = 19, IDR_N_LP = 20, CRA_NUT = 21
+		return nalType == 19 || nalType == 20 || nalType == 21
 
 	default:
 		return false
@@ -742,4 +855,106 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// SetBitrate dynamically adjusts encoder bitrate at runtime
+// This is called by QualityManager for adaptive quality control
+func (g *GStreamerPipeline) SetBitrate(bitrateKbps int) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.encoder == nil {
+		return errors.New("encoder not initialized")
+	}
+
+	if g.pipeline == nil {
+		return errors.New("pipeline not initialized")
+	}
+
+	// Sanity check bitrate bounds
+	const minBitrate = 100   // 100 Kbps absolute minimum
+	const maxBitrate = 15000 // 15 Mbps absolute maximum
+	if bitrateKbps < minBitrate || bitrateKbps > maxBitrate {
+		return fmt.Errorf("bitrate %d Kbps out of safe range [%d, %d]", bitrateKbps, minBitrate, maxBitrate)
+	}
+
+	// Check if pipeline is playing
+	currentState := g.pipeline.GetCurrentState()
+	if currentState != gst.StatePlaying {
+		return errors.New("pipeline not running")
+	}
+
+	log.Printf("[GStreamerPipeline] Adjusting encoder bitrate: %d -> %d Kbps", g.config.BitRateKbps, bitrateKbps)
+
+	// Update encoder based on type
+	var err error
+	switch g.encoderKind {
+	case encH264NVENC, encH265NVENC:
+		// NVIDIA NVENC supports runtime bitrate changes
+		err = g.encoder.SetProperty("bitrate", uint(bitrateKbps))
+		if err != nil {
+			return fmt.Errorf("failed to set NVENC bitrate: %w", err)
+		}
+
+	case encH264VAAPI, encH265VAAPI:
+		// VA-API supports runtime bitrate changes
+		err = g.encoder.SetProperty("bitrate", uint(bitrateKbps))
+		if err != nil {
+			return fmt.Errorf("failed to set VAAPI bitrate: %w", err)
+		}
+
+	case encH264VideoToolbox, encH265VideoToolbox:
+		// VideoToolbox supports runtime bitrate changes
+		err = g.encoder.SetProperty("bitrate", uint(bitrateKbps))
+		if err != nil {
+			return fmt.Errorf("failed to set VideoToolbox bitrate: %w", err)
+		}
+
+	case encH264X264, encH265X265:
+		// Software encoders (x264/x265) support runtime bitrate changes
+		err = g.encoder.SetProperty("bitrate", uint(bitrateKbps))
+		if err != nil {
+			return fmt.Errorf("failed to set x264/x265 bitrate: %w", err)
+		}
+
+	case encAV1SVT, encAV1RAV1E:
+		// AV1 encoders - check support
+		err = g.encoder.SetProperty("bitrate", uint(bitrateKbps))
+		if err != nil {
+			log.Printf("[GStreamerPipeline] Warning: AV1 encoder may not support runtime bitrate changes: %v", err)
+			return fmt.Errorf("failed to set AV1 bitrate: %w", err)
+		}
+
+	default:
+		return fmt.Errorf("unsupported encoder type for runtime bitrate adjustment: %d", g.encoderKind)
+	}
+
+	// Update config to reflect new bitrate
+	g.config.BitRateKbps = bitrateKbps
+	log.Printf("[GStreamerPipeline] Bitrate adjusted successfully to %d Kbps", bitrateKbps)
+
+	return nil
+}
+
+// GetCurrentBitrate returns the current configured bitrate
+func (g *GStreamerPipeline) GetCurrentBitrate() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.config.BitRateKbps
+}
+
+// SupportsDynamicBitrate checks if the current encoder supports runtime bitrate changes
+func (g *GStreamerPipeline) SupportsDynamicBitrate() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	switch g.encoderKind {
+	case encH264NVENC, encH265NVENC,
+		encH264VAAPI, encH265VAAPI,
+		encH264VideoToolbox, encH265VideoToolbox,
+		encH264X264, encH265X265:
+		return true
+	default:
+		return false
+	}
 }

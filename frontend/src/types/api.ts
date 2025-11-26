@@ -88,6 +88,7 @@ export interface EmailSettings {
 export interface WebRTCSettings {
   username: string;
   password?: string;
+  qualityPriority?: string; // 'maximize_quality' | 'minimize_latency' | 'minimize_device_strain'
 }
 
 // Calibration types

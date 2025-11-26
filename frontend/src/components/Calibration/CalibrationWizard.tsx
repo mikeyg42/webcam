@@ -1,8 +1,13 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useCalibrationStore } from '../../stores/calibrationStore';
 
-export function CalibrationWizard() {
+interface CalibrationWizardProps {
+  onCalibrationComplete?: () => void;
+}
+
+export function CalibrationWizard({ onCalibrationComplete }: CalibrationWizardProps) {
   const { status, isPolling, error, startCalibration, applyCalibration, fetchStatus, stopPolling } = useCalibrationStore();
+  const [applySuccess, setApplySuccess] = useState(false);
 
   useEffect(() => {
     // Fetch initial status
@@ -24,9 +29,15 @@ export function CalibrationWizard() {
 
   const handleApply = async () => {
     try {
+      setApplySuccess(false);
       await applyCalibration();
+      setApplySuccess(true);
+      if (onCalibrationComplete) {
+        onCalibrationComplete();
+      }
     } catch (error) {
       console.error('Failed to apply calibration:', error);
+      setApplySuccess(false);
     }
   };
 
@@ -67,6 +78,12 @@ export function CalibrationWizard() {
       {error && (
         <div className="bg-red-900/50 border border-red-500 text-red-200 px-4 py-3 rounded mb-6">
           {error}
+        </div>
+      )}
+
+      {applySuccess && (
+        <div className="bg-green-900/50 border border-green-500 text-green-200 px-4 py-3 rounded mb-6">
+          ✓ Calibration applied successfully! Motion detection is now using the calibrated baseline.
         </div>
       )}
 

@@ -22,7 +22,6 @@ import (
 type FrameDistributor struct {
 	// Camera configuration
 	camera        mediadevices.MediaDeviceInfo
-	codecSelector *mediadevices.CodecSelector
 	stream        mediadevices.MediaStream
 
 	// Lifecycle management
@@ -34,7 +33,7 @@ type FrameDistributor struct {
 	isRunning atomic.Bool
 
 	// Consumer channels
-	vp9Channel    chan image.Image
+	webrtcChannel chan image.Image  // H.264 for WebRTC streaming
 	motionChannel chan image.Image
 	recordChannel chan image.Image
 
@@ -43,12 +42,12 @@ type FrameDistributor struct {
 
 	// Statistics with atomic counters for lock-free updates
 	stats struct {
-		totalFrames   atomic.Int64
-		droppedFrames atomic.Int64
-		vp9Sent      atomic.Int64
-		motionSent   atomic.Int64
-		recordSent   atomic.Int64
-		lastFrameTime atomic.Value // stores time.Time
+		totalFrames    atomic.Int64
+		droppedFrames  atomic.Int64
+		webrtcSent     atomic.Int64  // H.264 frames sent to WebRTC
+		motionSent     atomic.Int64
+		recordSent     atomic.Int64
+		lastFrameTime  atomic.Value // stores time.Time
 	}
 }
 
@@ -56,9 +55,9 @@ type FrameDistributor struct {
 type DistributorStats struct {
 	TotalFrames   int64
 	DroppedFrames int64
-	VP9Sent      int64
-	MotionSent   int64
-	RecordSent   int64
+	WebRTCSent    int64  // H.264 frames sent to WebRTC
+	MotionSent    int64
+	RecordSent    int64
 	LastFrameTime time.Time
 }
 
@@ -70,8 +69,7 @@ type ImageFrame struct {
 }
 
 // NewFrameDistributor creates a new single-source frame distributor
-func NewFrameDistributor(ctx context.Context, camera mediadevices.MediaDeviceInfo,
-	codecSelector *mediadevices.CodecSelector) (*FrameDistributor, error) {
+func NewFrameDistributor(ctx context.Context, camera mediadevices.MediaDeviceInfo) (*FrameDistributor, error) {
 
 	fdCtx, cancel := context.WithCancel(ctx)
 
@@ -80,10 +78,9 @@ func NewFrameDistributor(ctx context.Context, camera mediadevices.MediaDeviceInf
 
 	fd := &FrameDistributor{
 		camera:          camera,
-		codecSelector:   codecSelector,
 		ctx:             fdCtx,
 		cancel:          cancel,
-		vp9Channel:      make(chan image.Image, 10),
+		webrtcChannel:   make(chan image.Image, 10),  // H.264 for WebRTC
 		motionChannel:   make(chan image.Image, 5),
 		recordChannel:   make(chan image.Image, 30),
 		preMotionBuffer: preMotionBuffer,
@@ -105,7 +102,7 @@ func (fd *FrameDistributor) Start(width, height int) error {
 
 	log.Printf("[FrameDistributor] Starting single camera capture at %dx%d", width, height)
 
-	// Configure camera constraints
+	// Configure camera constraints (no codec - raw frames only)
 	constraints := mediadevices.MediaStreamConstraints{
 		Video: func(c *mediadevices.MediaTrackConstraints) {
 			c.DeviceID = prop.String(fd.camera.DeviceID)
@@ -113,7 +110,6 @@ func (fd *FrameDistributor) Start(width, height int) error {
 			c.Height = prop.IntExact(height)
 			c.FrameRate = prop.FloatExact(15)  // 15fps
 		},
-		Codec: fd.codecSelector,
 	}
 
 	// Create media stream
@@ -257,10 +253,10 @@ func (fd *FrameDistributor) efficientClone(img image.Image) image.Image {
 
 // sendToConsumers distributes frame to all consumer channels
 func (fd *FrameDistributor) sendToConsumers(img image.Image) {
-	// VP9 encoder channel (non-blocking)
+	// H.264 WebRTC encoder channel (non-blocking)
 	select {
-	case fd.vp9Channel <- img:
-		fd.stats.vp9Sent.Add(1)
+	case fd.webrtcChannel <- img:
+		fd.stats.webrtcSent.Add(1)
 	default:
 		fd.stats.droppedFrames.Add(1)
 		// Only log every 100th dropped frame to avoid spam
@@ -291,7 +287,7 @@ func (fd *FrameDistributor) sendToConsumers(img image.Image) {
 func (fd *FrameDistributor) logStats() {
 	total := fd.stats.totalFrames.Load()
 	dropped := fd.stats.droppedFrames.Load()
-	vp9 := fd.stats.vp9Sent.Load()
+	webrtc := fd.stats.webrtcSent.Load()
 	motion := fd.stats.motionSent.Load()
 	record := fd.stats.recordSent.Load()
 
@@ -300,8 +296,8 @@ func (fd *FrameDistributor) logStats() {
 		dropRate = float64(dropped) * 100.0 / float64(total*3) // 3 channels
 	}
 
-	log.Printf("[FrameDistributor] Stats - Total: %d, VP9: %d, Motion: %d, Record: %d, Drop rate: %.1f%%",
-		total, vp9, motion, record, dropRate)
+	log.Printf("[FrameDistributor] Stats - Total: %d, WebRTC: %d, Motion: %d, Record: %d, Drop rate: %.1f%%",
+		total, webrtc, motion, record, dropRate)
 }
 
 // Stop gracefully stops the frame distributor
@@ -342,7 +338,7 @@ func (fd *FrameDistributor) cleanup() {
 	}
 
 	// Close channels (safe because distributeFrames has exited)
-	close(fd.vp9Channel)
+	close(fd.webrtcChannel)
 	close(fd.motionChannel)
 	close(fd.recordChannel)
 
@@ -352,9 +348,9 @@ func (fd *FrameDistributor) cleanup() {
 	log.Printf("[FrameDistributor] Cleanup completed")
 }
 
-// GetVP9Channel returns the channel for VP9 encoder frames
-func (fd *FrameDistributor) GetVP9Channel() <-chan image.Image {
-	return fd.vp9Channel
+// GetWebRTCChannel returns the channel for H.264 WebRTC encoder frames
+func (fd *FrameDistributor) GetWebRTCChannel() <-chan image.Image {
+	return fd.webrtcChannel
 }
 
 // GetMotionChannel returns the channel for motion detection frames
@@ -384,12 +380,15 @@ func (fd *FrameDistributor) GetStats() DistributorStats {
 	return DistributorStats{
 		TotalFrames:   fd.stats.totalFrames.Load(),
 		DroppedFrames: fd.stats.droppedFrames.Load(),
-		VP9Sent:      fd.stats.vp9Sent.Load(),
+		WebRTCSent:   fd.stats.webrtcSent.Load(),
 		MotionSent:   fd.stats.motionSent.Load(),
 		RecordSent:   fd.stats.recordSent.Load(),
 		LastFrameTime: lastTime,
 	}
 }
+
+// GetStream has been removed - no longer needed with GStreamer pipeline
+// The GStreamer pipeline now handles encoding and RTP packetization directly
 
 // ============================================================================
 // CIRCULAR FRAME BUFFER FOR PRE-MOTION RECORDING

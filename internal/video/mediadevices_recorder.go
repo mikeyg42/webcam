@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mikeyg42/webcam/internal/framestream"
+	"github.com/mikeyg42/webcam/internal/imgconv"
 	"github.com/mikeyg42/webcam/internal/notification"
 	"gocv.io/x/gocv"
 )
@@ -276,132 +277,7 @@ func (rm *MediaDevicesRecordingManager) processFrame(img image.Image) error {
 
 // imageToMat converts image.Image to gocv.Mat using optimized method
 func (rm *MediaDevicesRecordingManager) imageToMat(img image.Image) (gocv.Mat, error) {
-	bounds := img.Bounds()
-	width := bounds.Dx()
-	height := bounds.Dy()
-
-	// Handle different image types efficiently
-	switch srcImg := img.(type) {
-	case *image.RGBA:
-		return rm.convertRGBAToMat(srcImg)
-	case *image.YCbCr:
-		return rm.convertYCbCrToMat(srcImg)
-	default:
-		// Generic fallback
-		mat := gocv.NewMatWithSize(height, width, gocv.MatTypeCV8UC3)
-		matData, err := mat.DataPtrUint8()
-		if err != nil {
-			mat.Close()
-			return gocv.NewMat(), err
-		}
-
-		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-			for x := bounds.Min.X; x < bounds.Max.X; x++ {
-				r, g, b, _ := img.At(x, y).RGBA()
-				idx := ((y-bounds.Min.Y)*width + (x - bounds.Min.X)) * 3
-				matData[idx] = uint8(b >> 8)   // B
-				matData[idx+1] = uint8(g >> 8) // G
-				matData[idx+2] = uint8(r >> 8) // R
-			}
-		}
-		return mat, nil
-	}
-}
-
-// convertRGBAToMat efficiently converts RGBA images
-func (rm *MediaDevicesRecordingManager) convertRGBAToMat(img *image.RGBA) (gocv.Mat, error) {
-	bounds := img.Bounds()
-	width := bounds.Dx()
-	height := bounds.Dy()
-
-	mat := gocv.NewMatWithSize(height, width, gocv.MatTypeCV8UC3)
-	matData, err := mat.DataPtrUint8()
-	if err != nil {
-		mat.Close()
-		return gocv.NewMat(), err
-	}
-
-	// Fast path for contiguous memory
-	if img.Stride == width*4 {
-		srcIdx := 0
-		dstIdx := 0
-		for i := 0; i < width*height; i++ {
-			matData[dstIdx] = img.Pix[srcIdx+2]   // B
-			matData[dstIdx+1] = img.Pix[srcIdx+1] // G
-			matData[dstIdx+2] = img.Pix[srcIdx]   // R
-			srcIdx += 4
-			dstIdx += 3
-		}
-	} else {
-		// Handle stride
-		for y := 0; y < height; y++ {
-			srcRow := y * img.Stride
-			dstRow := y * width * 3
-			for x := 0; x < width; x++ {
-				srcIdx := srcRow + x*4
-				dstIdx := dstRow + x*3
-				matData[dstIdx] = img.Pix[srcIdx+2]   // B
-				matData[dstIdx+1] = img.Pix[srcIdx+1] // G
-				matData[dstIdx+2] = img.Pix[srcIdx]   // R
-			}
-		}
-	}
-
-	return mat, nil
-}
-
-// convertYCbCrToMat efficiently converts YCbCr images
-func (rm *MediaDevicesRecordingManager) convertYCbCrToMat(img *image.YCbCr) (gocv.Mat, error) {
-	bounds := img.Bounds()
-	width := bounds.Dx()
-	height := bounds.Dy()
-
-	mat := gocv.NewMatWithSize(height, width, gocv.MatTypeCV8UC3)
-	matData, err := mat.DataPtrUint8()
-	if err != nil {
-		mat.Close()
-		return gocv.NewMat(), err
-	}
-
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			yi := img.YOffset(x+bounds.Min.X, y+bounds.Min.Y)
-			ci := img.COffset(x+bounds.Min.X, y+bounds.Min.Y)
-
-			yy := int32(img.Y[yi])
-			cb := int32(img.Cb[ci]) - 128
-			cr := int32(img.Cr[ci]) - 128
-
-			// YCbCr to RGB conversion
-			r := yy + (91881*cr)>>16
-			g := yy - (22554*cb+46802*cr)>>16
-			b := yy + (116130*cb)>>16
-
-			// Clamp and write
-			idx := (y*width + x) * 3
-			if b < 0 {
-				b = 0
-			} else if b > 255 {
-				b = 255
-			}
-			if g < 0 {
-				g = 0
-			} else if g > 255 {
-				g = 255
-			}
-			if r < 0 {
-				r = 0
-			} else if r > 255 {
-				r = 255
-			}
-
-			matData[idx] = uint8(b)
-			matData[idx+1] = uint8(g)
-			matData[idx+2] = uint8(r)
-		}
-	}
-
-	return mat, nil
+	return imgconv.ToMat(img)
 }
 
 // sendNotification sends motion detection notification

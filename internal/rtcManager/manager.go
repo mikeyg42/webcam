@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -22,7 +21,7 @@ import (
 
 	"github.com/pion/mediadevices"
 	"github.com/pion/mediadevices/pkg/codec/opus"
-	"github.com/pion/mediadevices/pkg/codec/vpx"
+	"github.com/pion/mediadevices/pkg/codec/x264"
 	_ "github.com/pion/mediadevices/pkg/driver/camera"     // This is required to register camera adapter - DON'T REMOVE
 	_ "github.com/pion/mediadevices/pkg/driver/microphone" // This is required to register microphone adapter  - DON'T REMOVE
 	"github.com/pion/mediadevices/pkg/prop"
@@ -347,6 +346,11 @@ func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websock
 
 	m.ConnectionDoctor = m.NewConnectionDoctor(ctx)
 
+	// Start ConnectionDoctor monitoring goroutines
+	m.ConnectionDoctor.StartStatsCollection(1 * time.Second)
+	go m.RespondToDoctorsWarnings()
+	log.Println("[Manager] ConnectionDoctor stats collection and warning responder started")
+
 	// Initialize RTCP feedback buffer for preventing feedback loops
 	m.rtcpFeedbackBuffer = NewRTCPFeedbackBuffer(1000) // Store up to 1000 RTCP events
 
@@ -384,29 +388,28 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 		Type: "nack",
 	}, webrtc.RTPCodecTypeAudio)
 
-	// Create VP9 parameters with bandwidth-based optimization
-	vpxParams, err := vpx.NewVP9Params()
+	// Create H.264 parameters for macOS hardware acceleration
+	x264Params, err := x264.NewParams()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create VP9 params: %v", err)
+		return nil, fmt.Errorf("failed to create H.264 params: %v", err)
 	}
 
 	// Bandwidth-based optimization (estimate ~1-5 Mbps typical)
-	// Conservative VP9 settings to avoid encoder errors
+	// H.264 settings optimized for macOS VideoToolbox
 	estimatedBandwidth := m.estimateBandwidth()               // In bps
-	optimalBitrate := uint(float64(estimatedBandwidth) * 0.4) // Use only 40% of estimated bandwidth (ultra-conservative)
-	if optimalBitrate > 500_000 {
-		optimalBitrate = 500_000 // Cap at 500kbps for VP9 encoder stability
+	optimalBitrate := uint(float64(estimatedBandwidth) * 0.6) // Use 60% of estimated bandwidth for H.264 (more efficient than VP9)
+	if optimalBitrate > 2_000_000 {
+		optimalBitrate = 2_000_000 // Cap at 2Mbps for H.264 (better quality than VP9 at same bitrate)
 	}
-	if optimalBitrate < 150_000 {
-		optimalBitrate = 150_000 // Reduced minimum threshold
+	if optimalBitrate < 500_000 {
+		optimalBitrate = 500_000 // Minimum 500kbps for decent H.264 quality
 	}
 
-	// Use minimal VP9 parameters to avoid vpx_codec_encode error (8)
-	vpxParams.BitRate = int(optimalBitrate)
-	vpxParams.KeyFrameInterval = 60 // More conservative: every 4 seconds at 15fps
-	// Use VBR for VP9 stability (CBR can cause encoding issues)
-	vpxParams.RateControlEndUsage = vpx.RateControlVBR
-	// Remove Deadline and ErrorResilient to prevent invalid parameter errors
+	// H.264 parameters optimized for real-time streaming
+	x264Params.BitRate = int(optimalBitrate)
+	x264Params.KeyFrameInterval = 60 // Every 2 seconds at 30fps
+	x264Params.Preset = x264.PresetVeryfast // Fast encoding for real-time
+	// H.264 is more stable than VP9 for WebRTC on macOS
 
 	// Create Opus parameters
 	opusParams, err := opus.NewParams()
@@ -416,24 +419,25 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	opusParams.BitRate = 32_000
 	opusParams.Latency = opus.Latency20ms // 20 ms frame size for real-time communication
 
-	log.Printf("Using VP9 video constraints: BitRate=%d (from %d bps bandwidth), KeyFrameInterval=%d, RateControl=VBR (conservative mode)\n",
-		vpxParams.BitRate, m.estimateBandwidth(), vpxParams.KeyFrameInterval)
+	log.Printf("Using H.264 video constraints: BitRate=%d (from %d bps bandwidth), KeyFrameInterval=%d, Preset=VeryFast (optimized for macOS)\n",
+		x264Params.BitRate, m.estimateBandwidth(), x264Params.KeyFrameInterval)
 	log.Printf("Using audio constraints: BitRate=%d, Latency=%d\n", opusParams.BitRate, opusParams.Latency)
 
-	// Create VP9-only codec selector to prevent VP8 encoder creation
-	// This forces mediadevices to only create VP9 encoders
+	// Create H.264-only codec selector for macOS hardware acceleration
+	// This forces mediadevices to use H.264 (VideoToolbox on macOS)
 	codecSelector := mediadevices.NewCodecSelector(
-		mediadevices.WithVideoEncoders(&vpxParams), // VP9 only
+		mediadevices.WithVideoEncoders(&x264Params), // H.264 only
 		mediadevices.WithAudioEncoders(&opusParams),
 	)
-	log.Printf("VP9-only Codec Selector Configured: %v", codecSelector)
+	log.Printf("H.264 Codec Selector Configured: %v", codecSelector)
 
-	// Register VP9-only codec with the MediaEngine to prevent VP8 registration
-	// This ensures only VP9 is available during negotiation
+	// Register H.264 codec with the MediaEngine for macOS VideoToolbox
+	// This ensures only H.264 is available during negotiation
 	err = mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeVP9,
-			ClockRate: 90000,
+			MimeType:    webrtc.MimeTypeH264,
+			ClockRate:   90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
 			RTCPFeedback: []webrtc.RTCPFeedback{
 				{Type: "nack"}, {Type: "nack", Parameter: "pli"},
 				{Type: "ccm", Parameter: "fir"}, {Type: "transport-cc"},
@@ -442,7 +446,7 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 		PayloadType: 96,
 	}, webrtc.RTPCodecTypeVideo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to register VP9 codec: %v", err)
+		return nil, fmt.Errorf("failed to register H.264 codec: %v", err)
 	}
 
 	// Register Opus for audio
@@ -462,7 +466,7 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 		return nil, fmt.Errorf("failed to register Opus codec: %v", err)
 	}
 
-	log.Println("VP9-only codecs registered successfully")
+	log.Println("H.264/H.265 codecs registered successfully (matching GStreamer output)")
 
 	// Create SettingEngine for DTLS and Tailscale configuration
 	settingEngine := webrtc.SettingEngine{}
@@ -516,8 +520,8 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 		return nil, fmt.Errorf("failed to create peer connection: %v", err)
 	}
 
-	// Add transceivers with VP9-only codec preferences (proper Pion approach)
-	videoTransceiver, err := peerConnection.AddTransceiverFromKind(
+	// Add video transceiver for H.264/H.265 from GStreamer (not VP9)
+	_, err = peerConnection.AddTransceiverFromKind(
 		webrtc.RTPCodecTypeVideo,
 		webrtc.RTPTransceiverInit{
 			Direction: webrtc.RTPTransceiverDirectionSendonly,
@@ -527,30 +531,11 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 		return nil, fmt.Errorf("failed to add video transceiver: %v", err)
 	}
 
-	// Set codec preferences to VP9-only using the recommended Pion approach
-	// Create VP9 codec parameters manually since GetCodecsByKind is unexported
-	vp9Codecs := []webrtc.RTPCodecParameters{
-		{
-			RTPCodecCapability: webrtc.RTPCodecCapability{
-				MimeType:  webrtc.MimeTypeVP9,
-				ClockRate: 90000,
-				RTCPFeedback: []webrtc.RTCPFeedback{
-					{Type: "nack"},
-					{Type: "nack", Parameter: "pli"},
-					{Type: "ccm", Parameter: "fir"},
-					{Type: "transport-cc"},
-				},
-			},
-			PayloadType: 96,
-		},
-	}
-
-	if err := videoTransceiver.SetCodecPreferences(vp9Codecs); err != nil {
-		log.Printf("Warning: Failed to set VP9 codec preferences: %v", err)
-		// Continue anyway - fallback to default negotiation
-	} else {
-		log.Printf("Successfully set VP9-only codec preferences (%d codecs)", len(vp9Codecs))
-	}
+	// NOTE: Codec preferences are NOT set here because we use GStreamer's H.264/H.265 encoder
+	// The actual codec is determined by SetupPassthroughTracks() which creates tracks
+	// matching GStreamer's encoder output (H264, H265, or AV1)
+	// WebRTC will automatically negotiate based on the track's MIME type
+	log.Println("Video transceiver added - codec will be determined by GStreamer encoder output")
 
 	// Add audio transceiver
 	if _, err := peerConnection.AddTransceiverFromKind(
@@ -658,7 +643,7 @@ func (m *Manager) setupCallbacks() {
 			log.Println("PeerConnection failed")
 			select {
 			case m.ConnectionDoctor.warnings <- Warning{
-				Timestamp: time.Now().Format("15:04:05.000"),
+				Timestamp: time.Now(),
 				Level:     CriticalLevel,
 				Type:      ConnWarning,
 				Message:   fmt.Sprintln("Peer Connection Failed! "),
@@ -702,7 +687,7 @@ func (m *Manager) setupCallbacks() {
 						if m.ConnectionDoctor != nil {
 							select {
 							case m.ConnectionDoctor.warnings <- Warning{
-								Timestamp: time.Now().Format("15:04:05.000"),
+								Timestamp: time.Now(),
 								Level:     SuggestionLevel,
 								Type:      ICEWarning,
 								Message:   "ICE connection stuck in 'new' state for 30 seconds",
@@ -787,7 +772,7 @@ func (m *Manager) setupCallbacks() {
 			if m.ConnectionDoctor != nil {
 				select {
 				case m.ConnectionDoctor.warnings <- Warning{
-					Timestamp: time.Now().Format("15:04:05.000"),
+					Timestamp: time.Now(),
 					Level:     SuggestionLevel,
 					Type:      SignalingWarning,
 					Message:   fmt.Sprintf("Negotiation failed: %v", err),
@@ -907,9 +892,6 @@ func (m *Manager) handleNegotiationNeeded() error {
 		return fmt.Errorf("[handleNegotiationNeeded] failed to create offer: %v", err)
 	}
 
-	// Prioritize VP9 in the offer SDP BEFORE setting local description
-	offer.SDP = prioritizeVP9InSDP(offer.SDP)
-
 	// Don't validate our own local offer - only validate remote SDPs
 
 	if err := m.PeerConnection.SetLocalDescription(offer); err != nil {
@@ -932,9 +914,6 @@ func (m *Manager) SetupSignaling() error {
 	if err != nil {
 		return fmt.Errorf("[SetupSignaling] failed to create offer: %v", err)
 	}
-
-	// Prioritize VP9 in SDP BEFORE setting local description
-	offer.SDP = prioritizeVP9InSDP(offer.SDP)
 
 	// Set local description
 	if err := m.PeerConnection.SetLocalDescription(offer); err != nil {
@@ -1379,7 +1358,7 @@ func (m *Manager) readRTCP(rtpSender *webrtc.RTPSender, mediaKind string) {
 				if m.ConnectionDoctor != nil {
 					select {
 					case m.ConnectionDoctor.warnings <- Warning{
-						Timestamp: time.Now().Format("15:04:05.000"),
+						Timestamp: time.Now(),
 						Level:     SuggestionLevel,
 						Type:      ConnWarning,
 						Message:   fmt.Sprintf("RTCP read error for %s: %v", mediaKind, rtcpErr),
@@ -1491,11 +1470,66 @@ func (m *Manager) SetupMediaTracks(
 	return nil
 }
 
+// SetupPassthroughTracks creates WebRTC tracks that will receive external RTP packets
+// These tracks don't capture from devices - they're just conduits for GStreamer-encoded RTP
+// videoCodecMimeType should be the actual codec from GStreamer (e.g., "video/H264", "video/H265")
+func (m *Manager) SetupPassthroughTracks(videoCodecMimeType string) error {
+	if m.PeerConnection == nil {
+		return fmt.Errorf("peer connection not initialized")
+	}
+
+	log.Printf("[SetupPassthroughTracks] Creating passthrough tracks for external RTP input (video codec: %s)", videoCodecMimeType)
+
+	// Create video track with the codec that matches GStreamer's output
+	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: videoCodecMimeType},
+		"video",
+		"gstreamer-video",
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create video track: %w", err)
+	}
+
+	// Create audio track for Opus
+	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+		"audio",
+		"gstreamer-audio",
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create audio track: %w", err)
+	}
+
+	// Add tracks to peer connection
+	videoSender, err := m.PeerConnection.AddTrack(videoTrack)
+	if err != nil {
+		return fmt.Errorf("failed to add video track: %w", err)
+	}
+	log.Println("[SetupPassthroughTracks] Video track added to peer connection")
+
+	audioSender, err := m.PeerConnection.AddTrack(audioTrack)
+	if err != nil {
+		return fmt.Errorf("failed to add audio track: %w", err)
+	}
+	log.Println("[SetupPassthroughTracks] Audio track added to peer connection")
+
+	// Store tracks for RTP forwarding
+	m.videoTrack = videoTrack
+	m.audioTrack = audioTrack
+
+	// Start RTCP monitoring
+	go m.readRTCP(videoSender, "video")
+	go m.readRTCP(audioSender, "audio")
+
+	log.Println("[SetupPassthroughTracks] Passthrough tracks successfully set up (awaiting external RTP source)")
+	return nil
+}
+
 // AttachExternalRTPSource connects external RTP channels (e.g., from GStreamer) to WebRTC tracks
 // This allows using an external encoder (like GStreamer VP9) instead of mediadevices built-in encoder
 func (m *Manager) AttachExternalRTPSource(videoRTP <-chan *rtp.Packet, audioRTP <-chan *rtp.Packet) error {
 	if m.videoTrack == nil && m.audioTrack == nil {
-		return fmt.Errorf("no tracks available - call SetupMediaTracks first")
+		return fmt.Errorf("no tracks available - call SetupPassthroughTracks first")
 	}
 
 	// Mark RTP forwarding as active
@@ -1719,7 +1753,7 @@ func (m *Manager) handleRTCP(rtpSender *webrtc.RTPSender, mediaKind string) {
 				if m.ConnectionDoctor != nil {
 					select {
 					case m.ConnectionDoctor.warnings <- Warning{
-						Timestamp: time.Now().Format("15:04:05.000"),
+						Timestamp: time.Now(),
 						Level:     SuggestionLevel,
 						Type:      ConnWarning,
 						Message:   fmt.Sprintf("RTCP read error in handleRTCP for %s: %v", mediaKind, err),
@@ -1816,7 +1850,7 @@ func (m *Manager) analyzeRTCPPacket(data []byte, attributes interface{}, mediaKi
 		case 203: // Goodbye (BYE)
 			select {
 			case m.ConnectionDoctor.warnings <- Warning{
-				Timestamp: time.Now().Format("15:04:05.000"),
+				Timestamp: time.Now(),
 				Level:     InfoLevel,
 				Type:      ConnWarning,
 				Message:   fmt.Sprintf("Received RTCP BYE packet for %s", mediaKind),
@@ -1864,7 +1898,7 @@ func (m *Manager) handleReceiverReport(data []byte, mediaKind string) {
 		if lossRate > 0.05 { // 5% loss threshold
 			select {
 			case m.ConnectionDoctor.warnings <- Warning{
-				Timestamp:   time.Now().Format("15:04:05.000"),
+				Timestamp:   time.Now(),
 				Level:       SuggestionLevel,
 				Type:        PacketLossWarning,
 				Message:     fmt.Sprintf("RTCP RR indicates %s packet loss: %.2f%% (%d total)", mediaKind, lossRate*100, totalLost),
@@ -1887,7 +1921,7 @@ func (m *Manager) handleTWCCFeedback(data []byte, mediaKind string) {
 	// Send info to connection doctor
 	select {
 	case m.ConnectionDoctor.warnings <- Warning{
-		Timestamp: time.Now().Format("15:04:05.000"),
+		Timestamp: time.Now(),
 		Level:     InfoLevel,
 		Type:      BitrateWarning,
 		Message:   fmt.Sprintf("Received TWCC congestion feedback for %s", mediaKind),
@@ -1909,7 +1943,7 @@ func (m *Manager) handlePayloadSpecificFeedback(data []byte, mediaKind string) {
 	case 1: // NACK - Negative Acknowledgment
 		select {
 		case m.ConnectionDoctor.warnings <- Warning{
-			Timestamp: time.Now().Format("15:04:05.000"),
+			Timestamp: time.Now(),
 			Level:     SuggestionLevel,
 			Type:      PacketLossWarning,
 			Message:   fmt.Sprintf("Received NACK feedback for %s - requesting packet retransmission", mediaKind),
@@ -1921,7 +1955,7 @@ func (m *Manager) handlePayloadSpecificFeedback(data []byte, mediaKind string) {
 	case 2: // PLI - Picture Loss Indication
 		select {
 		case m.ConnectionDoctor.warnings <- Warning{
-			Timestamp: time.Now().Format("15:04:05.000"),
+			Timestamp: time.Now(),
 			Level:     SuggestionLevel,
 			Type:      FramerateWarning,
 			Message:   fmt.Sprintf("Received PLI feedback for %s - picture corruption detected", mediaKind),
@@ -1933,7 +1967,7 @@ func (m *Manager) handlePayloadSpecificFeedback(data []byte, mediaKind string) {
 	case 4: // FIR - Full Intra Request
 		select {
 		case m.ConnectionDoctor.warnings <- Warning{
-			Timestamp: time.Now().Format("15:04:05.000"),
+			Timestamp: time.Now(),
 			Level:     SuggestionLevel,
 			Type:      FramerateWarning,
 			Message:   fmt.Sprintf("Received FIR feedback for %s - requesting keyframe", mediaKind),
@@ -2005,7 +2039,7 @@ func (m *Manager) processRTCPWithBuffer(data []byte, attributes interface{}, med
 		case 203: // Goodbye (BYE)
 			select {
 			case m.ConnectionDoctor.warnings <- Warning{
-				Timestamp: time.Now().Format("15:04:05.000"),
+				Timestamp: time.Now(),
 				Level:     InfoLevel,
 				Type:      ConnWarning,
 				Message:   fmt.Sprintf("Received RTCP BYE packet for %s (SSRC: %d)", mediaKind, ssrc),
@@ -2135,6 +2169,12 @@ func (m *Manager) monitorRestartProgress() {
 func (m *Manager) handleDisconnection() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Cleanup ConnectionDoctor resources
+	if m.ConnectionDoctor != nil {
+		m.ConnectionDoctor.Shutdown()
+		m.ConnectionDoctor = nil
+	}
 
 	// Cleanup media resources.
 	if m.mediaStream != nil {
@@ -2352,63 +2392,6 @@ func (m *Manager) SendOffer(offer *webrtc.SessionDescription) error {
 	}
 
 	return nil
-}
-
-// prioritizeVP9InSDP modifies SDP to prioritize VP9 codec over VP8
-func prioritizeVP9InSDP(sdp string) string {
-	// Find VP9 and VP8 payload types in the SDP
-	vp9Pattern := regexp.MustCompile(`a=rtpmap:(\d+) VP9/90000`)
-	vp8Pattern := regexp.MustCompile(`a=rtpmap:(\d+) VP8/90000`)
-
-	vp9Matches := vp9Pattern.FindStringSubmatch(sdp)
-	vp8Matches := vp8Pattern.FindStringSubmatch(sdp)
-
-	if len(vp9Matches) < 2 || len(vp8Matches) < 2 {
-		log.Printf("[prioritizeVP9InSDP] Could not find both VP9 and VP8 codecs in SDP")
-		return sdp
-	}
-
-	vp9PayloadType := vp9Matches[1]
-	vp8PayloadType := vp8Matches[1]
-
-	log.Printf("[prioritizeVP9InSDP] Found VP9 payload type: %s, VP8 payload type: %s", vp9PayloadType, vp8PayloadType)
-
-	// In the m= video line, move VP9 payload type to the front
-	videoLinePattern := regexp.MustCompile(`(m=video \d+ \w+/\w+ )([^\r\n]+)`)
-	sdp = videoLinePattern.ReplaceAllStringFunc(sdp, func(match string) string {
-		parts := videoLinePattern.FindStringSubmatch(match)
-		if len(parts) != 3 {
-			return match
-		}
-
-		prefix := parts[1]
-		payloadTypes := parts[2]
-
-		// Split payload types and reorder to put VP9 first
-		types := strings.Fields(payloadTypes)
-		var reordered []string
-
-		// Add VP9 first if found
-		for _, pt := range types {
-			if pt == vp9PayloadType {
-				reordered = append(reordered, pt)
-				break
-			}
-		}
-
-		// Add all other types except VP9 (already added)
-		for _, pt := range types {
-			if pt != vp9PayloadType {
-				reordered = append(reordered, pt)
-			}
-		}
-
-		result := prefix + strings.Join(reordered, " ")
-		log.Printf("[prioritizeVP9InSDP] Modified video line: %s", result)
-		return result
-	})
-
-	return sdp
 }
 
 // logNegotiatedCodecs inspects all transceivers and logs the negotiated codecs.

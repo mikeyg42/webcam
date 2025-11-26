@@ -3,6 +3,7 @@ package tailscale
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -11,9 +12,10 @@ import (
 	"time"
 
 	"github.com/mikeyg42/webcam/internal/config"
+	"github.com/mikeyg42/webcam/internal/validate"
 )
 
-// TailscaleManager handles Tailscale integration for WebRTC
+// TailscaleManager handles Tailscale integration for WebRTC.
 type TailscaleManager struct {
 	config   *config.TailscaleConfig
 	hostname string
@@ -22,86 +24,89 @@ type TailscaleManager struct {
 	cancel   context.CancelFunc
 }
 
-// TailscaleStatus represents the status information from Tailscale
+// TailscaleStatus represents the status information from Tailscale.
 type TailscaleStatus struct {
-	BackendState string                       `json:"BackendState"`
-	Self         TailscaleDevice             `json:"Self"`
-	Peer         map[string]TailscaleDevice  `json:"Peer"`
+	BackendState string                     `json:"BackendState"`
+	Self         TailscaleDevice            `json:"Self"`
+	Peer         map[string]TailscaleDevice `json:"Peer"`
 }
 
 type TailscaleDevice struct {
-	ID       string   `json:"ID"`
-	HostName string   `json:"HostName"`
-	DNSName  string   `json:"DNSName"`
-	TailAddr string   `json:"TailAddr"`
-	Online   bool     `json:"Online"`
+	ID       string `json:"ID"`
+	HostName string `json:"HostName"`
+	DNSName  string `json:"DNSName"`
+	TailAddr string `json:"TailAddr"`
+	Online   bool   `json:"Online"`
 }
 
-// NewTailscaleManager creates a new Tailscale manager
-func NewTailscaleManager(ctx context.Context, tsConfig *config.TailscaleConfig) (*TailscaleManager, error) {
-	if !tsConfig.Enabled {
-		return nil, fmt.Errorf("Tailscale is not enabled in configuration")
+// NewTailscaleManager creates a new Tailscale manager.
+// It runs the minimal validation (installed, hostname set, writable state dir) before starting.
+func NewTailscaleManager(parent context.Context, tsConfig *config.TailscaleConfig) (*TailscaleManager, error) {
+	if tsConfig == nil {
+		return nil, errors.New("tailscale: nil config")
+	}
+	if err := validate.ValidateTailscaleConfig(tsConfig); err != nil {
+		return nil, err
 	}
 
-	tsCtx, cancel := context.WithCancel(ctx)
-	
+	tsCtx, cancel := context.WithCancel(parent)
 	tm := &TailscaleManager{
 		config: tsConfig,
 		ctx:    tsCtx,
 		cancel: cancel,
 	}
 
-	// Initialize Tailscale connection
+	// Initialize (read status, confirm running, capture node info).
 	if err := tm.initialize(); err != nil {
 		cancel()
-		return nil, fmt.Errorf("failed to initialize Tailscale: %w", err)
+		return nil, fmt.Errorf("tailscale init: %w", err)
 	}
-
 	return tm, nil
 }
 
-// initialize sets up the Tailscale connection
+// initialize sets up the Tailscale connection metadata from `tailscale status --json`.
 func (tm *TailscaleManager) initialize() error {
-	// Check if Tailscale is already connected
 	status, err := tm.getStatus()
 	if err != nil {
-		return fmt.Errorf("failed to get Tailscale status: %w", err)
+		return fmt.Errorf("get status: %w", err)
 	}
-
 	if status.BackendState != "Running" {
-		return fmt.Errorf("tailscale is not running (state: %s) - please start Tailscale externally and ensure it's connected to your tailnet", status.BackendState)
+		return fmt.Errorf("tailscale is not running (state: %s); start tailscale and connect to your tailnet", status.BackendState)
 	}
 
-	// Get our Tailscale info
-	status, err = tm.getStatus()
-	if err != nil {
-		return fmt.Errorf("failed to get updated status: %w", err)
-	}
-
+	// Fill locals from the same status object (no need to re-query).
 	tm.hostname = status.Self.HostName
 	tm.localIP = status.Self.TailAddr
-	
-	log.Printf("Tailscale initialized - Hostname: %s, IP: %s", tm.hostname, tm.localIP)
+
+	log.Printf("tailscale: initialized — Hostname=%s TailIP=%s", tm.hostname, tm.localIP)
 	return nil
 }
 
-// getStatus retrieves the current Tailscale status
+// getStatus retrieves the current Tailscale status (JSON) via the `tailscale` CLI.
 func (tm *TailscaleManager) getStatus() (*TailscaleStatus, error) {
-	cmd := exec.CommandContext(tm.ctx, "tailscale", "status", "--json")
-	output, err := cmd.Output()
+	// keep this fast but bounded
+	ctx, cancel := context.WithTimeout(tm.ctx, 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "tailscale", "status", "--json")
+	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get status: %w", err)
+		return nil, fmt.Errorf("tailscale status: %w", err)
 	}
 
 	var status TailscaleStatus
-	if err := json.Unmarshal(output, &status); err != nil {
-		return nil, fmt.Errorf("failed to parse status JSON: %w", err)
+	if err := json.Unmarshal(out, &status); err != nil {
+		return nil, fmt.Errorf("parse status json: %w", err)
+	}
+
+	if status.Self.HostName == "" || status.Self.DNSName == "" {
+		return &status, fmt.Errorf("TailscaleStatus lacks a hostname and/or a DNS name: %+v", status)
 	}
 
 	return &status, nil
 }
 
-// waitForConnection waits for Tailscale to be fully connected
+// waitForConnection polls until Tailscale backend is Running (or times out).
 func (tm *TailscaleManager) waitForConnection(timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(tm.ctx, timeout)
 	defer cancel()
@@ -112,142 +117,88 @@ func (tm *TailscaleManager) waitForConnection(timeout time.Duration) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for Tailscale connection")
+			return fmt.Errorf("timeout waiting for tailscale connection")
 		case <-ticker.C:
 			status, err := tm.getStatus()
 			if err != nil {
-				log.Printf("Error checking status: %v", err)
+				log.Printf("tailscale: status check error: %v", err)
 				continue
 			}
-			
 			if status.BackendState == "Running" && status.Self.Online {
 				return nil
 			}
-			
-			log.Printf("Waiting for Tailscale connection... Status: %s", status.BackendState)
+			log.Printf("tailscale: waiting… state=%s online=%v", status.BackendState, status.Self.Online)
 		}
 	}
 }
 
-// GetLocalTailscaleIP returns this device's Tailscale IP address
-func (tm *TailscaleManager) GetLocalTailscaleIP() string {
-	return tm.localIP
-}
+// GetLocalTailscaleIP returns this device's Tailscale IP address.
+func (tm *TailscaleManager) GetLocalTailscaleIP() string { return tm.localIP }
 
-// GetTailscaleHostname returns this device's Tailscale hostname
-func (tm *TailscaleManager) GetTailscaleHostname() string {
-	return tm.hostname
-}
+// GetTailscaleHostname returns this device's Tailscale hostname.
+func (tm *TailscaleManager) GetTailscaleHostname() string { return tm.hostname }
 
-// GetICEServers returns ICE server configuration for WebRTC using Tailscale
+// GetICEServers returns ICE server configuration for WebRTC.
+// We keep a single public STUN for initial ICE; Tailscale itself handles NAT traversal and DERP.
 func (tm *TailscaleManager) GetICEServers() ([]map[string]interface{}, error) {
-	// Instead of traditional STUN/TURN servers, we can use Tailscale's coordination
-	// For WebRTC over Tailscale, we primarily rely on direct connections
-	// but may still need STUN for discovering our public endpoint
-	
-	iceServers := []map[string]interface{}{
-		{
-			"urls": []string{"stun:stun.l.google.com:19302"},
-		},
-	}
-
-	// If we have peers, we could potentially set up TURN-like functionality
-	// through Tailscale's DERP servers, but this requires custom implementation
-	
-	return iceServers, nil
+	return []map[string]interface{}{
+		{"urls": []string{"stun:stun.l.google.com:19302"}},
+	}, nil
 }
 
-// GetPeerAddresses returns addresses of other devices on the Tailscale network
+// GetPeerAddresses returns Tail IPs of online peers.
 func (tm *TailscaleManager) GetPeerAddresses() ([]string, error) {
 	status, err := tm.getStatus()
 	if err != nil {
 		return nil, err
 	}
-
-	var addresses []string
-	for _, peer := range status.Peer {
-		if peer.Online && peer.TailAddr != "" {
-			addresses = append(addresses, peer.TailAddr)
+	addrs := make([]string, 0, len(status.Peer))
+	for _, p := range status.Peer {
+		if p.Online && p.TailAddr != "" {
+			addrs = append(addrs, p.TailAddr)
 		}
 	}
-
-	return addresses, nil
+	return addrs, nil
 }
 
-// IsDirectConnectionPossible checks if we can connect directly to a peer
+// IsDirectConnectionPossible does a quick TCP probe to a peer on port 80.
+// This is a *best-effort* reachability hint only.
 func (tm *TailscaleManager) IsDirectConnectionPossible(peerAddr string) bool {
-	// Try to establish a test connection to the peer
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(peerAddr, "80"), 5*time.Second)
 	if err != nil {
 		return false
 	}
-	conn.Close()
+	_ = conn.Close()
 	return true
 }
 
-// GetWebRTCConfigForTailscale returns WebRTC configuration optimized for Tailscale
+// GetWebRTCConfigForTailscale returns a minimal WebRTC config map tuned for Tailscale.
 func (tm *TailscaleManager) GetWebRTCConfigForTailscale() map[string]interface{} {
-	config := map[string]interface{}{
+	return map[string]interface{}{
 		"iceServers": []map[string]interface{}{
-			{
-				// Use Google's STUN server for initial connectivity detection
-				"urls": []string{"stun:stun.l.google.com:19302"},
-			},
+			{"urls": []string{"stun:stun.l.google.com:19302"}},
 		},
-		// Prefer direct connections over relays since Tailscale handles NAT traversal
-		"iceTransportPolicy": "all",
-		// Faster connection establishment for local network
+		"iceTransportPolicy":   "all",
 		"iceCandidatePoolSize": 10,
 	}
-
-	return config
 }
 
-// Shutdown cleanly stops the Tailscale manager
+// Shutdown cleanly stops the Tailscale manager.
 func (tm *TailscaleManager) Shutdown() error {
 	if tm.cancel != nil {
 		tm.cancel()
 	}
-	
-	log.Println("Tailscale manager shutdown complete")
+	log.Println("tailscale: manager shutdown complete")
 	return nil
 }
 
-// HTTP handler for Tailscale status endpoint
+// StatusHandler is an HTTP handler that returns the current tailscale status as JSON.
 func (tm *TailscaleManager) StatusHandler(w http.ResponseWriter, r *http.Request) {
 	status, err := tm.getStatus()
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to get status: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("tailscale status error: %v", err), http.StatusInternalServerError)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
-}
-
-// Helper function to check if Tailscale is installed
-func IsTailscaleInstalled() bool {
-	cmd := exec.Command("which", "tailscale")
-	return cmd.Run() == nil
-}
-
-// ValidateTailscaleConfig validates the Tailscale configuration
-func ValidateTailscaleConfig(config *config.TailscaleConfig) error {
-	if !config.Enabled {
-		return nil
-	}
-
-	if !IsTailscaleInstalled() {
-		return fmt.Errorf("Tailscale is not installed. Please install it first: https://tailscale.com/download")
-	}
-
-	if config.NodeName == "" {
-		return fmt.Errorf("Tailscale node name cannot be empty")
-	}
-
-	if config.ListenPort < 1024 || config.ListenPort > 65535 {
-		return fmt.Errorf("Tailscale listen port must be between 1024 and 65535")
-	}
-
-	return nil
+	_ = json.NewEncoder(w).Encode(status)
 }
