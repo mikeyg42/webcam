@@ -79,7 +79,6 @@ function populateForm(config) {
     document.getElementById('cooldownPeriod').value = config.motion?.cooldownPeriod || 10;
     document.getElementById('noMotionDelay').value = config.motion?.noMotionDelay || 3;
     document.getElementById('minConsecutiveFrames').value = config.motion?.minConsecutiveFrames || 2;
-    document.getElementById('frameSkip').value = config.motion?.frameSkip || 2;
 
     // Storage
     document.getElementById('minioEndpoint').value = config.storage?.minio?.endpoint || 'localhost:9000';
@@ -164,7 +163,6 @@ async function saveConfig() {
             cooldownPeriod: parseInt(document.getElementById('cooldownPeriod').value),
             noMotionDelay: parseInt(document.getElementById('noMotionDelay').value),
             minConsecutiveFrames: parseInt(document.getElementById('minConsecutiveFrames').value),
-            frameSkip: parseInt(document.getElementById('frameSkip').value)
         },
         storage: {
             minio: {

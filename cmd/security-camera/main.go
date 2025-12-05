@@ -24,6 +24,7 @@ import (
 	"github.com/mikeyg42/webcam/internal/api"
 	"github.com/mikeyg42/webcam/internal/calibration"
 	"github.com/mikeyg42/webcam/internal/config"
+	"github.com/mikeyg42/webcam/internal/database"
 	"github.com/mikeyg42/webcam/internal/encoder"
 	"github.com/mikeyg42/webcam/internal/framestream"
 	"github.com/mikeyg42/webcam/internal/imgconv"
@@ -36,6 +37,7 @@ import (
 	"github.com/mikeyg42/webcam/internal/recorder"
 	"github.com/mikeyg42/webcam/internal/recorder/recorderlog"
 	"github.com/mikeyg42/webcam/internal/rtcManager"
+	"github.com/mikeyg42/webcam/internal/tailscale"
 	"github.com/mikeyg42/webcam/internal/validate"
 
 	// call these without the "_" identifier so that we can call methods from these drivers
@@ -166,9 +168,38 @@ func main() {
 		log.Fatalf("Failed to initialize: %v", err)
 	}
 
+	// Initialize credential database for encrypted storage
+	var credDB *database.DB
+	var tsManager *tailscale.TailscaleManager
+	homeDir, err := os.UserHomeDir()
+	if err == nil {
+		dbPath := filepath.Join(homeDir, ".webcam2", "credentials.db")
+		credDB, err = database.NewDB(dbPath)
+		if err != nil {
+			log.Printf("Warning: Could not initialize credential database: %v", err)
+			credDB = nil
+		} else {
+			log.Printf("✓ Credential database initialized at %s", dbPath)
+			defer credDB.Close()
+		}
+	} else {
+		log.Printf("Warning: Could not determine home directory for credential database: %v", err)
+	}
+
+	// Initialize Tailscale manager if enabled
+	if cfg.Tailscale.Enabled {
+		tsManager, err = tailscale.NewTailscaleManager(ctx, &cfg.Tailscale)
+		if err != nil {
+			log.Printf("Warning: Could not initialize Tailscale manager: %v", err)
+			tsManager = nil
+		} else {
+			log.Printf("✓ Tailscale manager initialized for user authentication")
+		}
+	}
+
 	// Start API server AFTER Initialize() completes to avoid race conditions
 	// API endpoints need fully initialized components (calibrationService, motionDetector, frameDistributor)
-	apiServer := api.NewServer(ctx, cfg, ":8081", app.calibrationService, app.motionDetector, app.frameDistributor)
+	apiServer := api.NewServer(ctx, cfg, ":8081", app.calibrationService, app.motionDetector, app.frameDistributor, credDB, tsManager)
 	apiServer.StartInBackground()
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

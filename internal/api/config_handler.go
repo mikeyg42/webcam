@@ -17,15 +17,19 @@ import (
 
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/crypto"
+	"github.com/mikeyg42/webcam/internal/database"
 	"github.com/mikeyg42/webcam/internal/motion"
+	"github.com/mikeyg42/webcam/internal/tailscale"
 )
 
 // ConfigHandler handles configuration API requests
 type ConfigHandler struct {
-	config                *config.Config
-	configFile            string
-	masterKey             string // AES-256-GCM master key for password encryption
-	motionDetector        *motion.Detector
+	config                  *config.Config
+	configFile              string
+	masterKey               string // AES-256-GCM master key for password encryption
+	motionDetector          *motion.Detector
+	credDB                  *database.DB
+	tailscaleManager        *tailscale.TailscaleManager
 	onQualityPriorityChange func(priority string) error // Callback for dynamic priority updates
 }
 
@@ -59,12 +63,24 @@ func NewConfigHandler(cfg *config.Config, motionDetector *motion.Detector) *Conf
 	}
 
 	return &ConfigHandler{
-		config:         cfg,
-		configFile:     configFile,
-		masterKey:      masterKey,
-		motionDetector: motionDetector,
+		config:                  cfg,
+		configFile:              configFile,
+		masterKey:               masterKey,
+		motionDetector:          motionDetector,
+		credDB:                  nil, // Set via SetCredentialDatabase
+		tailscaleManager:        nil, // Set via SetTailscaleManager
 		onQualityPriorityChange: nil,
 	}
+}
+
+// SetCredentialDatabase sets the credential database for auto-populating credentials
+func (h *ConfigHandler) SetCredentialDatabase(db *database.DB) {
+	h.credDB = db
+}
+
+// SetTailscaleManager sets the Tailscale manager for user identification
+func (h *ConfigHandler) SetTailscaleManager(tm *tailscale.TailscaleManager) {
+	h.tailscaleManager = tm
 }
 
 // SetQualityPriorityCallback registers a callback for quality priority changes
@@ -186,8 +202,35 @@ func (h *ConfigHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert internal config to API response format
-	response := h.configToResponse()
+	// Require Tailscale authentication
+	var userEmail string
+	if h.tailscaleManager != nil {
+		email, err := h.tailscaleManager.GetUserEmailFromRequest(r)
+		if err != nil {
+			log.Printf("[ConfigHandler] Authentication failed: %v", err)
+			http.Error(w, "Unauthorized - Tailscale authentication required", http.StatusUnauthorized)
+			return
+		}
+		userEmail = email
+	} else {
+		// If Tailscale is disabled, allow unauthenticated access (development mode)
+		log.Printf("[ConfigHandler] Warning: Tailscale disabled - unauthenticated config access")
+	}
+
+	// Create a copy of config to avoid race conditions
+	// We never mutate the shared h.config directly
+	configCopy := *h.config
+
+	// Auto-populate credentials from database if available
+	if h.credDB != nil && userEmail != "" {
+		// Try to enrich the COPY with user's stored credentials
+		if err := database.EnrichConfigWithUserCredentials(&configCopy, h.credDB, userEmail); err != nil {
+			log.Printf("[ConfigHandler] Warning: Could not load credentials for %s: %v", userEmail, err)
+		}
+	}
+
+	// Convert config copy to API response format
+	response := h.configToResponseFromConfig(&configCopy)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
@@ -198,6 +241,22 @@ func (h *ConfigHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	// Limit request body size to 1MB to prevent DoS attacks
+	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
+
+	// Require Tailscale authentication
+	if h.tailscaleManager != nil {
+		_, err := h.tailscaleManager.GetUserEmailFromRequest(r)
+		if err != nil {
+			log.Printf("[ConfigHandler] Authentication failed: %v", err)
+			http.Error(w, "Unauthorized - Tailscale authentication required", http.StatusUnauthorized)
+			return
+		}
+	} else {
+		// If Tailscale is disabled, allow unauthenticated access (development mode)
+		log.Printf("[ConfigHandler] Warning: Tailscale disabled - unauthenticated config update")
 	}
 
 	var req ConfigResponse
@@ -244,8 +303,10 @@ func (h *ConfigHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 // configToResponse converts internal config to API response
 func (h *ConfigHandler) configToResponse() ConfigResponse {
-	cfg := h.config
+	return h.configToResponseFromConfig(h.config)
+}
 
+func (h *ConfigHandler) configToResponseFromConfig(cfg *config.Config) ConfigResponse {
 	return ConfigResponse{
 		Recording: RecordingSettings{
 			ContinuousEnabled: false, // This will be read from recorder config
@@ -347,8 +408,13 @@ func (h *ConfigHandler) updateInternalConfig(req *ConfigResponse) {
 	cfg.Tailscale.Enabled = req.Tailscale.Enabled
 	cfg.Tailscale.NodeName = req.Tailscale.NodeName
 	cfg.Tailscale.Hostname = req.Tailscale.Hostname
+	// Note: Tailscale auth keys should NOT be stored in config files
+	// Auth keys are one-time use credentials for device registration
+	// If provided, log a warning but don't persist to disk
 	if req.Tailscale.AuthKey != "" {
-		cfg.Tailscale.AuthKey = req.Tailscale.AuthKey
+		log.Println("WARNING: Tailscale auth key provided but will not be persisted to config file")
+		log.Println("WARNING: Auth keys are one-time use credentials and should not be stored")
+		// Do not store: cfg.Tailscale.AuthKey = req.Tailscale.AuthKey
 	}
 
 	// Update email settings

@@ -391,8 +391,17 @@ app.post('/api/config', async (req, res) => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(req.body)
         });
-        const data = await response.json();
-        res.json(data);
+
+        // Check content type to handle both JSON and text responses
+        const contentType = response.headers.get('content-type');
+        if (contentType && contentType.includes('application/json')) {
+            const data = await response.json();
+            res.status(response.status).json(data);
+        } else {
+            // Handle text/plain error responses
+            const text = await response.text();
+            res.status(response.status).json({ error: text });
+        }
     } catch (error) {
         console.error('Error updating config:', error);
         res.status(500).json({ error: 'Failed to update configuration' });
@@ -544,12 +553,40 @@ app.use((err, req, res, next) => {
     res.status(500).send('Something broke!');
 });
 
-// Start server
-server.listen(config.port, config.host, () => {
-    console.log(`Server running at http://${config.host}:${config.port}`);
-    console.log(`WebSocket server available at ws://${config.host}:${config.port}${config.websocket.path}?roomId=<yourRoomId>`);
-    console.log(`Proxying connections to ion-sfu at ${config.ionSfu.url}`);
-});
+// Start server with dynamic port selection
+function startServerWithDynamicPort(port, maxAttempts = 10) {
+    const tryPort = (currentPort, attempts) => {
+        if (attempts > maxAttempts) {
+            console.error(`Failed to find available port after ${maxAttempts} attempts`);
+            process.exit(1);
+        }
+
+        server.listen(currentPort, config.host)
+            .on('listening', () => {
+                const actualPort = server.address().port;
+                console.log(`Server running at http://${config.host}:${actualPort}`);
+                console.log(`WebSocket server available at ws://${config.host}:${actualPort}${config.websocket.path}?roomId=<yourRoomId>`);
+                console.log(`Proxying connections to ion-sfu at ${config.ionSfu.url}`);
+
+                if (actualPort !== config.port) {
+                    console.log(`Note: Using port ${actualPort} instead of configured port ${config.port}`);
+                }
+            })
+            .on('error', (err) => {
+                if (err.code === 'EADDRINUSE') {
+                    console.log(`Port ${currentPort} is in use, trying port ${currentPort + 1}...`);
+                    tryPort(currentPort + 1, attempts + 1);
+                } else {
+                    console.error('Server error:', err);
+                    process.exit(1);
+                }
+            });
+    };
+
+    tryPort(port, 1);
+}
+
+startServerWithDynamicPort(config.port);
 
 // Graceful shutdown
 process.on('SIGTERM', () => {

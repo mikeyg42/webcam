@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/mikeyg42/webcam/internal/config"
@@ -22,6 +23,16 @@ type TailscaleManager struct {
 	localIP  string
 	ctx      context.Context
 	cancel   context.CancelFunc
+
+	// WhoIs cache to avoid spawning processes per request
+	whoisCache     map[string]*cachedWhoIs
+	whoisCacheLock sync.RWMutex
+}
+
+type cachedWhoIs struct {
+	email      string
+	cachedAt   time.Time
+	ttl        time.Duration
 }
 
 // TailscaleStatus represents the status information from Tailscale.
@@ -51,9 +62,10 @@ func NewTailscaleManager(parent context.Context, tsConfig *config.TailscaleConfi
 
 	tsCtx, cancel := context.WithCancel(parent)
 	tm := &TailscaleManager{
-		config: tsConfig,
-		ctx:    tsCtx,
-		cancel: cancel,
+		config:     tsConfig,
+		ctx:        tsCtx,
+		cancel:     cancel,
+		whoisCache: make(map[string]*cachedWhoIs),
 	}
 
 	// Initialize (read status, confirm running, capture node info).
@@ -61,6 +73,10 @@ func NewTailscaleManager(parent context.Context, tsConfig *config.TailscaleConfi
 		cancel()
 		return nil, fmt.Errorf("tailscale init: %w", err)
 	}
+
+	// Start cache cleanup goroutine
+	go tm.cleanupCacheLoop()
+
 	return tm, nil
 }
 
@@ -104,32 +120,6 @@ func (tm *TailscaleManager) getStatus() (*TailscaleStatus, error) {
 	}
 
 	return &status, nil
-}
-
-// waitForConnection polls until Tailscale backend is Running (or times out).
-func (tm *TailscaleManager) waitForConnection(timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(tm.ctx, timeout)
-	defer cancel()
-
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for tailscale connection")
-		case <-ticker.C:
-			status, err := tm.getStatus()
-			if err != nil {
-				log.Printf("tailscale: status check error: %v", err)
-				continue
-			}
-			if status.BackendState == "Running" && status.Self.Online {
-				return nil
-			}
-			log.Printf("tailscale: waiting… state=%s online=%v", status.BackendState, status.Self.Online)
-		}
-	}
 }
 
 // GetLocalTailscaleIP returns this device's Tailscale IP address.
@@ -201,4 +191,175 @@ func (tm *TailscaleManager) StatusHandler(w http.ResponseWriter, r *http.Request
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
+}
+
+// WhoIsInfo represents user information from Tailscale WhoIs
+type WhoIsInfo struct {
+	UserProfile UserProfile `json:"UserProfile"`
+	Node        NodeInfo    `json:"Node"`
+}
+
+type UserProfile struct {
+	LoginName      string `json:"LoginName"`      // User's email
+	DisplayName    string `json:"DisplayName"`
+	ProfilePicURL  string `json:"ProfilePicURL"`
+	ID             int64  `json:"ID"`
+}
+
+type NodeInfo struct {
+	ID       int64  `json:"ID"`
+	Name     string `json:"Name"`
+	User     int64  `json:"User"`
+}
+
+// GetUserEmailFromIP uses Tailscale WhoIs to get the email of a connected user
+// Results are cached for 5 minutes to avoid spawning processes per request
+func (tm *TailscaleManager) GetUserEmailFromIP(ipAddr string) (string, error) {
+	// Validate IP address format before using
+	ip := net.ParseIP(ipAddr)
+	if ip == nil {
+		return "", fmt.Errorf("invalid IP address format: %s", ipAddr)
+	}
+
+	// Check cache first
+	tm.whoisCacheLock.RLock()
+	if cached, exists := tm.whoisCache[ipAddr]; exists {
+		if time.Since(cached.cachedAt) < cached.ttl {
+			email := cached.email
+			tm.whoisCacheLock.RUnlock()
+			return email, nil
+		}
+	}
+	tm.whoisCacheLock.RUnlock()
+
+	// Cache miss or expired - fetch from tailscale
+	ctx, cancel := context.WithTimeout(tm.ctx, 5*time.Second)
+	defer cancel()
+
+	// Call tailscale whois with validated IP
+	cmd := exec.CommandContext(ctx, "tailscale", "whois", "--json", ip.String())
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("tailscale whois: %w", err)
+	}
+
+	var whoIs WhoIsInfo
+	if err := json.Unmarshal(out, &whoIs); err != nil {
+		return "", fmt.Errorf("parse whois json: %w", err)
+	}
+
+	if whoIs.UserProfile.LoginName == "" {
+		return "", fmt.Errorf("no user email found in whois response")
+	}
+
+	email := whoIs.UserProfile.LoginName
+
+	// Cache the result for 5 minutes
+	// User-to-IP mappings rarely change, so longer TTL reduces subprocess overhead
+	tm.whoisCacheLock.Lock()
+	tm.whoisCache[ipAddr] = &cachedWhoIs{
+		email:    email,
+		cachedAt: time.Now(),
+		ttl:      5 * time.Minute,
+	}
+	tm.whoisCacheLock.Unlock()
+
+	return email, nil
+}
+
+// GetUserEmailFromRequest extracts user email from HTTP request using Tailscale WhoIs
+//
+// CRITICAL ASSUMPTION: This function assumes the API server is listening DIRECTLY on a
+// Tailscale network interface and clients connect over the tailnet. It uses r.RemoteAddr
+// to get the client's IP address.
+//
+// If you put an HTTP reverse proxy (nginx, Caddy, etc.) in front of this server:
+// - r.RemoteAddr will be 127.0.0.1 or the proxy's LAN IP, NOT the client's Tailscale IP
+// - Authentication will fail with "Tailscale authentication required"
+// - You would need to trust X-Forwarded-For from the proxy (which we explicitly don't do)
+//
+// For production deployments behind a proxy:
+// - Run the proxy on the same node and join it to the tailnet
+// - Configure secure forwarding of the original client IP
+// - Modify this function to trust X-Forwarded-For only from specific trusted sources
+func (tm *TailscaleManager) GetUserEmailFromRequest(r *http.Request) (string, error) {
+	// Get remote IP from request
+	remoteAddr := r.RemoteAddr
+	if remoteAddr == "" {
+		return "", fmt.Errorf("no remote address in request")
+	}
+
+	// Extract IP (remove port if present)
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		// Might not have port, use as-is
+		host = remoteAddr
+	}
+
+	// Check if this is a local/non-Tailscale IP
+	if isLocalIP(host) {
+		// Log detailed info server-side, return generic message to client
+		log.Printf("Tailscale auth unavailable: request from non-Tailscale IP %s", host)
+		return "", fmt.Errorf("Tailscale authentication required")
+	}
+
+	return tm.GetUserEmailFromIP(host)
+}
+
+// isLocalIP checks if the IP is localhost or private network (but NOT Tailscale CGNAT)
+// Returns true for IPs that should be rejected (local/RFC1918), false for allowed IPs (Tailscale/public)
+func isLocalIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+
+	// Check for localhost
+	if ip.IsLoopback() {
+		return true
+	}
+
+	// Tailscale CGNAT range: 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+	// This is NOT in RFC1918, so check explicitly first
+	ipv4 := ip.To4()
+	if ipv4 != nil && ipv4[0] == 100 && ipv4[1] >= 64 && ipv4[1] < 128 {
+		return false // This IS a Tailscale IP - allow it
+	}
+
+	// Check for RFC1918 private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+	// Note: ip.IsPrivate() returns false for 100.64.0.0/10, so this doesn't conflict
+	if ip.IsPrivate() {
+		return true // Private IP - reject it
+	}
+
+	// Public IPs will reach here - allow them (they'll fail at whois if not in tailnet)
+	return false
+}
+
+// cleanupCacheLoop periodically removes expired entries from the WhoIs cache
+func (tm *TailscaleManager) cleanupCacheLoop() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-tm.ctx.Done():
+			return
+		case <-ticker.C:
+			tm.cleanupExpiredCache()
+		}
+	}
+}
+
+// cleanupExpiredCache removes expired entries from the WhoIs cache
+func (tm *TailscaleManager) cleanupExpiredCache() {
+	tm.whoisCacheLock.Lock()
+	defer tm.whoisCacheLock.Unlock()
+
+	now := time.Now()
+	for ip, cached := range tm.whoisCache {
+		if now.Sub(cached.cachedAt) > cached.ttl {
+			delete(tm.whoisCache, ip)
+		}
+	}
 }

@@ -259,6 +259,13 @@ log_info "Starting Go security camera application…"
 export WEBRTC_USERNAME="${WEBRTC_USERNAME:-testuser}"
 export WEBRTC_PASSWORD="${WEBRTC_PASSWORD:-testing123}"
 
+# Set encryption key for credential database
+if [[ -z "${CREDENTIALS_ENCRYPTION_KEY:-}" ]]; then
+  log_warn "CREDENTIALS_ENCRYPTION_KEY not set. Using development default."
+  log_warn "For production, set: export CREDENTIALS_ENCRYPTION_KEY=\"your-secure-key\""
+  export CREDENTIALS_ENCRYPTION_KEY="dev-key-change-in-production-please"
+fi
+
 # Check port 8080 for Go app (note: port is hardcoded in the app)
 # If it's occupied by our previous security-camera process, kill it
 # Otherwise, warn and exit (since we can't change the port easily)

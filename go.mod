@@ -12,6 +12,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/lib/pq v1.10.9
+	github.com/mattn/go-sqlite3 v1.14.22
 	github.com/minio/minio-go/v7 v7.0.95
 	github.com/pion/mediadevices v0.7.0
 	github.com/pion/rtp v1.8.10
@@ -20,6 +21,7 @@ require (
 	github.com/zserge/lorca v0.1.10
 	go.uber.org/zap v1.27.0
 	gocv.io/x/gocv v0.42.0
+	golang.org/x/crypto v0.41.0
 	golang.org/x/oauth2 v0.31.0
 	google.golang.org/api v0.249.0
 	gopkg.in/yaml.v2 v2.4.0
@@ -70,7 +72,6 @@ require (
 	go.opentelemetry.io/otel/metric v1.37.0 // indirect
 	go.opentelemetry.io/otel/trace v1.37.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
-	golang.org/x/crypto v0.41.0 // indirect
 	golang.org/x/exp v0.0.0-20240909161429-701f63a606c0 // indirect
 	golang.org/x/image v0.23.0 // indirect
 	golang.org/x/net v0.43.0 // indirect

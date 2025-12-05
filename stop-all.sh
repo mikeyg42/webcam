@@ -38,8 +38,8 @@ pkill -f "./security-camera" && log_info "Go camera application stopped" || log_
 
 # Step 3: Stop Docker Compose services
 log_info "Stopping Docker Compose services..."
-if [ -f "docker-compose.yml" ]; then
-    docker-compose down
+if [ -f "docker-compose.yml" ] || [ -f "compose.yml" ]; then
+    docker compose down -v 2>/dev/null || docker-compose down 2>/dev/null || log_warn "Could not stop Docker services"
     log_info "Docker services stopped"
 else
     log_warn "docker-compose.yml not found"

@@ -10,16 +10,21 @@ import (
 
 	"github.com/mikeyg42/webcam/internal/calibration"
 	"github.com/mikeyg42/webcam/internal/config"
+	"github.com/mikeyg42/webcam/internal/database"
 	"github.com/mikeyg42/webcam/internal/motion"
+	"github.com/mikeyg42/webcam/internal/tailscale"
 )
 
 // Server is an HTTP API server
 type Server struct {
-	httpServer         *http.Server
-	mux                *http.ServeMux // Store mux for dynamic route registration
-	configHandler      *ConfigHandler
-	calibrationHandler *CalibrationHandler
-	qualityHandler     *QualityHandler
+	httpServer          *http.Server
+	mux                 *http.ServeMux // Store mux for dynamic route registration
+	configHandler       *ConfigHandler
+	calibrationHandler  *CalibrationHandler
+	qualityHandler      *QualityHandler
+	credentialsHandler  *CredentialsHandler
+	credDB              *database.DB
+	tailscaleManager    *tailscale.TailscaleManager
 }
 
 // NewServer creates a new API server
@@ -28,11 +33,18 @@ func NewServer(ctx context.Context, cfg *config.Config, addr string, calibServic
 	Start(width, height int) error
 	Stop()
 	IsRunning() bool
-}) *Server {
+}, credDB *database.DB, tsManager *tailscale.TailscaleManager) *Server {
 	mux := http.NewServeMux()
 
 	// Create configuration handler with motion detector for runtime updates
 	configHandler := NewConfigHandler(cfg, detector)
+	// Set credential database and Tailscale manager for auto-population
+	if credDB != nil {
+		configHandler.SetCredentialDatabase(credDB)
+	}
+	if tsManager != nil {
+		configHandler.SetTailscaleManager(tsManager)
+	}
 	configHandler.RegisterRoutes(mux)
 
 	// Create calibration handler (if provided)
@@ -40,6 +52,32 @@ func NewServer(ctx context.Context, cfg *config.Config, addr string, calibServic
 	if calibService != nil && detector != nil && frameDistributor != nil {
 		calibrationHandler = NewCalibrationHandler(ctx, calibService, detector, frameDistributor)
 		calibrationHandler.RegisterRoutes(mux)
+	}
+
+	// Create credentials handler (if database and Tailscale are available)
+	var credentialsHandler *CredentialsHandler
+	if credDB != nil && tsManager != nil {
+		credentialsHandler = NewCredentialsHandler(credDB, tsManager)
+
+		// Create rate limiter: 10 requests per minute per IP
+		credentialRateLimiter := NewRateLimiter(10, time.Minute)
+
+		// Register credential management routes with rate limiting
+		mux.HandleFunc("/api/credentials", credentialRateLimiter.Middleware(func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodPost:
+				credentialsHandler.HandleSetCredentials(w, r)
+			case http.MethodDelete:
+				credentialsHandler.HandleDeleteCredentials(w, r)
+			default:
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			}
+		}))
+		mux.HandleFunc("/api/credentials/status", credentialRateLimiter.Middleware(credentialsHandler.HandleGetCredentialsStatus))
+
+		log.Println("[APIServer] Credential management endpoints registered with rate limiting")
+	} else {
+		log.Println("[APIServer] Warning: Credential management disabled (database or Tailscale not available)")
 	}
 
 	// Health check endpoint
@@ -60,9 +98,12 @@ func NewServer(ctx context.Context, cfg *config.Config, addr string, calibServic
 			WriteTimeout:   10 * time.Second,
 			MaxHeaderBytes: 1 << 20, // 1 MB
 		},
-		mux:                mux,
-		configHandler:      configHandler,
-		calibrationHandler: calibrationHandler,
+		mux:                 mux,
+		configHandler:       configHandler,
+		calibrationHandler:  calibrationHandler,
+		credentialsHandler:  credentialsHandler,
+		credDB:              credDB,
+		tailscaleManager:    tsManager,
 	}
 }
 
@@ -82,17 +123,26 @@ func (s *Server) SetQualityHandler(provider QualityManagerProvider) {
 
 // corsMiddleware adds CORS headers to allow cross-origin requests
 func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Allow requests from any localhost port for development
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			origin = "*"
-		}
+	// Whitelist of allowed origins
+	allowedOrigins := map[string]bool{
+		"http://localhost:8080":  true,
+		"http://localhost:8081":  true,
+		"http://localhost:3000":  true,
+		"http://127.0.0.1:8080":  true,
+		"http://127.0.0.1:8081":  true,
+		"http://127.0.0.1:3000":  true,
+	}
 
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+
+		// Only set CORS headers for whitelisted origins
+		if origin != "" && allowedOrigins[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
 
 		// Handle preflight requests
 		if r.Method == "OPTIONS" {

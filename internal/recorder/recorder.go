@@ -120,7 +120,7 @@ func NewRecordingService(cfg *config.Config, logger recorderlog.Logger) (*Record
 		metadataStore:     metadataStore,
 		ringBuffer:        ringBuffer,
 		segmenter:         segmenter,
-		frameInput:        make(chan *buffer.Frame, int(cfg.Video.FrameRate)), // ~1s of frames
+		frameInput:        make(chan *buffer.Frame, int(cfg.Video.FrameRate)*3), // ~3s of frames (increased buffer)
 		motionEvents:      make(chan MotionEvent, 16),
 		stopCh:            make(chan struct{}),
 		continuousEnabled: cfg.Recording.ContinuousEnabled,

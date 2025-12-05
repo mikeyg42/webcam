@@ -423,11 +423,6 @@
                             <input type="number" id="minConsecutiveFrames" name="minConsecutiveFrames" min="1" max="10" value="2">
                             <small>Frames needed to trigger</small>
                         </div>
-                        <div class="form-group">
-                            <label>Frame Skip</label>
-                            <input type="number" id="frameSkip" name="frameSkip" min="1" max="10" value="2">
-                            <small>Process every Nth frame</small>
-                        </div>
                     </div>
                 </div>
 
@@ -436,6 +431,7 @@
                     <h2>🗄️ Storage Settings</h2>
 
                     <h3>MinIO (Object Storage)</h3>
+                    <div id="minio-credentials">
                     <div class="form-row">
                         <div class="form-group">
                             <label>Endpoint <span class="required">*</span></label>
@@ -465,8 +461,10 @@
                         <input type="checkbox" id="minioUseSSL" name="minioUseSSL">
                         <label for="minioUseSSL">Use SSL/TLS</label>
                     </div>
+                    </div>
 
                     <h3>PostgreSQL (Metadata)</h3>
+                    <div id="postgres-credentials">
                     <div class="form-row">
                         <div class="form-group">
                             <label>Host <span class="required">*</span></label>
@@ -494,6 +492,7 @@
                             <button type="button" class="toggle-password-btn" onclick="togglePasswordVisibility('postgresPassword')" title="Show/hide password">👁️</button>
                         </div>
                     </div>
+                    </div>
                 </div>
 
                 <!-- Network Settings -->
@@ -501,6 +500,7 @@
                     <h2>🌐 Network Settings</h2>
 
                     <h3>WebRTC Authentication</h3>
+                    <div id="webrtc-credentials">
                     <div class="form-row">
                         <div class="form-group">
                             <label>Username <span class="required">*</span></label>
@@ -516,6 +516,7 @@
                             </div>
                             <small>Min 8 characters</small>
                         </div>
+                    </div>
                     </div>
 
                     <h3>Tailscale (Optional)</h3>
@@ -572,5 +573,6 @@
     </div>
 
     <script src="config.js"></script>
+    <script src="credentials.js"></script>
 </body>
 </html>

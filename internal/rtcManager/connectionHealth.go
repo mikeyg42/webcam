@@ -663,26 +663,12 @@ func (cd *ConnectionDoctor) collectWSMetrics(metrics *QualityMetrics) {
 	metrics.WSState = "Connected"
 
 	// Check JSON-RPC health
+	// NOTE: Disabled because ion-sfu doesn't implement a standard "ping" method
+	// The connection is monitored through WebSocket health checks instead
 	if cd.manager.rpcConn != nil {
-		jsonrpc_latency, err := cd.checkJSONRPCHealth()
-		if err != nil {
-			// Check shutdown again before trying to send
-			if cd.isShutdown.Load() {
-				return
-			}
-			select {
-			case cd.warnings <- Warning{
-				Timestamp: time.Now(),
-				Level:     CriticalLevel,
-				Type:      SignalingWarning,
-				Message:   fmt.Sprintf("JSON-RPC health check failed: %v", err),
-			}:
-			case <-cd.ctx.Done():
-				return
-			}
-		} else {
-			metrics.JSONRPCLatency = jsonrpc_latency
-		}
+		// Skip JSON-RPC health check - not supported by ion-sfu
+		// WebSocket health is sufficient for monitoring
+		metrics.JSONRPCLatency = 0
 	}
 }
 
