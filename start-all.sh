@@ -266,6 +266,16 @@ if [[ -z "${CREDENTIALS_ENCRYPTION_KEY:-}" ]]; then
   export CREDENTIALS_ENCRYPTION_KEY="dev-key-change-in-production-please"
 fi
 
+# Enable Tailscale development mode (bypasses auth for localhost)
+# WARNING: This disables Tailscale authentication for localhost connections!
+# For production, unset this variable or set to "false"
+if [[ -z "${TAILSCALE_DEV_MODE:-}" ]]; then
+  log_warn "TAILSCALE_DEV_MODE not set. Enabling for local development."
+  log_warn "This bypasses Tailscale authentication for localhost connections."
+  log_warn "For production, set: export TAILSCALE_DEV_MODE=\"false\""
+  export TAILSCALE_DEV_MODE="true"
+fi
+
 # Check port 8080 for Go app (note: port is hardcoded in the app)
 # If it's occupied by our previous security-camera process, kill it
 # Otherwise, warn and exit (since we can't change the port easily)

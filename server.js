@@ -11,7 +11,7 @@ const url = require('url'); // Added for parsing URL query parameters
 // Configuration
 const config = {
     port: process.env.PORT || 3000,
-    host: process.env.HOST || 'localhost',
+    host: process.env.HOST || '0.0.0.0',  // Listen on all interfaces (localhost, LAN, Tailscale)
     cors: {
         origin: process.env.CORS_ORIGIN || '*', // Allow configuring origin via env var
         methods: ['GET', 'POST']
@@ -50,7 +50,8 @@ app.use(helmet({
             imgSrc: ["'self'", "data:", "blob:"],
             styleSrc: ["'self'", "'unsafe-inline'"],
             objectSrc: ["'none'"],
-            frameAncestors: ["'none'"]
+            frameAncestors: ["'none'"],
+            upgradeInsecureRequests: null  // Disable HTTPS upgrade for development (no SSL certs)
         }
     }
 }));
