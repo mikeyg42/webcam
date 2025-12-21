@@ -30,6 +30,11 @@ const config = {
 // Initialize Express app
 const app = express();
 
+// Trust proxy - needed to get real client IP from X-Forwarded-For when behind a proxy
+// Since frontend connects to Node.js and Node.js connects to Go backend,
+// we need the frontend's IP to reach the Go backend
+app.set('trust proxy', true);
+
 // Security middleware
 const ionSfuUrl = process.env.ION_SFU_URL || 'ws://localhost:7001/ws';
 const ionSfuWssUrl = ionSfuUrl.replace('ws://', 'wss://');
@@ -373,9 +378,22 @@ wss.on('close', () => {
 // Proxy configuration API to Go backend
 const goBackendUrl = process.env.GO_BACKEND_URL || 'http://localhost:8081';
 
+// Helper to get client IP and create headers for proxying
+function getProxyHeaders(req) {
+    const clientIP = req.ip || req.connection.remoteAddress || req.socket.remoteAddress;
+    return {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': clientIP,  // Forward real client IP to Go backend
+        'X-Forwarded-Proto': req.protocol,
+        'X-Forwarded-Host': req.get('host')
+    };
+}
+
 app.get('/api/config', async (req, res) => {
     try {
-        const response = await fetch(`${goBackendUrl}/api/config`);
+        const response = await fetch(`${goBackendUrl}/api/config`, {
+            headers: getProxyHeaders(req)
+        });
         const data = await response.json();
         res.json(data);
     } catch (error) {
@@ -388,7 +406,7 @@ app.post('/api/config', async (req, res) => {
     try {
         const response = await fetch(`${goBackendUrl}/api/config`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getProxyHeaders(req),
             body: JSON.stringify(req.body)
         });
 

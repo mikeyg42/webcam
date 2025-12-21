@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -302,27 +303,20 @@ func (tm *TailscaleManager) GetUserEmailFromIP(ipAddr string) (string, error) {
 // - Configure secure forwarding of the original client IP
 // - Modify this function to trust X-Forwarded-For only from specific trusted sources
 func (tm *TailscaleManager) GetUserEmailFromRequest(r *http.Request) (string, error) {
-	// Get remote IP from request
-	remoteAddr := r.RemoteAddr
-	if remoteAddr == "" {
-		return "", fmt.Errorf("no remote address in request")
-	}
-
-	// Extract IP (remove port if present)
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		// Might not have port, use as-is
-		host = remoteAddr
+	// Get client IP - trust X-Forwarded-For ONLY from localhost (our trusted proxy)
+	clientIP := getClientIP(r)
+	if clientIP == "" {
+		return "", fmt.Errorf("no client address in request")
 	}
 
 	// Check if this is a local/non-Tailscale IP
-	if isLocalIP(host) {
+	if isLocalIP(clientIP) {
 		// Log detailed info server-side, return generic message to client
-		log.Printf("Tailscale auth unavailable: request from non-Tailscale IP %s", host)
+		log.Printf("Tailscale auth unavailable: request from non-Tailscale IP %s", clientIP)
 		return "", fmt.Errorf("Tailscale authentication required")
 	}
 
-	return tm.GetUserEmailFromIP(host)
+	return tm.GetUserEmailFromIP(clientIP)
 }
 
 // isLocalIP checks if the IP is localhost or private network (but NOT Tailscale CGNAT)
@@ -393,4 +387,41 @@ func getTailscaleBinary() string {
 	}
 	// Fallback to system binary
 	return "tailscale"
+}
+
+// isLocalhost checks if an IP is localhost
+func isLocalhost(ipStr string) bool {
+	return ipStr == "127.0.0.1" || ipStr == "::1" || ipStr == "localhost"
+}
+
+// getClientIP extracts the real client IP, trusting X-Forwarded-For ONLY from localhost
+// This allows a trusted proxy (Node.js on same machine) to forward the real client IP
+// while maintaining security against X-Forwarded-For spoofing from external clients
+func getClientIP(r *http.Request) string {
+	// Get the proxy IP (who made the request to us)
+	remoteAddr := r.RemoteAddr
+	proxyIP, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		proxyIP = remoteAddr
+	}
+
+	// If request comes from localhost (our trusted Node.js proxy), trust X-Forwarded-For
+	if isLocalhost(proxyIP) {
+		// Check X-Forwarded-For header for the real client IP
+		forwardedFor := r.Header.Get("X-Forwarded-For")
+		if forwardedFor != "" {
+			// X-Forwarded-For can be a comma-separated list; take the first IP
+			// This is the original client IP before any proxies
+			ips := strings.Split(forwardedFor, ",")
+			clientIP := strings.TrimSpace(ips[0])
+			if clientIP != "" {
+				log.Printf("Tailscale auth: using X-Forwarded-For IP %s from trusted proxy %s", clientIP, proxyIP)
+				return clientIP
+			}
+		}
+	}
+
+	// Either not from localhost proxy, or no X-Forwarded-For header
+	// Use the direct connection IP
+	return proxyIP
 }
