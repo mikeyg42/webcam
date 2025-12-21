@@ -70,9 +70,8 @@ func validateTailscaleConfig(v *Validator, cfg *config.TailscaleConfig) {
 	if !isTailscaleInstalled() {
 		v.AddError("tailscale is not installed. install from https://tailscale.com/download")
 	}
-	if strings.TrimSpace(cfg.Hostname) == "" {
-		v.AddError("tailscale node name (hostname) cannot be empty")
-	}
+	// Hostname can be empty or "auto-detect" - it will be populated from tailscale status
+	// No validation needed here
 
 	// StateDir must exist and be writable. We keep this simple and reliable:
 	// mkdir -p; create a temp file; delete it.

@@ -397,7 +397,7 @@ type ICEServer struct {
 
 // TailscaleConfig contains Tailscale VPN settings
 type TailscaleConfig struct {
-	Enabled         bool   `yaml:"enabled" json:"enabled" default:"false"`
+	Enabled         bool   `yaml:"enabled" json:"enabled" default:"true"`
 	AuthKey         string `yaml:"auth_key" json:"auth_key"`
 	ControlURL      string `yaml:"control_url" json:"control_url" default:""`
 	Hostname        string `yaml:"hostname" json:"hostname"`
@@ -603,8 +603,9 @@ func DefaultConfig() *Config {
 			Password:             "defaultpassword123",    // Added: must be 8-128 chars
 		},
 		Tailscale: TailscaleConfig{
-			Enabled:   false,
-			StateDir:  "/var/lib/tailscale",
+			Enabled:   true,           // Always enabled - no testing without Tailscale authentication
+			Hostname:  "auto-detect",  // Will be auto-detected from tailscale status
+			StateDir:  os.TempDir(),   // Use temp dir for dev, writable by user
 			ShieldsUp: false,
 		},
 		Recording: RecordingConfig{

@@ -18,6 +18,9 @@ log_test() { echo -e "${BLUE}[TEST]${NC} $*"; }
 TEST_PASSED=0
 TEST_FAILED=0
 
+# Ensure arithmetic operations work
+set +e
+
 # Get Tailscale IP from interface
 TAILSCALE_IP=$(ifconfig | grep -A 2 "utun" | grep "inet " | awk '{print $2}' | grep "^100\." | head -1)
 
