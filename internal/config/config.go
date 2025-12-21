@@ -522,7 +522,7 @@ func DefaultConfig() *Config {
 			Height:           480,
 			FrameRate:        30,
 			Quality:          "high",
-			BitRate:          2000,  // Adjusted to be within MaxBitRate: 5000 range
+			BitRate:          2000000,  // 2 Mbps in bps (min 500 kbps required)
 			KeyFrameInterval: 60,
 			OutputPath:       "/tmp/recordings",  // Changed: use /tmp for local testing
 		},

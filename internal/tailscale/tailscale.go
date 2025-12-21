@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -43,11 +44,12 @@ type TailscaleStatus struct {
 }
 
 type TailscaleDevice struct {
-	ID       string `json:"ID"`
-	HostName string `json:"HostName"`
-	DNSName  string `json:"DNSName"`
-	TailAddr string `json:"TailAddr"`
-	Online   bool   `json:"Online"`
+	ID            string   `json:"ID"`
+	HostName      string   `json:"HostName"`
+	DNSName       string   `json:"DNSName"`
+	TailAddr      string   `json:"TailAddr"`       // Deprecated, may be null
+	TailscaleIPs  []string `json:"TailscaleIPs"`  // Use this for IP addresses
+	Online        bool     `json:"Online"`
 }
 
 // NewTailscaleManager creates a new Tailscale manager.
@@ -92,7 +94,21 @@ func (tm *TailscaleManager) initialize() error {
 
 	// Fill locals from the same status object (no need to re-query).
 	tm.hostname = status.Self.HostName
-	tm.localIP = status.Self.TailAddr
+
+	// Get Tailscale IP from TailscaleIPs array (prefer IPv4)
+	if len(status.Self.TailscaleIPs) > 0 {
+		// Find IPv4 address (starts with 100.)
+		for _, ip := range status.Self.TailscaleIPs {
+			if len(ip) > 0 && ip[0] == '1' {  // Quick check for 100.x.x.x
+				tm.localIP = ip
+				break
+			}
+		}
+		// Fallback to first IP if no IPv4 found
+		if tm.localIP == "" {
+			tm.localIP = status.Self.TailscaleIPs[0]
+		}
+	}
 
 	log.Printf("tailscale: initialized — Hostname=%s TailIP=%s", tm.hostname, tm.localIP)
 	return nil
@@ -104,7 +120,9 @@ func (tm *TailscaleManager) getStatus() (*TailscaleStatus, error) {
 	ctx, cancel := context.WithTimeout(tm.ctx, 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "tailscale", "status", "--json")
+	// Use full path to avoid bundleIdentifier issues with /usr/local/bin/tailscale symlink
+	tailscaleBin := getTailscaleBinary()
+	cmd := exec.CommandContext(ctx, tailscaleBin, "status", "--json")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("tailscale status: %w", err)
@@ -236,8 +254,9 @@ func (tm *TailscaleManager) GetUserEmailFromIP(ipAddr string) (string, error) {
 	ctx, cancel := context.WithTimeout(tm.ctx, 5*time.Second)
 	defer cancel()
 
-	// Call tailscale whois with validated IP
-	cmd := exec.CommandContext(ctx, "tailscale", "whois", "--json", ip.String())
+	// Call tailscale whois with validated IP (use full path to avoid bundleIdentifier issues)
+	tailscaleBin := getTailscaleBinary()
+	cmd := exec.CommandContext(ctx, tailscaleBin, "whois", "--json", ip.String())
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("tailscale whois: %w", err)
@@ -362,4 +381,16 @@ func (tm *TailscaleManager) cleanupExpiredCache() {
 			delete(tm.whoisCache, ip)
 		}
 	}
+}
+
+// getTailscaleBinary returns the path to a working Tailscale binary
+// Prefers the app binary which doesn't have bundleIdentifier issues
+func getTailscaleBinary() string {
+	// Try app binary first (works on macOS without bundleIdentifier issues)
+	appBinary := "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+	if _, err := os.Stat(appBinary); err == nil {
+		return appBinary
+	}
+	// Fallback to system binary
+	return "tailscale"
 }
