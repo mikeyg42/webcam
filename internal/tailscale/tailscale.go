@@ -311,7 +311,14 @@ func (tm *TailscaleManager) GetUserEmailFromRequest(r *http.Request) (string, er
 
 	// Check if this is a local/non-Tailscale IP
 	if isLocalIP(clientIP) {
-		// Log detailed info server-side, return generic message to client
+		// Development mode: Allow localhost access without Tailscale authentication
+		// Set TAILSCALE_DEV_MODE=true to enable (WARNING: Bypasses all authentication!)
+		if os.Getenv("TAILSCALE_DEV_MODE") == "true" {
+			log.Printf("Tailscale DEV MODE: bypassing auth for localhost IP %s", clientIP)
+			return "dev-user@localhost", nil
+		}
+
+		// Production: Reject non-Tailscale IPs
 		log.Printf("Tailscale auth unavailable: request from non-Tailscale IP %s", clientIP)
 		return "", fmt.Errorf("Tailscale authentication required")
 	}
