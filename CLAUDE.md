@@ -81,7 +81,7 @@ nodemon server.js
 ## Configuration
 
 ### Key Configuration Files
-- `configs/sfu.toml`: ion-sfu configuration (TURN server, port ranges, timeouts)
+- `configs/sfu.toml`: ion-sfu configuration (port ranges, timeouts)
 - `internal/config/config.go`: Go application defaults with environment variable overrides
 
 ### Environment Variables
@@ -90,10 +90,9 @@ nodemon server.js
 - `PORT`: Node.js server port (default: 3000)
 - `ION_SFU_URL`: ion-sfu WebSocket URL (default: ws://localhost:7000/ws)
 
-### TURN Server Configuration
-- Embedded TURN server in ion-sfu container
-- Default credentials: `pion=ion, pion2=ion2`
-- UDP port range: 5000-5200 for WebRTC, 49152-65535 for TURN relay
+### Networking
+- **Tailscale required**: All WebRTC connections use Tailscale for secure mesh networking
+- UDP port range: 5000-5200 for WebRTC media
 
 ## Testing and Development Notes
 

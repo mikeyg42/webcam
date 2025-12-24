@@ -76,10 +76,6 @@ failed = 25
 # How often in [sec] the ICE Agent sends extra traffic if there is no activity, if media is flowing no traffic will be sent
 keepalive = 4
 
-[turn]
-# TURN server disabled - using Tailscale-only networking
-enabled = false
-
 [log]
 # 0 - INFO 1 - DEBUG 2 - TRACE
 v = 0
