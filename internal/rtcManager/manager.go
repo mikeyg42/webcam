@@ -360,9 +360,6 @@ func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websock
 func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	log.Println("DEBUGGING: WebRTC Manager Initialize() started")
 
-	// Skip TURN server when streaming to ion-sfu (ion-sfu handles NAT traversal)
-	log.Println("DEBUGGING: Skipping TURN server - using ion-sfu for media forwarding")
-
 	// Create MediaEngine
 	mediaEngine := webrtc.MediaEngine{}
 
