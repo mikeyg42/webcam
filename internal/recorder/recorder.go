@@ -29,7 +29,12 @@ type MotionEvent struct {
 	Regions    []image.Rectangle
 }
 
-// RecordingService manages the entire recording pipeline
+// RecordingService manages the entire recording pipeline.
+//
+// The encoder is initialized lazily on the first frame received, allowing the service
+// to adapt to the actual camera resolution rather than failing if the configured
+// resolution doesn't match what the camera produces. This design choice prioritizes
+// runtime flexibility over strict configuration enforcement.
 type RecordingService struct {
 	config  *config.Config
 	logger  recorderlog.Logger
@@ -41,6 +46,13 @@ type RecordingService struct {
 	metadataStore storage.MetadataStore
 	ringBuffer    *buffer.RingBuffer
 	segmenter     *pipeline.Segmenter
+
+	// Lazy encoder initialization: the encoder is created on the first frame
+	// using the actual frame dimensions rather than config values. This allows
+	// graceful handling of resolution mismatches between config and camera hardware.
+	encoderConfig      encoder.EncoderConfig // Template config (dimensions may be overridden)
+	encoderMu          sync.Mutex            // Guards encoder creation
+	encoderInitialized atomic.Bool           // Fast path check to avoid mutex contention
 
 	// Channels
 	frameInput   chan *buffer.Frame
@@ -55,6 +67,7 @@ type RecordingService struct {
 	lastMotionTime    time.Time
 	continuousEnabled bool
 	eventEnabled      bool
+	bufferWarnLogged  atomic.Bool // Rate-limit buffer full warnings
 
 	// Workers
 	wg sync.WaitGroup
@@ -72,22 +85,12 @@ type Metrics struct {
 	Errors            atomic.Uint64
 }
 
-// NewRecordingService creates a new recording service
+// NewRecordingService creates a new recording service.
+//
+// The encoder is NOT created here - it's lazily initialized on the first frame
+// using ensureEncoder(). This allows the service to adapt to the actual camera
+// resolution if it differs from the configured values.
 func NewRecordingService(cfg *config.Config, logger recorderlog.Logger) (*RecordingService, error) {
-	// Create GStreamer AV1 encoder for maximum quality recording
-	enc, err := encoder.NewGStreamerAV1Encoder(encoder.EncoderConfig{
-		Width:            cfg.Video.Width,
-		Height:           cfg.Video.Height,
-		FrameRate:        float64(cfg.Video.FrameRate),
-		Bitrate:          cfg.Video.BitRate * 1000, // Convert kbps to bps
-		KeyframeInterval: 60,                        // 2 seconds at 30fps
-		Codec:            "av1",
-		RealTime:         false, // Recording mode for maximum quality
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create AV1 encoder: %w", err)
-	}
-
 	// Initialize storage using adapter helper
 	minioCfg, pgCfg, err := config.CreateStorageConfigs(cfg)
 	if err != nil {
@@ -111,16 +114,35 @@ func NewRecordingService(cfg *config.Config, logger recorderlog.Logger) (*Record
 	// Segmenter
 	segmenter := pipeline.NewSegmenter(cfg.Recording.SegmentDuration, cfg.Recording.TempDir)
 
+	// Prepare encoder config template. The Width/Height values here are from config
+	// but may be overridden during lazy initialization if the actual camera produces
+	// frames at a different resolution.
+	encConfig := encoder.EncoderConfig{
+		Width:            cfg.Video.Width,
+		Height:           cfg.Video.Height,
+		FrameRate:        float64(cfg.Video.FrameRate),
+		Bitrate:          cfg.Video.BitRate, // Already in bps from config
+		KeyframeInterval: 60,                 // 2 seconds at 30fps
+		Codec:            "av1",
+		RealTime:         false, // Recording mode for maximum quality
+	}
+
+	logger.Info("Recording service initialized (encoder will be created on first frame)",
+		recorderlog.Int("configured_width", cfg.Video.Width),
+		recorderlog.Int("configured_height", cfg.Video.Height),
+		recorderlog.Int("configured_fps", cfg.Video.FrameRate))
+
 	return &RecordingService{
 		config:            cfg,
 		logger:            logger,
 		metrics:           &Metrics{},
-		encoder:           enc,
+		encoderConfig:     encConfig,
+		// encoder is nil - will be lazily initialized in ensureEncoder()
 		objectStore:       objectStore,
 		metadataStore:     metadataStore,
 		ringBuffer:        ringBuffer,
 		segmenter:         segmenter,
-		frameInput:        make(chan *buffer.Frame, int(cfg.Video.FrameRate)*3), // ~3s of frames (increased buffer)
+		frameInput:        make(chan *buffer.Frame, int(cfg.Video.FrameRate)*10), // ~10s of frames (handles encoder init delay)
 		motionEvents:      make(chan MotionEvent, 16),
 		stopCh:            make(chan struct{}),
 		continuousEnabled: cfg.Recording.ContinuousEnabled,
@@ -194,9 +216,11 @@ func (r *RecordingService) Stop() error {
 	}
 	r.mu.Unlock()
 
-	// Close components
-	if err := r.encoder.Close(); err != nil {
-		r.logger.Error("Failed to close encoder", recorderlog.Error(err))
+	// Close encoder if it was initialized (may be nil if no frames were ever received)
+	if r.encoder != nil {
+		if err := r.encoder.Close(); err != nil {
+			r.logger.Error("Failed to close encoder", recorderlog.Error(err))
+		}
 	}
 
 	return nil
@@ -217,10 +241,16 @@ func (r *RecordingService) HandleFrame(img image.Image, ts time.Time) error {
 	select {
 	case r.frameInput <- frame:
 		r.metrics.FramesReceived.Add(1)
+		// Reset warning flag when buffer has capacity again
+		r.bufferWarnLogged.Store(false)
 		return nil
 	default:
 		r.metrics.FramesDropped.Add(1)
-		return fmt.Errorf("frame buffer full")
+		// Log only once per overflow episode to avoid log spam
+		if !r.bufferWarnLogged.Swap(true) {
+			r.logger.Warn("Frame buffer full - dropping frames during encoder initialization")
+		}
+		return nil // Don't return error - drops are expected during encoder init
 	}
 }
 
@@ -238,6 +268,77 @@ func (r *RecordingService) HandleMotionEvent(event MotionEvent) {
 	default:
 		r.logger.Warn("Motion event buffer full")
 	}
+}
+
+// ensureEncoder lazily initializes the encoder on the first frame.
+//
+// This method solves a common problem: the configured video resolution may not match
+// what the camera actually produces. Rather than failing at startup or dropping frames,
+// we create the encoder using the actual frame dimensions from the first frame received.
+//
+// Thread-safety: Uses double-checked locking pattern with atomic.Bool for the fast path
+// and mutex for the slow path (encoder creation). This ensures:
+//   - Most calls (after initialization) only check an atomic bool
+//   - Only one goroutine creates the encoder
+//   - All goroutines see the encoder once created
+//
+// Returns error only on encoder creation failure; returns nil if encoder already exists.
+func (r *RecordingService) ensureEncoder(frame *buffer.Frame) error {
+	// Fast path: encoder already initialized
+	if r.encoderInitialized.Load() {
+		return nil
+	}
+
+	// Slow path: need to initialize encoder
+	r.encoderMu.Lock()
+	defer r.encoderMu.Unlock()
+
+	// Double-check after acquiring lock (another goroutine may have initialized)
+	if r.encoderInitialized.Load() {
+		return nil
+	}
+
+	// Extract actual dimensions from the frame
+	bounds := frame.Image.Bounds()
+	actualWidth := bounds.Dx()
+	actualHeight := bounds.Dy()
+
+	// Check if dimensions differ from config and log appropriately
+	configWidth := r.encoderConfig.Width
+	configHeight := r.encoderConfig.Height
+
+	if actualWidth != configWidth || actualHeight != configHeight {
+		r.logger.Warn("Camera resolution differs from config - using actual camera resolution",
+			recorderlog.Int("config_width", configWidth),
+			recorderlog.Int("config_height", configHeight),
+			recorderlog.Int("actual_width", actualWidth),
+			recorderlog.Int("actual_height", actualHeight))
+	}
+
+	// Create encoder config with actual dimensions
+	actualConfig := r.encoderConfig
+	actualConfig.Width = actualWidth
+	actualConfig.Height = actualHeight
+
+	r.logger.Info("Creating AV1 encoder with actual frame dimensions",
+		recorderlog.Int("width", actualWidth),
+		recorderlog.Int("height", actualHeight),
+		recorderlog.Float64("framerate", actualConfig.FrameRate),
+		recorderlog.Int("bitrate_bps", actualConfig.Bitrate))
+
+	enc, err := encoder.NewGStreamerAV1Encoder(actualConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create AV1 encoder: %w", err)
+	}
+
+	r.encoder = enc
+	r.encoderInitialized.Store(true)
+
+	r.logger.Info("Encoder initialized successfully",
+		recorderlog.Int("width", actualWidth),
+		recorderlog.Int("height", actualHeight))
+
+	return nil
 }
 
 func (r *RecordingService) frameProcessor(ctx context.Context) {
@@ -271,8 +372,10 @@ func (r *RecordingService) processFrame(frame *buffer.Frame) {
 		return
 	}
 
-	// Validate encoder is initialized
-	if r.encoder == nil {
+	// Lazily initialize encoder on first frame using actual frame dimensions.
+	// This handles the case where config resolution doesn't match camera hardware.
+	if err := r.ensureEncoder(frame); err != nil {
+		r.logger.Error("Failed to initialize encoder", recorderlog.Error(err))
 		r.metrics.Errors.Add(1)
 		return
 	}
@@ -525,8 +628,20 @@ func (r *RecordingService) uploadSegment(rec *storage.Recording, seg *pipeline.S
 	}
 }
 
-// processBufferedFrames writes pre-motion buffered frames
+// processBufferedFrames writes pre-motion buffered frames.
+// These are frames from the ring buffer captured before motion was detected,
+// allowing recordings to include context leading up to the motion event.
 func (r *RecordingService) processBufferedFrames(recordingID string, frames []*buffer.Frame) {
+	if len(frames) == 0 {
+		return
+	}
+
+	// Ensure encoder is initialized using the first buffered frame's dimensions
+	if err := r.ensureEncoder(frames[0]); err != nil {
+		r.logger.Error("Failed to initialize encoder for buffered frames", recorderlog.Error(err))
+		return
+	}
+
 	for _, f := range frames {
 		data, err := r.encoder.Encode(f.Image, f.PTS)
 		if err != nil {

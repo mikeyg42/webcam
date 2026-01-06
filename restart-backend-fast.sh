@@ -54,7 +54,53 @@ else
     log_warn "Go camera application was not running"
 fi
 
-# Step 2: Ensure ports are free (8080 for frontend, 8081 for API)
+# Step 2: Verify Docker dependencies are running
+log_info "Checking Docker container dependencies..."
+
+check_container() {
+    local name="$1"
+    local port="$2"
+    local check_cmd="$3"
+
+    if ! docker ps --format '{{.Names}}' | grep -q "$name"; then
+        log_error "Docker container '$name' is not running!"
+        log_error "Run './start-all.sh' first, or 'docker compose up -d'"
+        return 1
+    fi
+
+    # Optional port check
+    if [ -n "$check_cmd" ]; then
+        if ! eval "$check_cmd" >/dev/null 2>&1; then
+            log_warn "Container '$name' is running but service not ready on port $port"
+        fi
+    fi
+    return 0
+}
+
+DOCKER_OK=true
+
+# Check PostgreSQL
+if ! check_container "webcam2-postgres" "5432" "docker exec webcam2-postgres pg_isready -U recorder -d recordings"; then
+    DOCKER_OK=false
+fi
+
+# Check MinIO
+if ! check_container "webcam2-minio" "9000" "curl -fsS http://localhost:9000/minio/health/live"; then
+    DOCKER_OK=false
+fi
+
+# Check ion-sfu
+if ! check_container "webcam2-ion-sfu" "7001" ""; then
+    DOCKER_OK=false
+fi
+
+if [ "$DOCKER_OK" = false ]; then
+    log_error "Docker dependencies not ready. Start them with: docker compose up -d"
+    exit 1
+fi
+log_info "✓ Docker containers are running"
+
+# Step 3a: Ensure ports are free (8080 for frontend, 8081 for API)
 for port in 8080 8081; do
     if lsof -ti:$port >/dev/null 2>&1; then
         log_warn "Port $port still occupied, clearing..."
@@ -63,7 +109,45 @@ for port in 8080 8081; do
     fi
 done
 
-# Step 3: Restart Go camera application
+# Step 3b: Ensure Node.js WebSocket proxy is running
+NODE_PORT="${PORT:-3000}"
+log_info "Checking Node.js WebSocket proxy on port ${NODE_PORT}..."
+
+if ! curl -fsS "http://localhost:${NODE_PORT}" >/dev/null 2>&1; then
+    log_warn "Node.js proxy not responding on port ${NODE_PORT}, starting it..."
+
+    # Kill any zombie processes on the port
+    if lsof -ti:${NODE_PORT} >/dev/null 2>&1; then
+        log_warn "Clearing port ${NODE_PORT}..."
+        kill -9 $(lsof -ti:${NODE_PORT}) 2>/dev/null || true
+        sleep 1
+    fi
+
+    # Start Node.js server
+    export ION_SFU_URL="${ION_SFU_URL:-ws://localhost:7001/ws}"
+    export PORT="${NODE_PORT}"
+    node server.js > "$LOG_DIR/node-server.log" 2>&1 &
+    NODE_PID=$!
+    log_info "Node.js server started with PID: ${NODE_PID}"
+
+    # Wait for Node.js to be ready (max 15 seconds)
+    for i in {1..15}; do
+        if curl -fsS "http://localhost:${NODE_PORT}" >/dev/null 2>&1; then
+            log_info "✓ Node.js proxy is ready"
+            break
+        fi
+        sleep 1
+        if [ $i -eq 15 ]; then
+            log_error "Node.js proxy failed to start"
+            tail -20 "$LOG_DIR/node-server.log" 2>/dev/null || echo "No logs available"
+            exit 1
+        fi
+    done
+else
+    log_info "✓ Node.js proxy already running"
+fi
+
+# Step 4: Restart Go camera application
 log_info "Starting Go security camera application..."
 
 # Preserve environment variables if they were set
@@ -76,7 +160,7 @@ GO_PID=$!
 
 log_info "Go camera started with PID: ${GO_PID}"
 
-# Step 4: Verify it's running
+# Step 5: Verify it's running
 sleep 2
 if kill -0 "$GO_PID" 2>/dev/null; then
     log_info "✓ Go camera application restarted successfully"

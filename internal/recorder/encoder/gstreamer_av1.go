@@ -37,6 +37,9 @@ type GStreamerAV1Encoder struct {
 	frameCount   atomic.Uint64
 	bytesEncoded atomic.Uint64
 	keyFrames    atomic.Uint64
+
+	// Lifecycle
+	wg sync.WaitGroup
 }
 
 // NewGStreamerAV1Encoder creates a new AV1 encoder using GStreamer
@@ -66,6 +69,11 @@ func NewGStreamerAV1Encoder(cfg EncoderConfig) (*GStreamerAV1Encoder, error) {
 	}
 
 	enc.running.Store(true)
+
+	// Start bus monitoring goroutine for error detection
+	enc.wg.Add(1)
+	go enc.monitorBus()
+
 	log.Println("GStreamer AV1 encoder initialized successfully")
 
 	return enc, nil
@@ -128,19 +136,33 @@ func (e *GStreamerAV1Encoder) buildPipeline() error {
 		return err
 	}
 
-	// Link elements
+	// Link elements with logging
+	log.Println("[AV1 Encoder] Linking pipeline elements...")
+
 	if err := srcElem.Link(conv); err != nil {
+		log.Printf("[AV1 Encoder] FAILED to link appsrc -> videoconvert")
 		return fmt.Errorf("link src->conv: %w", err)
 	}
+	log.Println("[AV1 Encoder] Linked: appsrc -> videoconvert")
+
 	if err := conv.Link(e.encoder); err != nil {
+		log.Printf("[AV1 Encoder] FAILED to link videoconvert -> encoder (caps mismatch?)")
 		return fmt.Errorf("link conv->encoder: %w", err)
 	}
+	log.Println("[AV1 Encoder] Linked: videoconvert -> encoder")
+
 	if err := e.encoder.Link(parser); err != nil {
+		log.Printf("[AV1 Encoder] FAILED to link encoder -> av1parse")
 		return fmt.Errorf("link encoder->parser: %w", err)
 	}
+	log.Println("[AV1 Encoder] Linked: encoder -> av1parse")
+
 	if err := parser.Link(sinkElem); err != nil {
+		log.Printf("[AV1 Encoder] FAILED to link av1parse -> appsink")
 		return fmt.Errorf("link parser->sink: %w", err)
 	}
+	log.Println("[AV1 Encoder] Linked: av1parse -> appsink")
+	log.Println("[AV1 Encoder] Pipeline linking complete")
 
 	return nil
 }
@@ -247,8 +269,12 @@ func (e *GStreamerAV1Encoder) configureAppSrc() error {
 		e.config.Height,
 		int(e.config.FrameRate),
 	)
+	log.Printf("[AV1 Encoder] Configuring appsrc with caps: %s", capsStr)
 
 	caps := gst.NewCapsFromString(capsStr)
+	if caps == nil {
+		return fmt.Errorf("failed to create caps from string: %s", capsStr)
+	}
 	e.appSrc.SetCaps(caps)
 	e.appSrc.SetStreamType(app.AppStreamTypeStream)
 	e.appSrc.SetLatency(0, uint64(2*time.Second))
@@ -256,18 +282,26 @@ func (e *GStreamerAV1Encoder) configureAppSrc() error {
 	e.appSrc.SetProperty("is-live", false) // Recording mode, not live
 	e.appSrc.SetProperty("block", false)
 
+	log.Printf("[AV1 Encoder] appsrc configured: format=RGB, %dx%d @ %dfps",
+		e.config.Width, e.config.Height, int(e.config.FrameRate))
 	return nil
 }
 
 // configureAppSink sets up the encoded output sink
 func (e *GStreamerAV1Encoder) configureAppSink() error {
+	log.Println("[AV1 Encoder] Configuring appsink...")
 	e.appSink.SetProperty("emit-signals", true)
 	e.appSink.SetProperty("sync", false)
 	e.appSink.SetProperty("max-buffers", uint(100))
 	e.appSink.SetProperty("drop", false)
 
 	// Set caps for AV1 output
-	caps := gst.NewCapsFromString("video/x-av1")
+	capsStr := "video/x-av1"
+	log.Printf("[AV1 Encoder] Configuring appsink with caps: %s", capsStr)
+	caps := gst.NewCapsFromString(capsStr)
+	if caps == nil {
+		return fmt.Errorf("failed to create caps from string: %s", capsStr)
+	}
 	e.appSink.SetCaps(caps)
 
 	// Set callback for encoded samples
@@ -399,14 +433,27 @@ func (e *GStreamerAV1Encoder) Close() error {
 
 	e.running.Store(false)
 
+	// Cancel context to stop bus monitoring
+	e.cancel()
+
+	// Wait for goroutines with timeout
+	done := make(chan struct{})
+	go func() {
+		e.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.Println("[AV1 Encoder] Warning: timeout waiting for goroutines to stop")
+	}
+
 	// Stop pipeline
 	if e.pipeline != nil {
 		e.pipeline.SetState(gst.StateNull)
 		e.pipeline.Unref()
 	}
-
-	// Cancel context
-	e.cancel()
 
 	// Close channel
 	close(e.encodedFrames)
@@ -415,17 +462,79 @@ func (e *GStreamerAV1Encoder) Close() error {
 	return nil
 }
 
+// monitorBus watches the GStreamer bus for errors and warnings
+func (e *GStreamerAV1Encoder) monitorBus() {
+	defer e.wg.Done()
+
+	bus := e.pipeline.GetBus()
+	if bus == nil {
+		log.Println("[AV1 Encoder] Warning: could not get pipeline bus for monitoring")
+		return
+	}
+
+	log.Println("[AV1 Encoder] Bus monitoring started")
+
+	for {
+		// Check if we should stop
+		select {
+		case <-e.ctx.Done():
+			log.Println("[AV1 Encoder] Bus monitoring stopped (context cancelled)")
+			return
+		default:
+		}
+
+		// Poll for message with short timeout
+		msg := bus.TimedPopFiltered(gst.ClockTime(100*time.Millisecond),
+			gst.MessageError|gst.MessageWarning|gst.MessageEOS|gst.MessageStateChanged)
+
+		if msg == nil {
+			continue
+		}
+
+		switch msg.Type() {
+		case gst.MessageError:
+			err := msg.ParseError()
+			log.Printf("[AV1 Encoder] Pipeline ERROR: %v", err)
+			// Mark as not running so HandleFrame stops sending frames
+			e.running.Store(false)
+
+		case gst.MessageWarning:
+			warn := msg.ParseWarning()
+			log.Printf("[AV1 Encoder] Pipeline WARNING: %v", warn)
+
+		case gst.MessageEOS:
+			log.Println("[AV1 Encoder] Pipeline EOS received")
+			return
+
+		case gst.MessageStateChanged:
+			// Only log state changes for the pipeline itself, not child elements
+			if msg.Source() == e.pipeline.GetName() {
+				oldState, newState := msg.ParseStateChanged()
+				log.Printf("[AV1 Encoder] Pipeline state: %s -> %s", oldState.String(), newState.String())
+			}
+		}
+	}
+}
+
 // GetMetrics returns current encoder metrics
 func (e *GStreamerAV1Encoder) GetMetrics() *EncoderMetrics {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	// Calculate bitrate safely to avoid division by zero
+	// bitrate (bps) = (bytes * 8) * frameRate / frames
+	var currentBitrate float64
+	frames := e.frameCount.Load()
+	if frames > 0 {
+		currentBitrate = float64(e.bytesEncoded.Load()*8) * e.config.FrameRate / float64(frames)
+	}
+
 	return &EncoderMetrics{
-		FramesEncoded:       e.frameCount.Load(),
+		FramesEncoded:       frames,
 		BytesEncoded:        e.bytesEncoded.Load(),
 		KeyFrames:           e.keyFrames.Load(),
 		HardwareAccelerated: false, // AV1 is software encoding
-		CurrentBitrate:      float64(e.bytesEncoded.Load() * 8 / (e.frameCount.Load() / uint64(e.config.FrameRate))),
+		CurrentBitrate:      currentBitrate,
 	}
 }
 
