@@ -8,6 +8,55 @@ const { v4: uuidv4 } = require('uuid'); // Add this dependency with: npm install
 const crypto = require('crypto');
 const url = require('url'); // Added for parsing URL query parameters
 
+// Rate-limited logger to prevent log flooding
+const rateLimitedLog = (() => {
+    const logHistory = new Map(); // key -> { count, lastTime, firstTime }
+    const COOLDOWN_MS = 5000;     // 5 seconds between identical messages
+    const BATCH_REPORT_MS = 10000; // Report suppressed count every 10s
+
+    // Periodically report suppressed message counts
+    setInterval(() => {
+        const now = Date.now();
+        logHistory.forEach((entry, key) => {
+            if (entry.count > 1 && (now - entry.firstTime) > BATCH_REPORT_MS) {
+                console.log(`[Log suppressed ${entry.count - 1}x in last ${Math.round((now - entry.firstTime) / 1000)}s]: ${key}`);
+                logHistory.delete(key);
+            }
+        });
+    }, BATCH_REPORT_MS);
+
+    return {
+        error: (key, ...args) => {
+            const now = Date.now();
+            const entry = logHistory.get(key);
+
+            if (entry && (now - entry.lastTime) < COOLDOWN_MS) {
+                // Suppress duplicate, increment counter
+                entry.count++;
+                entry.lastTime = now;
+                return;
+            }
+
+            // Log the message
+            console.error(...args);
+            logHistory.set(key, { count: 1, lastTime: now, firstTime: now });
+        },
+        warn: (key, ...args) => {
+            const now = Date.now();
+            const entry = logHistory.get(key);
+
+            if (entry && (now - entry.lastTime) < COOLDOWN_MS) {
+                entry.count++;
+                entry.lastTime = now;
+                return;
+            }
+
+            console.warn(...args);
+            logHistory.set(key, { count: 1, lastTime: now, firstTime: now });
+        }
+    };
+})();
+
 // Configuration
 const config = {
     port: process.env.PORT || 3000,
@@ -48,7 +97,8 @@ app.use(helmet({
             mediaSrc: ["'self'", "blob:", "data:"],
             workerSrc: ["'self'", "blob:"],
             imgSrc: ["'self'", "data:", "blob:"],
-            styleSrc: ["'self'", "'unsafe-inline'"],
+            styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+            fontSrc: ["'self'", "https://fonts.gstatic.com"],
             objectSrc: ["'none'"],
             frameAncestors: ["'none'"],
             upgradeInsecureRequests: null  // Disable HTTPS upgrade for development (no SSL certs)
@@ -119,6 +169,20 @@ const server = http.createServer(app);
 
 // --- Room and Session Management ---
 
+// Track recent disconnections for reconnect detection
+const recentDisconnections = new Map(); // key: `${ip}-${roomId}` -> { time, clientId }
+const RECONNECT_WINDOW_MS = 30000; // 30 seconds
+
+// Clean up old entries periodically
+setInterval(() => {
+    const now = Date.now();
+    recentDisconnections.forEach((entry, key) => {
+        if (now - entry.time > RECONNECT_WINDOW_MS * 2) {
+            recentDisconnections.delete(key);
+        }
+    });
+}, 60000); // Clean every minute
+
 class RoomManager {
     constructor() {
         // Map<roomId, Room>
@@ -183,7 +247,7 @@ class Room {
                     const messageText = typeof message === 'string' ? message : String(message);
                     client.send(messageText);
                 } catch (error) {
-                    console.error(`Error broadcasting to client ${client.id} in room ${this.id}:`, error);
+                    rateLimitedLog.error(`broadcast-${this.id}`, `Error broadcasting to client in room ${this.id}:`, error.message);
                 }
             }
         });
@@ -269,7 +333,7 @@ class Room {
         });
 
         this.ionWs.on('error', (error) => {
-            console.error(`ion-sfu connection error for room ${this.id}:`, error.message);
+            rateLimitedLog.error(`ion-sfu-${this.id}`, `ion-sfu connection error for room ${this.id}:`, error.message);
              // Close event will likely follow, triggering reconnect logic
              if (this.ionWsState !== 'reconnecting' && this.ionWsState !== 'closed') {
                 this.ionWs.close(); // Ensure close is triggered if error doesn't auto-close
@@ -319,9 +383,19 @@ wss.on('connection', (ws, req) => {
     // Enhance the WebSocket object with client info
     ws.id = clientId;
     ws.roomId = roomId;
+    ws.clientIp = clientIp; // Store for disconnect tracking
     ws.isAlive = true; // For keepalive checks
 
-    console.log(`Client ${clientId} connected from ${clientIp} to room ${roomId}`);
+    // Check if this is a reconnection
+    const disconnectKey = `${clientIp}-${roomId}`;
+    const recentDisconnect = recentDisconnections.get(disconnectKey);
+    if (recentDisconnect) {
+        const timeSinceDisconnect = Date.now() - recentDisconnect.time;
+        console.log(`[Reconnect] Client reconnecting from ${clientIp} to room ${roomId} (was ${recentDisconnect.clientId}, disconnected ${Math.round(timeSinceDisconnect / 1000)}s ago)`);
+        recentDisconnections.delete(disconnectKey);
+    } else {
+        console.log(`Client ${clientId} connected from ${clientIp} to room ${roomId}`);
+    }
 
     // Add client to the room
     const room = roomManager.getOrCreateRoom(roomId);
@@ -343,14 +417,19 @@ wss.on('connection', (ws, req) => {
     });
 
     // Handle client disconnection
-    ws.on('close', () => {
-        console.log(`Client ${clientId} disconnected from room ${roomId}`);
+    ws.on('close', (code, reason) => {
+        const disconnectKey = `${ws.clientIp}-${roomId}`;
+        recentDisconnections.set(disconnectKey, { time: Date.now(), clientId });
+
+        // Log with close code for debugging
+        const reasonStr = reason ? reason.toString() : 'none';
+        console.log(`Client ${clientId} disconnected from room ${roomId} (code: ${code}, reason: ${reasonStr})`);
         roomManager.removeClient(ws);
     });
 
     // Handle errors
     ws.on('error', (error) => {
-        console.error(`WebSocket error for client ${clientId} in room ${roomId}:`, error);
+        rateLimitedLog.error(`ws-error-${roomId}`, `WebSocket error for client in room ${roomId}:`, error.message);
         // Trigger cleanup on error as well
         roomManager.removeClient(ws);
         ws.terminate(); // Force close on error
@@ -395,10 +474,18 @@ app.get('/api/config', async (req, res) => {
         const response = await fetch(`${goBackendUrl}/api/config`, {
             headers: getProxyHeaders(req)
         });
-        const data = await response.json();
-        res.json(data);
+
+        // Check content type to handle both JSON and text responses
+        const contentType = response.headers.get('content-type');
+        if (contentType && contentType.includes('application/json')) {
+            const data = await response.json();
+            res.status(response.status).json(data);
+        } else {
+            const text = await response.text();
+            res.status(response.status).json({ error: text });
+        }
     } catch (error) {
-        console.error('Error fetching config from Go backend:', error);
+        rateLimitedLog.error('api-config-get', 'Error fetching config from Go backend:', error.message);
         res.status(500).json({ error: 'Failed to fetch configuration' });
     }
 });
@@ -422,7 +509,7 @@ app.post('/api/config', async (req, res) => {
             res.status(response.status).json({ error: text });
         }
     } catch (error) {
-        console.error('Error updating config:', error);
+        rateLimitedLog.error('api-config-post', 'Error updating config:', error.message);
         res.status(500).json({ error: 'Failed to update configuration' });
     }
 });
@@ -434,10 +521,18 @@ app.post('/api/test-notification', async (req, res) => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(req.body)
         });
-        const data = await response.json();
-        res.json(data);
+
+        // Check content type to handle both JSON and text responses
+        const contentType = response.headers.get('content-type');
+        if (contentType && contentType.includes('application/json')) {
+            const data = await response.json();
+            res.status(response.status).json(data);
+        } else {
+            const text = await response.text();
+            res.status(response.status).json({ error: text });
+        }
     } catch (error) {
-        console.error('Error testing notification:', error);
+        rateLimitedLog.error('api-notification', 'Error testing notification:', error.message);
         res.status(500).json({ error: 'Failed to test notification' });
     }
 });
@@ -550,10 +645,20 @@ app.use('/api', async (req, res) => {
         }
 
         const response = await fetch(url, options);
-        const data = await response.json();
-        res.status(response.status).json(data);
+
+        // Check content type to handle both JSON and text responses
+        // Go's http.Error() returns text/plain which would crash response.json()
+        const contentType = response.headers.get('content-type');
+        if (contentType && contentType.includes('application/json')) {
+            const data = await response.json();
+            res.status(response.status).json(data);
+        } else {
+            // Handle text/plain error responses from Go's http.Error()
+            const text = await response.text();
+            res.status(response.status).json({ error: text });
+        }
     } catch (error) {
-        console.error(`Error proxying ${req.method} /api${req.url} to Go backend:`, error);
+        rateLimitedLog.error(`api-proxy-${req.method}`, `Error proxying ${req.method} /api${req.url} to Go backend:`, error.message);
         res.status(500).json({ error: 'Failed to proxy request to backend' });
     }
 });
@@ -635,17 +740,52 @@ process.on('SIGTERM', () => {
 });
 
 // Handle uncaught exceptions
+// Only exit on truly fatal errors - transient network failures should not crash the server
 process.on('uncaughtException', (err, origin) => {
     console.error('Uncaught Exception:', err, 'Origin:', origin);
-    // Implement more sophisticated error handling/logging here if needed
-    process.exit(1); // Exit uncleanly on uncaught exception
+
+    // Check if this is a recoverable error
+    const isRecoverable = (
+        err.code === 'ECONNREFUSED' ||
+        err.code === 'ECONNRESET' ||
+        err.code === 'ETIMEDOUT' ||
+        err.code === 'ENOTFOUND' ||
+        err.message?.includes('fetch failed') ||
+        err.message?.includes('socket hang up')
+    );
+
+    if (isRecoverable) {
+        console.warn('Recoverable error detected, continuing operation...');
+        return;
+    }
+
+    // For truly fatal errors, exit
+    console.error('Fatal error - exiting');
+    process.exit(1);
 });
 
 // Handle unhandled promise rejections
+// Log them but don't crash - many are transient network errors
 process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    // Implement more sophisticated error handling/logging here if needed
-    process.exit(1); // Exit uncleanly on unhandled rejection
+
+    // Check if this is a recoverable rejection
+    const isRecoverable = (
+        reason?.code === 'ECONNREFUSED' ||
+        reason?.code === 'ECONNRESET' ||
+        reason?.code === 'ETIMEDOUT' ||
+        reason?.code === 'ENOTFOUND' ||
+        reason?.message?.includes('fetch failed') ||
+        reason?.cause?.code === 'ECONNREFUSED'
+    );
+
+    if (isRecoverable) {
+        console.warn('Recoverable rejection detected, continuing operation...');
+        return;
+    }
+
+    // For non-recoverable rejections, log but don't crash
+    console.error('Non-fatal unhandled rejection - continuing operation...');
 });
 
 module.exports = server; // Export for testing

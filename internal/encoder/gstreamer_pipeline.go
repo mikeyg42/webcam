@@ -283,6 +283,12 @@ func (g *GStreamerPipeline) buildPipeline(pipe *gst.Pipeline) error {
 		return err
 	}
 
+	// Create videoconvert for encoder branch (encoder needs NV12/I420, not RGB)
+	convEnc, err := gst.NewElement("videoconvert")
+	if err != nil {
+		return fmt.Errorf("create encoder videoconvert: %w", err)
+	}
+
 	// Create sinks
 	rawSinkA, err := gst.NewElement("appsink")
 	if err != nil {
@@ -319,7 +325,7 @@ func (g *GStreamerPipeline) buildPipeline(pipe *gst.Pipeline) error {
 	g.rtpSink = app.SinkFromElement(rtpOut)
 
 	// Add all elements to pipeline
-	if err := pipe.AddMany(srcElem, conv, tee, qA, rawSinkA, qB, rawSinkB, qC, enc, rtpPay, rtpOut); err != nil {
+	if err := pipe.AddMany(srcElem, conv, tee, qA, rawSinkA, qB, rawSinkB, qC, convEnc, enc, rtpPay, rtpOut); err != nil {
 		return fmt.Errorf("add elements: %w", err)
 	}
 
@@ -337,7 +343,7 @@ func (g *GStreamerPipeline) buildPipeline(pipe *gst.Pipeline) error {
 	}
 
 	// Link branches
-	if err := g.linkBranches(tee, qA, rawSinkA, qB, rawSinkB, qC, enc, rtpPay, rtpOut); err != nil {
+	if err := g.linkBranches(tee, qA, rawSinkA, qB, rawSinkB, qC, convEnc, enc, rtpPay, rtpOut); err != nil {
 		return err
 	}
 
@@ -365,7 +371,7 @@ func (g *GStreamerPipeline) createQueue(name string, maxBuffers uint) (*gst.Elem
 }
 
 // linkBranches links all pipeline branches
-func (g *GStreamerPipeline) linkBranches(tee, qA, sinkA, qB, sinkB, qC, enc, pay, rtpOut *gst.Element) error {
+func (g *GStreamerPipeline) linkBranches(tee, qA, sinkA, qB, sinkB, qC, convEnc, enc, pay, rtpOut *gst.Element) error {
 	// Link motion branch
 	if err := linkTeeToQueue(tee, qA); err != nil {
 		return fmt.Errorf("link tee->qA: %w", err)
@@ -382,12 +388,15 @@ func (g *GStreamerPipeline) linkBranches(tee, qA, sinkA, qB, sinkB, qC, enc, pay
 		return fmt.Errorf("link qB->sinkB: %w", err)
 	}
 
-	// Link encode branch
+	// Link encode branch (queue → videoconvert → encoder → payloader → sink)
 	if err := linkTeeToQueue(tee, qC); err != nil {
 		return fmt.Errorf("link tee->qC: %w", err)
 	}
-	if err := qC.Link(enc); err != nil {
-		return fmt.Errorf("link qC->enc: %w", err)
+	if err := qC.Link(convEnc); err != nil {
+		return fmt.Errorf("link qC->convEnc: %w", err)
+	}
+	if err := convEnc.Link(enc); err != nil {
+		return fmt.Errorf("link convEnc->enc: %w", err)
 	}
 	if err := enc.Link(pay); err != nil {
 		return fmt.Errorf("link enc->pay: %w", err)
@@ -776,18 +785,32 @@ func (g *GStreamerPipeline) monitorBus(bus *gst.Bus) {
 			}
 		}
 
+		// Get source element name for better diagnostics
+		source := msg.Source()
+		sourceName := "unknown"
+		if source != "" {
+			sourceName = source
+		}
+
 		switch msg.Type() {
 		case gst.MessageEOS:
-			log.Println("Pipeline: EOS received")
+			log.Printf("[H.264 Pipeline] EOS received from element: %s", sourceName)
 			return
 
 		case gst.MessageError:
 			err := msg.ParseError()
-			log.Printf("Pipeline error: %v", err)
+			log.Printf("[H.264 Pipeline] ERROR from element '%s': %v", sourceName, err)
 
 		case gst.MessageWarning:
 			err := msg.ParseWarning()
-			log.Printf("Pipeline warning: %v", err)
+			log.Printf("[H.264 Pipeline] WARNING from element '%s': %v", sourceName, err)
+
+		case gst.MessageStateChanged:
+			// Only log state changes for the pipeline itself to reduce noise
+			if sourceName == "enc-pipeline" {
+				oldState, newState := msg.ParseStateChanged()
+				log.Printf("[H.264 Pipeline] State: %s -> %s", oldState.String(), newState.String())
+			}
 		}
 	}
 }
