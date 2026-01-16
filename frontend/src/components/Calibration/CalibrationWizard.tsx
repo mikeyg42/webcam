@@ -1,5 +1,12 @@
 import { useEffect, useState } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
+import { Focus, CheckCircle, AlertCircle, Loader2, Play, Sparkles } from 'lucide-react';
 import { useCalibrationStore } from '../../stores/calibrationStore';
+import { Button } from '../primitives/Button';
+import { Card } from '../layout/Card';
+import { Progress } from '../feedback/Progress';
+import { StatusIndicator } from '../feedback/StatusIndicator';
+import { slideUp, fadeIn } from '../../lib/motion';
 
 interface CalibrationWizardProps {
   onCalibrationComplete?: () => void;
@@ -10,10 +17,7 @@ export function CalibrationWizard({ onCalibrationComplete }: CalibrationWizardPr
   const [applySuccess, setApplySuccess] = useState(false);
 
   useEffect(() => {
-    // Fetch initial status
     fetchStatus();
-
-    // Cleanup polling on unmount
     return () => {
       stopPolling();
     };
@@ -32,37 +36,35 @@ export function CalibrationWizard({ onCalibrationComplete }: CalibrationWizardPr
       setApplySuccess(false);
       await applyCalibration();
       setApplySuccess(true);
-      if (onCalibrationComplete) {
-        onCalibrationComplete();
-      }
+      onCalibrationComplete?.();
     } catch (error) {
       console.error('Failed to apply calibration:', error);
       setApplySuccess(false);
     }
   };
 
-  const getStateColor = () => {
+  const getStatusType = (): 'idle' | 'loading' | 'success' | 'error' => {
     switch (status?.state) {
       case 'recording':
       case 'processing':
-        return 'text-yellow-400';
+        return 'loading';
       case 'complete':
-        return 'text-green-400';
+        return 'success';
       case 'error':
-        return 'text-red-400';
+        return 'error';
       default:
-        return 'text-gray-400';
+        return 'idle';
     }
   };
 
-  const getStateDisplay = () => {
+  const getStateLabel = () => {
     switch (status?.state) {
       case 'recording':
         return 'Recording calibration video...';
       case 'processing':
         return 'Processing calibration data...';
       case 'complete':
-        return 'Calibration complete!';
+        return 'Calibration complete';
       case 'error':
         return 'Calibration error';
       case 'idle':
@@ -71,110 +73,179 @@ export function CalibrationWizard({ onCalibrationComplete }: CalibrationWizardPr
     }
   };
 
+  const isInProgress = status?.state === 'recording' || status?.state === 'processing';
+  const canStart = !status || status.state === 'idle' || status.state === 'error';
+  const canApply = status?.state === 'complete';
+
   return (
-    <div className="max-w-4xl mx-auto p-6">
-      <h1 className="text-3xl font-bold mb-6 text-white">Motion Detection Calibration</h1>
-
-      {error && (
-        <div className="bg-red-900/50 border border-red-500 text-red-200 px-4 py-3 rounded mb-6">
-          {error}
-        </div>
-      )}
-
-      {applySuccess && (
-        <div className="bg-green-900/50 border border-green-500 text-green-200 px-4 py-3 rounded mb-6">
-          ✓ Calibration applied successfully! Motion detection is now using the calibrated baseline.
-        </div>
-      )}
-
-      <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 space-y-6">
-        {/* Status Display */}
-        <div>
-          <h2 className="text-xl font-semibold mb-4 text-white">Calibration Status</h2>
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="text-gray-300">State:</span>
-              <span className={`font-semibold ${getStateColor()}`}>
-                {getStateDisplay()}
-              </span>
-            </div>
-
-            {status && status.progress > 0 && status.state !== 'complete' && (
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-gray-300">Progress:</span>
-                  <span className="text-white font-semibold">{Math.round(status.progress)}%</span>
-                </div>
-                <div className="w-full bg-gray-700 rounded-full h-2">
-                  <div
-                    className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-                    style={{ width: `${status.progress}%` }}
-                  />
-                </div>
-              </div>
-            )}
-
-            {status?.message && (
-              <div className="text-sm text-gray-400 mt-2">
-                {status.message}
-              </div>
-            )}
-
-            {status?.error && (
-              <div className="text-sm text-red-400 mt-2">
-                Error: {status.error}
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Instructions */}
-        <div className="bg-gray-900/50 rounded-lg p-4 border border-gray-600">
-          <h3 className="font-semibold mb-2 text-white">How to Calibrate</h3>
-          <ol className="list-decimal list-inside space-y-1 text-sm text-gray-300">
-            <li>Ensure the camera has a clear, stable view of the monitoring area</li>
-            <li>Make sure there is no motion in the frame</li>
-            <li>Click "Start Calibration" to record baseline footage</li>
-            <li>Keep the scene static for the duration of calibration</li>
-            <li>Once complete, click "Apply Calibration" to activate</li>
-          </ol>
-        </div>
-
-        {/* Controls */}
-        <div className="flex gap-4">
-          {(!status || status.state === 'idle' || status.state === 'error') && (
-            <button
-              onClick={handleStart}
-              className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
-            >
-              Start Calibration
-            </button>
-          )}
-
-          {status && (status.state === 'recording' || status.state === 'processing') && (
-            <div className="px-6 py-3 bg-gray-700 text-gray-300 rounded-lg font-medium">
-              Calibration in progress... Please wait
-            </div>
-          )}
-
-          {status && status.state === 'complete' && (
-            <button
-              onClick={handleApply}
-              className="px-6 py-3 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition-colors"
-            >
-              Apply Calibration
-            </button>
-          )}
-        </div>
-
-        {/* Polling indicator */}
-        {isPolling && (
-          <div className="flex items-center text-sm text-gray-400">
-            <div className="animate-pulse w-2 h-2 bg-blue-500 rounded-full mr-2" />
-            Monitoring calibration progress...
-          </div>
-        )}
+    <motion.div
+      variants={slideUp}
+      initial="hidden"
+      animate="visible"
+      className="space-y-6"
+    >
+      {/* Header */}
+      <div className="text-center space-y-2">
+        <motion.div
+          variants={fadeIn}
+          className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-accent/10 mb-4"
+        >
+          <Focus className="w-8 h-8 text-accent" />
+        </motion.div>
+        <h1 className="font-display text-2xl font-semibold text-text-primary">
+          Motion Detection Calibration
+        </h1>
+        <p className="text-sm text-text-secondary max-w-md mx-auto">
+          Teach the system what your empty scene looks like to accurately detect motion.
+        </p>
       </div>
-    </div>
+
+      {/* Error Alert */}
+      <AnimatePresence>
+        {error && (
+          <motion.div
+            variants={fadeIn}
+            initial="hidden"
+            animate="visible"
+            exit="exit"
+            className="bg-status-error/10 border border-status-error/30 rounded-lg p-4 flex items-start gap-3"
+          >
+            <AlertCircle className="w-5 h-5 text-status-error flex-shrink-0 mt-0.5" />
+            <p className="text-sm text-status-error">{error}</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Success Alert */}
+      <AnimatePresence>
+        {applySuccess && (
+          <motion.div
+            variants={fadeIn}
+            initial="hidden"
+            animate="visible"
+            exit="exit"
+            className="bg-status-success/10 border border-status-success/30 rounded-lg p-4 flex items-start gap-3"
+          >
+            <CheckCircle className="w-5 h-5 text-status-success flex-shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-medium text-status-success">Calibration Applied</p>
+              <p className="text-xs text-text-secondary mt-1">
+                Motion detection is now using the calibrated baseline.
+              </p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Main Card */}
+      <Card padding="lg">
+        <div className="space-y-6">
+          {/* Status Section */}
+          <div className="flex items-center justify-between">
+            <span className="text-xs uppercase tracking-label text-text-tertiary">
+              Current Status
+            </span>
+            <StatusIndicator
+              status={getStatusType()}
+              label={getStateLabel()}
+            />
+          </div>
+
+          {/* Progress Bar */}
+          <AnimatePresence>
+            {status && status.progress > 0 && status.state !== 'complete' && (
+              <motion.div
+                variants={fadeIn}
+                initial="hidden"
+                animate="visible"
+                exit="exit"
+              >
+                <Progress value={status.progress} showLabel />
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Status Message */}
+          {status?.message && (
+            <p className="text-sm text-text-secondary bg-bg-subtle rounded-lg p-3">
+              {status.message}
+            </p>
+          )}
+
+          {/* Action Buttons */}
+          <div className="flex gap-3">
+            {canStart && (
+              <Button onClick={handleStart} className="flex-1">
+                <Play className="w-4 h-4 mr-2" />
+                Start Calibration
+              </Button>
+            )}
+
+            {isInProgress && (
+              <div className="flex-1 flex items-center justify-center gap-2 py-3 px-4 bg-bg-subtle rounded-lg">
+                <Loader2 className="w-4 h-4 text-accent animate-spin" />
+                <span className="text-sm text-text-secondary">Calibrating...</span>
+              </div>
+            )}
+
+            {canApply && (
+              <Button onClick={handleApply} className="flex-1">
+                <Sparkles className="w-4 h-4 mr-2" />
+                Apply Calibration
+              </Button>
+            )}
+          </div>
+
+          {/* Polling Indicator */}
+          {isPolling && (
+            <div className="flex items-center justify-center gap-2 text-xs text-text-tertiary">
+              <span className="w-1.5 h-1.5 bg-accent rounded-full animate-pulse" />
+              Monitoring progress
+            </div>
+          )}
+        </div>
+      </Card>
+
+      {/* Instructions Card */}
+      <Card padding="md">
+        <h3 className="font-editorial text-sm font-medium text-accent mb-4 italic">
+          How to Calibrate
+        </h3>
+        <ol className="space-y-3">
+          {[
+            'Ensure the camera has a clear, stable view of the monitoring area',
+            'Make sure there is no motion in the frame (no people, pets, or moving objects)',
+            'Click "Start Calibration" to record baseline footage',
+            'Keep the scene completely static for the duration (~10 seconds)',
+            'Once complete, click "Apply Calibration" to activate motion detection',
+          ].map((step, index) => (
+            <li key={index} className="flex gap-3 text-sm">
+              <span className="flex-shrink-0 w-5 h-5 rounded-full bg-bg-subtle text-text-tertiary text-xs flex items-center justify-center font-mono">
+                {index + 1}
+              </span>
+              <span className="text-text-secondary leading-relaxed">{step}</span>
+            </li>
+          ))}
+        </ol>
+      </Card>
+
+      {/* Tips Card */}
+      <Card padding="sm" className="bg-accent/5 border-accent/20">
+        <div className="flex items-start gap-3">
+          <div className="w-8 h-8 rounded-full bg-accent/10 flex items-center justify-center flex-shrink-0">
+            <Sparkles className="w-4 h-4 text-accent" />
+          </div>
+          <div>
+            <p className="text-xs font-medium text-accent mb-1">Pro Tip</p>
+            <p className="text-xs text-text-secondary leading-relaxed">
+              For best results, calibrate during typical lighting conditions. If lighting changes
+              dramatically (day to night), you may want to recalibrate.
+            </p>
+          </div>
+        </div>
+      </Card>
+    </motion.div>
   );
 }
+
+CalibrationWizard.displayName = 'CalibrationWizard';

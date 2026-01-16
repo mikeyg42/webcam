@@ -44,7 +44,8 @@ type GStreamerPipeline struct {
 	rtpChan    chan *rtp.Packet
 
 	// Statistics
-	stats *EncoderStats
+	stats            *EncoderStats
+	rtpCallbackCount uint64 // Atomic counter for RTP callback debugging
 
 	// Lifecycle
 	ctx    context.Context
@@ -116,7 +117,7 @@ func (g *GStreamerPipeline) Start(ctx context.Context) error {
 
 	// Setup sink callbacks
 	g.setupRawSinks()
-	
+
 	// Monitor bus
 	bus := pipe.GetBus()
 	g.wg.Add(1)
@@ -125,10 +126,52 @@ func (g *GStreamerPipeline) Start(ctx context.Context) error {
 		g.monitorBus(bus)
 	}()
 
-	// Start pipeline
+	// For live sources, set directly to PLAYING
+	// The appsrc with is-live=true will handle the case where no data is available
+	log.Println("[GStreamer] Setting pipeline to PLAYING state...")
 	if err := pipe.SetState(gst.StatePlaying); err != nil {
 		return fmt.Errorf("failed to set PLAYING state: %w", err)
 	}
+
+	// For live sources with appsrc, the pipeline may stay in PAUSED until data arrives
+	// This is expected behavior - once we start pushing data, it will transition to PLAYING
+	// We use a short timeout and accept PAUSED state for live pipelines
+	log.Println("[GStreamer] Waiting for pipeline state change...")
+	ret, state := pipe.GetState(gst.StatePlaying, gst.ClockTime(500*time.Millisecond))
+	log.Printf("[GStreamer] Pipeline GetState result: return=%s, state=%s", ret.String(), state.String())
+
+	// For live sources, ASYNC with PAUSED is acceptable - it will transition when data arrives
+	// NO_PREROLL is expected for live sources
+	if ret == gst.StateChangeSuccess || ret == gst.StateChangeNoPreroll {
+		log.Println("[GStreamer] Pipeline ready (immediate state change)")
+	} else if ret == gst.StateChangeAsync {
+		// For live pipelines, async state change to PAUSED is normal
+		// The pipeline will complete the transition when data starts flowing
+		log.Println("[GStreamer] Pipeline state change pending (async for live source) - will complete when data arrives")
+	} else if ret == gst.StateChangeFailure {
+		return fmt.Errorf("pipeline state change failed")
+	}
+
+	// Start a goroutine to monitor state transitions
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-g.ctx.Done():
+				return
+			case <-ticker.C:
+				currentState := pipe.GetCurrentState()
+				log.Printf("[GStreamer] Periodic state check: current=%s", currentState.String())
+				if currentState == gst.StatePlaying {
+					log.Println("[GStreamer] Pipeline reached PLAYING state!")
+					return
+				}
+			}
+		}
+	}()
 
 	log.Println("GStreamer pipeline started successfully")
 	return nil
@@ -218,12 +261,20 @@ func (g *GStreamerPipeline) FeedFrame(img image.Image) error {
 	atomic.AddUint64(&g.frameIdx, 1)
 
 	// Push to pipeline
-	if ret := appSrc.PushBuffer(buf); ret != gst.FlowOK {
+	ret := appSrc.PushBuffer(buf)
+	if ret != gst.FlowOK {
 		g.stats.IncrementDroppedFrames()
+		log.Printf("[GStreamer] PushBuffer failed: %s (frame %d)", ret.String(), g.stats.GetFramesIn())
 		return fmt.Errorf("push buffer failed: %s", ret.String())
 	}
 
+	frameCount := g.stats.GetFramesIn()
 	g.stats.IncrementFramesIn()
+
+	// Log first few frames and then periodically
+	if frameCount < 5 || frameCount%500 == 0 {
+		log.Printf("[GStreamer] PushBuffer OK (frame %d, ret=%s)", frameCount+1, ret.String())
+	}
 	return nil
 }
 
@@ -249,6 +300,7 @@ func (g *GStreamerPipeline) GetStats() EncoderStats {
 }
 
 // buildPipeline constructs the GStreamer pipeline
+// SIMPLIFIED: No tee, just straight encode path to isolate the issue
 func (g *GStreamerPipeline) buildPipeline(pipe *gst.Pipeline) error {
 	// Create elements
 	srcElem, err := gst.NewElement("appsrc")
@@ -262,70 +314,67 @@ func (g *GStreamerPipeline) buildPipeline(pipe *gst.Pipeline) error {
 		return fmt.Errorf("create videoconvert: %w", err)
 	}
 
-	tee, err := gst.NewElement("tee")
+	// Create capsfilter to force I420/NV12 format for encoder
+	// x264enc prefers I420, VideoToolbox prefers NV12 - videoconvert handles conversion
+	encCaps, err := gst.NewElement("capsfilter")
 	if err != nil {
-		return fmt.Errorf("create tee: %w", err)
+		return fmt.Errorf("create encoder capsfilter: %w", err)
 	}
-
-	// Create queues for each branch
-	qA, err := g.createQueue("queue-motion", 10)
-	if err != nil {
-		return err
-	}
-
-	qB, err := g.createQueue("queue-record", 10)
-	if err != nil {
-		return err
-	}
-
-	qC, err := g.createQueue("queue-encode", 30)
-	if err != nil {
-		return err
-	}
-
-	// Create videoconvert for encoder branch (encoder needs NV12/I420, not RGB)
-	convEnc, err := gst.NewElement("videoconvert")
-	if err != nil {
-		return fmt.Errorf("create encoder videoconvert: %w", err)
-	}
-
-	// Create sinks
-	rawSinkA, err := gst.NewElement("appsink")
-	if err != nil {
-		return fmt.Errorf("create appsink A: %w", err)
-	}
-	g.rawSink1 = app.SinkFromElement(rawSinkA)
-
-	rawSinkB, err := gst.NewElement("appsink")
-	if err != nil {
-		return fmt.Errorf("create appsink B: %w", err)
-	}
-	g.rawSink2 = app.SinkFromElement(rawSinkB)
+	// Use I420 which works with both software and hardware encoders
+	i420Caps := gst.NewCapsFromString(fmt.Sprintf(
+		"video/x-raw,format=I420,width=%d,height=%d",
+		g.config.Width, g.config.Height))
+	_ = encCaps.SetProperty("caps", i420Caps)
+	log.Printf("[GStreamer] Created capsfilter for I420 format: %dx%d", g.config.Width, g.config.Height)
 
 	// Create encoder
 	enc, encKind := g.chooseEncoder()
 	if enc == nil {
 		return fmt.Errorf("no usable encoder found")
 	}
-
-	// Store encoder reference for dynamic bitrate control
 	g.encoder = enc
 	g.encoderKind = encKind
 
+	// Create H.264 parser
+	h264parse, err := gst.NewElement("h264parse")
+	if err != nil {
+		return fmt.Errorf("create h264parse: %w", err)
+	}
+	log.Println("[GStreamer] Created h264parse for H.264 encoder output")
+
+	// Create capsfilter to force byte-stream format for RTP payloader
+	// rtph264pay requires byte-stream (Annex B with start codes), not AVC (length-prefixed)
+	byteStreamCaps, err := gst.NewElement("capsfilter")
+	if err != nil {
+		return fmt.Errorf("create byte-stream capsfilter: %w", err)
+	}
+	streamCaps := gst.NewCapsFromString("video/x-h264,stream-format=byte-stream")
+	_ = byteStreamCaps.SetProperty("caps", streamCaps)
+	log.Println("[GStreamer] Created capsfilter for byte-stream format (required for RTP)")
+
 	// Create RTP payloader
-	rtpPay, caps, err := g.makeRTPPay(encKind)
+	rtpPay, _, err := g.makeRTPPay(encKind)
 	if err != nil {
 		return err
 	}
 
+	// Create RTP output appsink
 	rtpOut, err := gst.NewElement("appsink")
 	if err != nil {
 		return fmt.Errorf("create RTP appsink: %w", err)
 	}
 	g.rtpSink = app.SinkFromElement(rtpOut)
 
+	// Configure appsink BEFORE adding to pipeline (critical for state transitions)
+	g.rtpSink.SetProperty("emit-signals", true)
+	g.rtpSink.SetProperty("sync", false) // Don't sync to timestamps - critical!
+	g.rtpSink.SetProperty("max-buffers", uint(50))
+	g.rtpSink.SetProperty("drop", false)
+	log.Println("[GStreamer] Appsink pre-configured (emit-signals=true, sync=false)")
+
 	// Add all elements to pipeline
-	if err := pipe.AddMany(srcElem, conv, tee, qA, rawSinkA, qB, rawSinkB, qC, convEnc, enc, rtpPay, rtpOut); err != nil {
+	log.Println("[GStreamer] Adding elements: appsrc, videoconvert, capsfilter(I420), encoder, h264parse, capsfilter(byte-stream), rtph264pay, appsink")
+	if err := pipe.AddMany(srcElem, conv, encCaps, enc, h264parse, byteStreamCaps, rtpPay, rtpOut); err != nil {
 		return fmt.Errorf("add elements: %w", err)
 	}
 
@@ -334,24 +383,50 @@ func (g *GStreamerPipeline) buildPipeline(pipe *gst.Pipeline) error {
 		return err
 	}
 
-	// Link main path
+	// Link: appsrc → videoconvert → capsfilter → encoder → h264parse → rtph264pay → appsink
+	log.Println("[GStreamer] Linking: appsrc -> videoconvert")
 	if err := srcElem.Link(conv); err != nil {
 		return fmt.Errorf("link src->conv: %w", err)
 	}
-	if err := conv.Link(tee); err != nil {
-		return fmt.Errorf("link conv->tee: %w", err)
+
+	log.Println("[GStreamer] Linking: videoconvert -> capsfilter(I420)")
+	if err := conv.Link(encCaps); err != nil {
+		return fmt.Errorf("link conv->capsfilter: %w", err)
 	}
 
-	// Link branches
-	if err := g.linkBranches(tee, qA, rawSinkA, qB, rawSinkB, qC, convEnc, enc, rtpPay, rtpOut); err != nil {
-		return err
+	log.Println("[GStreamer] Linking: capsfilter(I420) -> encoder")
+	if err := encCaps.Link(enc); err != nil {
+		return fmt.Errorf("link capsfilter->enc: %w", err)
 	}
 
-	// Setup RTP sink with encoder info
-	if err := g.setupRTPSink(caps, encKind); err != nil {
-		return err
+	log.Println("[GStreamer] Linking: encoder -> h264parse")
+	if err := enc.Link(h264parse); err != nil {
+		return fmt.Errorf("link enc->parse: %w", err)
 	}
 
+	log.Println("[GStreamer] Linking: h264parse -> capsfilter(byte-stream)")
+	if err := h264parse.Link(byteStreamCaps); err != nil {
+		return fmt.Errorf("link parse->bytestream: %w", err)
+	}
+
+	log.Println("[GStreamer] Linking: capsfilter(byte-stream) -> rtph264pay")
+	if err := byteStreamCaps.Link(rtpPay); err != nil {
+		return fmt.Errorf("link bytestream->pay: %w", err)
+	}
+
+	log.Println("[GStreamer] Linking: rtph264pay -> appsink")
+	if err := rtpPay.Link(rtpOut); err != nil {
+		return fmt.Errorf("link pay->rtpOut: %w", err)
+	}
+
+	// Set callback AFTER linking but BEFORE state change
+	g.rtpSink.SetCallbacks(&app.SinkCallbacks{
+		NewSampleFunc: func(s *app.Sink) gst.FlowReturn {
+			return g.handleRTPSampleSimple(s)
+		},
+	})
+
+	log.Println("[GStreamer] H.264 -> RTP -> appsink pipeline built successfully")
 	return nil
 }
 
@@ -371,8 +446,8 @@ func (g *GStreamerPipeline) createQueue(name string, maxBuffers uint) (*gst.Elem
 }
 
 // linkBranches links all pipeline branches
-func (g *GStreamerPipeline) linkBranches(tee, qA, sinkA, qB, sinkB, qC, convEnc, enc, pay, rtpOut *gst.Element) error {
-	// Link motion branch
+func (g *GStreamerPipeline) linkBranches(tee, qA, sinkA, qB, sinkB, qC, convEnc, encCapsFilter, enc, parse, parseCapsFilter, pay, rtpOut *gst.Element) error {
+	// Link motion branch: queue → appsink (simple, no capsfilter)
 	if err := linkTeeToQueue(tee, qA); err != nil {
 		return fmt.Errorf("link tee->qA: %w", err)
 	}
@@ -380,7 +455,7 @@ func (g *GStreamerPipeline) linkBranches(tee, qA, sinkA, qB, sinkB, qC, convEnc,
 		return fmt.Errorf("link qA->sinkA: %w", err)
 	}
 
-	// Link recording branch
+	// Link recording branch: queue → appsink (simple, no capsfilter)
 	if err := linkTeeToQueue(tee, qB); err != nil {
 		return fmt.Errorf("link tee->qB: %w", err)
 	}
@@ -388,23 +463,37 @@ func (g *GStreamerPipeline) linkBranches(tee, qA, sinkA, qB, sinkB, qC, convEnc,
 		return fmt.Errorf("link qB->sinkB: %w", err)
 	}
 
-	// Link encode branch (queue → videoconvert → encoder → payloader → sink)
+	// Link encode branch:
+	// queue → videoconvert → capsfilter(NV12) → encoder → h264parse → capsfilter(byte-stream) → payloader → sink
 	if err := linkTeeToQueue(tee, qC); err != nil {
 		return fmt.Errorf("link tee->qC: %w", err)
 	}
 	if err := qC.Link(convEnc); err != nil {
 		return fmt.Errorf("link qC->convEnc: %w", err)
 	}
-	if err := convEnc.Link(enc); err != nil {
-		return fmt.Errorf("link convEnc->enc: %w", err)
+	// Force NV12 format for hardware encoder input
+	if err := convEnc.Link(encCapsFilter); err != nil {
+		return fmt.Errorf("link convEnc->encCapsFilter: %w", err)
 	}
-	if err := enc.Link(pay); err != nil {
-		return fmt.Errorf("link enc->pay: %w", err)
+	if err := encCapsFilter.Link(enc); err != nil {
+		return fmt.Errorf("link encCapsFilter->enc: %w", err)
+	}
+	// Parser converts AVC to byte-stream format
+	if err := enc.Link(parse); err != nil {
+		return fmt.Errorf("link enc->parse: %w", err)
+	}
+	// Force byte-stream output for RTP payloader
+	if err := parse.Link(parseCapsFilter); err != nil {
+		return fmt.Errorf("link parse->parseCapsFilter: %w", err)
+	}
+	if err := parseCapsFilter.Link(pay); err != nil {
+		return fmt.Errorf("link parseCapsFilter->pay: %w", err)
 	}
 	if err := pay.Link(rtpOut); err != nil {
 		return fmt.Errorf("link pay->rtpOut: %w", err)
 	}
 
+	log.Println("[GStreamer] Encode branch linked: queue → videoconvert → NV12 caps → encoder → parser → byte-stream caps → RTP payloader → sink")
 	return nil
 }
 
@@ -421,9 +510,12 @@ func (g *GStreamerPipeline) configureAppSrc() error {
 	g.appSrc.SetStreamType(app.AppStreamTypeStream)
 	g.appSrc.SetLatency(0, uint64(2*time.Second))
 	g.appSrc.SetProperty("format", gst.FormatTime)
-	g.appSrc.SetProperty("is-live", true)
+	g.appSrc.SetProperty("is-live", false) // Match AV1 encoder - NOT live mode
 	g.appSrc.SetProperty("block", false)
-	
+
+	log.Printf("[GStreamer] AppSrc configured: %dx%d@%dfps (is-live=false)",
+		g.config.Width, g.config.Height, g.config.FrameRate)
+
 	return nil
 }
 
@@ -516,7 +608,7 @@ func (g *GStreamerPipeline) chooseEncoder() (*gst.Element, encoderKind) {
 	// For sub-4K resolutions or H.265 fallback, use H.264
 	log.Printf("Using H.264 encoder for %dx%d resolution", g.config.Width, g.config.Height)
 
-	// On macOS, prefer H264 VideoToolbox
+	// On macOS, prefer H264 VideoToolbox hardware encoder
 	if runtime.GOOS == "darwin" {
 		if e, err := gst.NewElement("vtenc_h264_hw"); err == nil && e != nil {
 			g.configureVideoToolbox(e)
@@ -634,38 +726,45 @@ func (g *GStreamerPipeline) makeRTPPay(kind encoderKind) (*gst.Element, *gst.Cap
 	}
 }
 
-// setupRawSinks configures raw frame output sinks
+// setupRawSinks configures raw frame output sinks (if they exist)
 func (g *GStreamerPipeline) setupRawSinks() {
-	// Motion detection sink
-	g.rawSink1.SetEmitSignals(true)
-	g.rawSink1.SetProperty("max-buffers", uint(2))
-	g.rawSink1.SetProperty("drop", true)
-	g.rawSink1.SetCallbacks(&app.SinkCallbacks{
-		NewSampleFunc: g.handleMotionSample,
-	})
+	// Motion detection sink - configured for live pipeline
+	if g.rawSink1 != nil {
+		g.rawSink1.SetEmitSignals(true)
+		g.rawSink1.SetProperty("max-buffers", uint(2))
+		g.rawSink1.SetProperty("drop", true)
+		g.rawSink1.SetCallbacks(&app.SinkCallbacks{
+			NewSampleFunc: g.handleMotionSample,
+		})
+	}
 
-	// Recording sink
-	g.rawSink2.SetEmitSignals(true)
-	g.rawSink2.SetProperty("max-buffers", uint(2))
-	g.rawSink2.SetProperty("drop", true)
-	g.rawSink2.SetCallbacks(&app.SinkCallbacks{
-		NewSampleFunc: g.handleRecordingSample,
-	})
+	// Recording sink - configured for live pipeline
+	if g.rawSink2 != nil {
+		g.rawSink2.SetEmitSignals(true)
+		g.rawSink2.SetProperty("max-buffers", uint(2))
+		g.rawSink2.SetProperty("drop", true)
+		g.rawSink2.SetCallbacks(&app.SinkCallbacks{
+			NewSampleFunc: g.handleRecordingSample,
+		})
+	}
 }
 
 // setupRTPSink configures the RTP output sink
 func (g *GStreamerPipeline) setupRTPSink(caps *gst.Caps, kind encoderKind) error {
 	g.rtpSink.SetEmitSignals(true)
+	g.rtpSink.SetProperty("sync", false) // Don't synchronize to timestamps - prevents blocking during preroll
 	g.rtpSink.SetCaps(caps)
 	g.rtpSink.SetProperty("max-buffers", uint(50))
 	g.rtpSink.SetProperty("drop", false)
-	
+
+	log.Printf("[GStreamer] RTP sink configured (sync=false)")
+
 	g.rtpSink.SetCallbacks(&app.SinkCallbacks{
 		NewSampleFunc: func(s *app.Sink) gst.FlowReturn {
 			return g.handleRTPSample(s, kind)
 		},
 	})
-	
+
 	return nil
 }
 
@@ -706,45 +805,114 @@ func (g *GStreamerPipeline) handleRawSample(s *app.Sink, outChan chan image.Imag
 	return gst.FlowOK
 }
 
-func (g *GStreamerPipeline) handleRTPSample(s *app.Sink, kind encoderKind) gst.FlowReturn {
+// handleRTPSampleSimple is a simplified handler that just logs and passes data through
+func (g *GStreamerPipeline) handleRTPSampleSimple(s *app.Sink) gst.FlowReturn {
 	sample := s.PullSample()
 	if sample == nil {
-		return gst.FlowOK
+		return gst.FlowOK // Return OK not EOS - more samples may be coming
 	}
-	defer sample.Unref()
+	// Don't unref sample - PullSample returns an unowned reference that will be collected
 
 	buf := sample.GetBuffer()
 	if buf == nil {
 		return gst.FlowOK
 	}
 
-	mapping := buf.Map(gst.MapRead); 
-	defer buf.Unmap()
-	
+	// Use Bytes() which handles mapping internally (same as AV1 encoder)
+	data := buf.Bytes()
+	if len(data) < 12 {
+		return gst.FlowOK
+	}
+
+	// Parse RTP packet - Unmarshal makes a copy of the data
 	var pkt rtp.Packet
-	if err := pkt.Unmarshal(mapping.Bytes()); err == nil {
-		// Check for keyframe
-		if g.isKeyframe(&pkt, kind) {
-			now := time.Now()
-			if !g.lastKeyframeTime.IsZero() {
-				interval := now.Sub(g.lastKeyframeTime)
-				if interval > g.keyframeIntervalWarn {
-					log.Printf("Warning: keyframe interval too long: %v", interval)
-				}
-			}
-			g.lastKeyframeTime = now
-			g.stats.SetLastKeyframe(now)
+	if err := pkt.Unmarshal(data); err != nil {
+		return gst.FlowOK
+	}
+
+	// Increment stats
+	g.stats.IncrementPacketsOut()
+	g.stats.AddBytesEncoded(uint64(len(data)))
+
+	// Send to channel (non-blocking)
+	select {
+	case g.rtpChan <- &pkt:
+		// Log first 5 packets and then every 500th
+		count := g.stats.GetPacketsOut()
+		if count <= 5 || count%500 == 0 {
+			log.Printf("[GStreamer] RTP packet #%d (SSRC: %d, PT: %d, Seq: %d, Payload: %d bytes)",
+				count, pkt.SSRC, pkt.PayloadType, pkt.SequenceNumber, len(pkt.Payload))
 		}
-		
-		select {
-		case g.rtpChan <- &pkt:
-			g.stats.IncrementPacketsOut()
-			g.stats.AddBytesEncoded(uint64(len(mapping.Bytes())))
-		default:
-			g.stats.IncrementDroppedFrames()
+	default:
+		g.stats.IncrementDroppedFrames()
+	}
+
+	return gst.FlowOK
+}
+
+func (g *GStreamerPipeline) handleRTPSample(s *app.Sink, kind encoderKind) gst.FlowReturn {
+	// Track callback invocations
+	callCount := atomic.AddUint64(&g.rtpCallbackCount, 1)
+	if callCount == 1 || callCount%1000 == 0 {
+		log.Printf("[RTP Callback] handleRTPSample called (count: %d)", callCount)
+	}
+
+	sample := s.PullSample()
+	if sample == nil {
+		if callCount <= 5 {
+			log.Printf("[RTP Callback] sample is nil")
+		}
+		return gst.FlowOK
+	}
+	defer sample.Unref()
+
+	buf := sample.GetBuffer()
+	if buf == nil {
+		if callCount <= 5 {
+			log.Printf("[RTP Callback] buffer is nil")
+		}
+		return gst.FlowOK
+	}
+
+	mapping := buf.Map(gst.MapRead);
+	defer buf.Unmap()
+
+	var pkt rtp.Packet
+	if err := pkt.Unmarshal(mapping.Bytes()); err != nil {
+		if callCount <= 5 {
+			log.Printf("[RTP Callback] RTP unmarshal failed: %v (bytes len: %d)", err, len(mapping.Bytes()))
+		}
+		return gst.FlowOK
+	}
+
+	// Check for keyframe
+	if g.isKeyframe(&pkt, kind) {
+		now := time.Now()
+		if !g.lastKeyframeTime.IsZero() {
+			interval := now.Sub(g.lastKeyframeTime)
+			if interval > g.keyframeIntervalWarn {
+				log.Printf("Warning: keyframe interval too long: %v", interval)
+			}
+		}
+		g.lastKeyframeTime = now
+		g.stats.SetLastKeyframe(now)
+	}
+
+	select {
+	case g.rtpChan <- &pkt:
+		g.stats.IncrementPacketsOut()
+		g.stats.AddBytesEncoded(uint64(len(mapping.Bytes())))
+		if callCount == 1 || callCount%1000 == 0 {
+			log.Printf("[RTP Callback] Packet sent to channel (SSRC: %d, PT: %d, Seq: %d)",
+				pkt.SSRC, pkt.PayloadType, pkt.SequenceNumber)
+		}
+	default:
+		g.stats.IncrementDroppedFrames()
+		if callCount <= 5 {
+			log.Printf("[RTP Callback] Channel full, packet dropped")
 		}
 	}
-	
+
 	return gst.FlowOK
 }
 
@@ -798,8 +966,10 @@ func (g *GStreamerPipeline) monitorBus(bus *gst.Bus) {
 			return
 
 		case gst.MessageError:
-			err := msg.ParseError()
-			log.Printf("[H.264 Pipeline] ERROR from element '%s': %v", sourceName, err)
+			gerr := msg.ParseError()
+			// Get the debug info for more details
+			log.Printf("[H.264 Pipeline] ERROR from element '%s': %v", sourceName, gerr)
+			log.Printf("[H.264 Pipeline] Error details - Check if caps negotiation failed in encode branch")
 
 		case gst.MessageWarning:
 			err := msg.ParseWarning()

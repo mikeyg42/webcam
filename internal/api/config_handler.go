@@ -341,19 +341,19 @@ func (h *ConfigHandler) configToResponseFromConfig(cfg *config.Config) ConfigRes
 		},
 		Storage: StorageSettings{
 			MinIO: MinIOSettings{
-				Endpoint:        "localhost:9000",
-				AccessKeyID:     "minioadmin",
+				Endpoint:        cfg.Storage.MinIO.Endpoint,
+				AccessKeyID:     cfg.Storage.MinIO.AccessKeyID,
 				SecretAccessKey: "", // Don't send secret by default
-				Bucket:          "recordings",
-				UseSSL:          false,
+				Bucket:          cfg.Storage.MinIO.Bucket,
+				UseSSL:          cfg.Storage.MinIO.UseSSL,
 			},
 			Postgres: PostgresSettings{
-				Host:     "localhost",
-				Port:     5432,
-				Database: "recordings",
-				Username: "recorder",
+				Host:     cfg.Storage.Postgres.Host,
+				Port:     cfg.Storage.Postgres.Port,
+				Database: cfg.Storage.Postgres.Database,
+				Username: cfg.Storage.Postgres.Username,
 				Password: "", // Don't send password by default
-				SSLMode:  "disable",
+				SSLMode:  cfg.Storage.Postgres.SSLMode,
 			},
 		},
 		Tailscale: TailscaleSettings{
@@ -454,6 +454,24 @@ func (h *ConfigHandler) updateInternalConfig(req *ConfigResponse) {
 		}
 	}
 
+	// Update storage settings (preserve passwords if empty)
+	cfg.Storage.MinIO.Endpoint = req.Storage.MinIO.Endpoint
+	cfg.Storage.MinIO.AccessKeyID = req.Storage.MinIO.AccessKeyID
+	if req.Storage.MinIO.SecretAccessKey != "" {
+		cfg.Storage.MinIO.SecretAccessKey = req.Storage.MinIO.SecretAccessKey
+	}
+	cfg.Storage.MinIO.Bucket = req.Storage.MinIO.Bucket
+	cfg.Storage.MinIO.UseSSL = req.Storage.MinIO.UseSSL
+
+	cfg.Storage.Postgres.Host = req.Storage.Postgres.Host
+	cfg.Storage.Postgres.Port = req.Storage.Postgres.Port
+	cfg.Storage.Postgres.Database = req.Storage.Postgres.Database
+	cfg.Storage.Postgres.Username = req.Storage.Postgres.Username
+	if req.Storage.Postgres.Password != "" {
+		cfg.Storage.Postgres.Password = req.Storage.Postgres.Password
+	}
+	cfg.Storage.Postgres.SSLMode = req.Storage.Postgres.SSLMode
+
 	// Apply motion config updates to running detector
 	if h.motionDetector != nil {
 		h.motionDetector.UpdateConfig(&cfg.Motion)
@@ -512,9 +530,11 @@ func (h *ConfigHandler) saveConfig() error {
 			}
 		}
 
-		// Note: MinIO and PostgreSQL passwords are not stored in config struct
-		// They come from the frontend request directly and should be encrypted there
 	}
+
+	// Include storage passwords (these are stored in plain text in config)
+	configResp.Storage.Postgres.Password = h.config.Storage.Postgres.Password
+	configResp.Storage.MinIO.SecretAccessKey = h.config.Storage.MinIO.SecretAccessKey
 
 	// Convert config to JSON
 	data, err := json.MarshalIndent(configResp, "", "  ")

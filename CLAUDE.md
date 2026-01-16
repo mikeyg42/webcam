@@ -1,104 +1,117 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## Core Purpose
 
-## Project Overview
+**Persist all motion-triggered events (or all events per user config) with full-quality recordings.**
 
-This is a WebRTC-based security camera system with dual language architecture:
-- **Go backend** (`cmd/security-camera/main.go`): Handles camera capture, motion detection, video recording, and WebRTC signaling
-- **Node.js proxy server** (`server.js`): WebSocket proxy that manages rooms and forwards signaling to ion-sfu
-- **Web frontend** (`public/`): Browser-based video streaming interface using ion-sdk-js
+WebRTC streaming latency up to 20 seconds is acceptable. Dropped frames or reduced resolution in persisted recordings is NOT acceptable - this is a security camera system where evidence capture is paramount.
+
+## Project Summary
+
+WebRTC security camera: Go backend captures video/audio, streams via ion-sfu, React frontend displays. Uses Tailscale for networking (NO TURN servers). Live streaming works; recording pipeline partially working (first segments playable, keyframe rotation WIP).
+
+## Quick Start
+
+```bash
+./start-all.sh   # Starts everything: Docker (ion-sfu, postgres, minio) + Node proxy + Go app
+./stop-all.sh    # Clean shutdown
+```
+
+## Frontend Workflow
+
+Three-tab wizard flow with progressive unlocking:
+
+1. **Configuration** (always available)
+   - Video: resolution, framerate, camera selection
+   - Audio: enable/disable, microphone selection, sample rate
+   - Motion: sensitivity, cooldown, detection zones
+   - Recording: format, storage location, retention
+   - Storage: MinIO/PostgreSQL settings
+   - Tailscale: node configuration
+
+2. **Calibration** (unlocks after config saved)
+   - 10-second recording of "empty scene"
+   - Computes motion baseline (mean + stddev)
+   - Sets threshold for motion detection
+   - Must complete before live view
+
+3. **Camera** (unlocks after calibration)
+   - Live WebRTC stream view
+   - Recording controls (start/stop)
+   - Motion detection status indicator
 
 ## Architecture
 
-### Key Components
-
-**Go Application (`cmd/security-camera/main.go`)**:
-- `Application` struct: Main application coordinator with lifecycle management
-- `FrameProducer`: Captures video frames using OpenCV (gocv)
-- `RecordingManager`: Handles motion-triggered recording with cooldown periods
-- `rtcManager.Manager` (`internal/rtcManager/manager.go`): WebRTC peer connection management and signaling
-
-**Node.js Proxy (`server.js`)**:
-- `RoomManager`: Manages WebSocket rooms for multiple concurrent sessions
-- `Room` class: Handles ion-sfu connections per room with automatic reconnection
-- WebSocket proxy that forwards signaling between clients and ion-sfu
-
-**Internal Packages**:
-- `internal/config/`: Configuration management with environment variable overrides
-- `internal/motion/`: OpenCV-based motion detection using background subtraction
-- `internal/video/`: Video recording functionality
-- `internal/notification/`: Email notifications (currently disabled)
-
 ### Data Flow
-1. Go app captures camera frames and detects motion
-2. WebRTC streams are established through ion-sfu JSON-RPC signaling
-3. Node.js server proxies WebSocket connections between browser clients and ion-sfu
-4. Motion triggers video recording and notifications
-
-## Development Commands
-
-### Starting the System
-```bash
-# Start ion-sfu (Docker) and Node.js proxy server
-./startServers.sh
-
-# In separate terminal, start Go security camera
-go run cmd/security-camera/main.go
+```
+Camera → FrameProducer → FrameDistributor → motionChannel → Motion Detector → triggers recording
+                                          → recordChannel → RecordingService → AV1 encoder → MKV segments → MinIO
+                                          → WebRTC Track → ion-sfu → Browser
 ```
 
-### Go Development
+### Key Components
+- **Motion Detector** (`internal/motion/detector.go`): Background subtraction via OpenCV/gocv. Configurable sensitivity and cooldown.
+- **Recording Service** (`internal/recorder/`): AV1 encoding via GStreamer SVT-AV1, MKV muxing via ebml-go. First segments playable; keyframe forcing at rotation still needed.
+- **Audio** (`internal/` + frontend): Microphone capture supported, configurable in GUI. Not yet muxed into MKV recordings.
+
+### Key Files
+| Purpose | File |
+|---------|------|
+| App entry | `cmd/security-camera/main.go` |
+| WebRTC management | `internal/rtcManager/manager.go` |
+| Frame distribution | `internal/integration/pipeline.go` |
+| Recording | `internal/recorder/recorder.go` |
+| Motion detection | `internal/motion/detector.go` |
+| Calibration | `internal/calibration/service.go` |
+| Node proxy | `server.js` |
+| Frontend | `frontend/src/App.tsx` |
+
+### Configuration Files
+| Purpose | Location |
+|---------|----------|
+| Runtime config | `~/.webcam2/config.json` |
+| Credentials DB | `~/.webcam2/credentials.db` |
+| Docker services | `docker-compose.yml` |
+| ion-sfu config | `configs/sfu.toml` |
+
+## Constraints (Non-Negotiable)
+
+1. **Tailscale ONLY** - No TURN/STUN. All WebRTC uses Tailscale mesh.
+2. **ion-sfu** - SFU already integrated and working
+3. **macOS primary** - VideoToolbox encoding, AVFoundation permissions
+4. **Recording quality** - Full resolution, no dropped frames in persisted files
+5. **gocv/OpenCV** - Required for motion detection
+
+## Decisions Already Made
+
+- ion-sfu (not Janus, Mediasoup)
+- Tailscale (all TURN code removed in commit b3cbadd)
+- H.264 via GStreamer VideoToolbox for WebRTC streaming
+- AV1 via GStreamer SVT-AV1 for recordings (high quality, smaller files)
+- MKV container via ebml-go for recordings
+- React frontend (not vanilla JS)
+- PostgreSQL + MinIO for storage
+- AES-256-GCM for credential encryption
+
+## Status & Issues
+
+- **Current status**: `FUNCTIONALITY_STATUS.md`
+- **Known issues & fixes needed**: `KNOWN_ISSUES.md`
+- **Detailed recording fix plan**: `todo_goals.md`
+
+## Development
+
 ```bash
-# Build Go application
-go build ./cmd/security-camera
+# Build and run with debug
+go build ./cmd/security-camera && ./security-camera -debug
 
-# Run with debug mode
-go run cmd/security-camera/main.go -debug
-
-# Run with custom WebSocket address
-go run cmd/security-camera/main.go -addr localhost:3000
+# Headless testing mode (bypasses Tailscale auth)
+WEBRTC_PASSWORD=testing123 WEBRTC_USERNAME=testuser ./security-camera -debug -headless -testing
 ```
 
-### Node.js Development
-```bash
-# Install dependencies
-npm install
+## Code Style
 
-# Start Node.js server directly
-npm start
-# or
-node server.js
-
-# Development with auto-reload (if nodemon installed)
-nodemon server.js
-```
-
-### Dependencies
-- **Go**: Requires OpenCV (gocv), WebRTC (Pion), WebSocket (Gorilla)
-- **Docker**: ion-sfu runs in container (`pionwebrtc/ion-sfu:latest-jsonrpc`)
-- **Node.js**: Express server with WebSocket proxy functionality
-
-## Configuration
-
-### Key Configuration Files
-- `configs/sfu.toml`: ion-sfu configuration (port ranges, timeouts)
-- `internal/config/config.go`: Go application defaults with environment variable overrides
-
-### Environment Variables
-- `MAILSLURP_API_KEY`: Email notification API key
-- `NOTIFICATION_EMAIL`: Email recipient for motion alerts
-- `PORT`: Node.js server port (default: 3000)
-- `ION_SFU_URL`: ion-sfu WebSocket URL (default: ws://localhost:7000/ws)
-
-### Networking
-- **Tailscale required**: All WebRTC connections use Tailscale for secure mesh networking
-- UDP port range: 5000-5200 for WebRTC media
-
-## Testing and Development Notes
-
-- Motion detection uses background subtraction with configurable thresholds
-- Video recording has cooldown periods to prevent excessive file creation
-- WebRTC connection includes automatic reconnection and health monitoring
-- System supports multiple concurrent room-based video sessions
-- All components use context-based cancellation for clean shutdown
-- you should be stopping and starting this code with stop-all.sh and start-all.sh as much as possible, to ensure complete, reliable, consistent tear down and run  process
+- Comments explain HOW, not change history
+- Error handling: return early, wrap with context
+- Logging: structured with component prefixes `[Pipeline]`, `[WebRTC]`, `[Motion]`
+- Use context.Context for cancellation throughout

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -177,6 +178,7 @@ type Manager struct {
 	}
 	rtcpFeedbackBuffer *RTCPFeedbackBuffer
 	signalingReady     atomic.Bool // Track when initial signaling setup is complete
+	signalingReadyTime time.Time   // When signaling was marked ready (for cooldown)
 
 	// External RTP source support (GStreamer pipeline)
 	videoTrack               *webrtc.TrackLocalStaticRTP
@@ -219,6 +221,7 @@ func (h *rtcHandler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonr
 
 	switch req.Method {
 	case "offer":
+		log.Printf("[rtcHandler] Received offer with request ID: %v (isNotification: %v)", req.ID, req.Notif)
 		var offer webrtc.SessionDescription
 		if err := json.Unmarshal(*req.Params, &offer); err != nil {
 			conn.ReplyWithError(ctx, req.ID, &jsonrpc2.Error{
@@ -228,7 +231,8 @@ func (h *rtcHandler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonr
 			return
 		}
 
-		if err := h.manager.handleOffer(ctx, &offer); err != nil {
+		answer, err := h.manager.handleOfferAndGetAnswer(ctx, &offer)
+		if err != nil {
 			conn.ReplyWithError(ctx, req.ID, &jsonrpc2.Error{
 				Code:    jsonrpc2.CodeInternalError,
 				Message: err.Error(),
@@ -236,7 +240,33 @@ func (h *rtcHandler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonr
 			return
 		}
 
-		conn.Reply(ctx, req.ID, nil)
+		// Convert answer to JSON-safe format with string type wrapped in "desc" field
+		// Ion-sfu expects: {"desc": {"type": "answer", "sdp": "..."}}
+		answerParams := struct {
+			Desc struct {
+				Type string `json:"type"`
+				SDP  string `json:"sdp"`
+			} `json:"desc"`
+		}{
+			Desc: struct {
+				Type string `json:"type"`
+				SDP  string `json:"sdp"`
+			}{
+				Type: answer.Type.String(),
+				SDP:  answer.SDP,
+			},
+		}
+		log.Printf("[rtcHandler] Answer type: raw=%d, string=%q", answer.Type, answer.Type.String())
+
+		// If this is a notification (no ID), use Notify to send answer
+		// If it's a call (has ID), reply with the answer
+		if req.Notif {
+			log.Println("[rtcHandler] Offer was a notification, sending answer via Notify")
+			h.manager.rpcConn.Notify(ctx, "answer", answerParams)
+		} else {
+			log.Printf("[rtcHandler] Offer was a call, replying with answer (ID: %v)", req.ID)
+			conn.Reply(ctx, req.ID, answerParams)
+		}
 
 	case "answer":
 		var answer webrtc.SessionDescription
@@ -274,10 +304,10 @@ func (h *rtcHandler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonr
 func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
 	ctx, cancel := context.WithCancel(appCtx)
 
-	// TODO: Re-enable Tailscale requirement for production
-	// TEMPORARY: Bypassed for local development/testing
+	// Skip Tailscale initialization entirely in dev mode
+	tailscaleDevMode := os.Getenv("TAILSCALE_DEV_MODE") == "true"
 	var tailscaleManager *tailscale.TailscaleManager
-	if myconfig.TailscaleConfig.Enabled {
+	if myconfig.TailscaleConfig.Enabled && !tailscaleDevMode {
 		if err := validate.ValidateTailscaleConfig(&myconfig.TailscaleConfig); err != nil {
 			cancel()
 			return nil, fmt.Errorf("tailscale configuration invalid: %w", err)
@@ -290,6 +320,8 @@ func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websock
 			return nil, fmt.Errorf("failed to initialize tailscale: %w", err)
 		}
 		log.Println("Tailscale networking initialized for WebRTC")
+	} else if tailscaleDevMode {
+		log.Println("Skipping Tailscale initialization (dev mode - using localhost)")
 	} else {
 		log.Println("WARNING: Running WebRTC without Tailscale (local development only)")
 	}
@@ -477,12 +509,16 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	})
 
 	// Rewrite host candidates to Tailscale IP (pin to tailnet)
-	if m.tailscaleManager != nil {
+	// Skip in dev mode (TAILSCALE_DEV_MODE=true) for local testing with ion-sfu
+	tailscaleDevMode := os.Getenv("TAILSCALE_DEV_MODE") == "true"
+	if m.tailscaleManager != nil && !tailscaleDevMode {
 		tsIP := m.tailscaleManager.GetLocalTailscaleIP()
 		if tsIP != "" {
 			settingEngine.SetNAT1To1IPs([]string{tsIP}, webrtc.ICECandidateTypeHost)
 			log.Printf("ICE configured to use Tailscale IP: %s", tsIP)
 		}
+	} else if tailscaleDevMode {
+		log.Println("Skipping Tailscale NAT1To1 ICE configuration (dev mode - using localhost)")
 	} else {
 		log.Println("Skipping Tailscale ICE configuration (Tailscale disabled)")
 	}
@@ -517,32 +553,10 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 		return nil, fmt.Errorf("failed to create peer connection: %v", err)
 	}
 
-	// Add video transceiver for H.264/H.265 from GStreamer (not VP9)
-	_, err = peerConnection.AddTransceiverFromKind(
-		webrtc.RTPCodecTypeVideo,
-		webrtc.RTPTransceiverInit{
-			Direction: webrtc.RTPTransceiverDirectionSendonly,
-		},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to add video transceiver: %v", err)
-	}
-
-	// NOTE: Codec preferences are NOT set here because we use GStreamer's H.264/H.265 encoder
-	// The actual codec is determined by SetupPassthroughTracks() which creates tracks
-	// matching GStreamer's encoder output (H264, H265, or AV1)
-	// WebRTC will automatically negotiate based on the track's MIME type
-	log.Println("Video transceiver added - codec will be determined by GStreamer encoder output")
-
-	// Add audio transceiver
-	if _, err := peerConnection.AddTransceiverFromKind(
-		webrtc.RTPCodecTypeAudio,
-		webrtc.RTPTransceiverInit{
-			Direction: webrtc.RTPTransceiverDirectionSendonly,
-		},
-	); err != nil {
-		return nil, fmt.Errorf("failed to add audio transceiver: %v", err)
-	}
+	// NOTE: Transceivers are NOT added here - they are created by SetupPassthroughTracks()
+	// when adding the actual tracks with the correct codec from GStreamer's encoder output.
+	// This avoids duplicate transceivers which cause codec negotiation issues.
+	log.Println("PeerConnection created - tracks will be added by SetupPassthroughTracks()")
 
 	// Store peer connection in Manager
 	m.PeerConnection = peerConnection
@@ -881,6 +895,15 @@ func (m *Manager) handleNegotiationNeeded() error {
 		return nil // Defer negotiation until initial signaling is complete
 	}
 
+	// Add cooldown after initial signaling to prevent spurious renegotiation
+	// Tracks are already in the initial offer, so immediate renegotiation is unnecessary
+	timeSinceSignaling := time.Since(m.signalingReadyTime)
+	if timeSinceSignaling < 2*time.Second {
+		log.Printf("[handleNegotiationNeeded] Skipping renegotiation within cooldown period (%.1fs since signaling)",
+			timeSinceSignaling.Seconds())
+		return nil
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -954,34 +977,79 @@ func (m *Manager) SetupSignaling() error {
 	// Log the negotiated codecs
 	m.logNegotiatedCodecs("SetupSignaling")
 
+	// Re-extract SSRC and PayloadType now that SDP negotiation is complete
+	// These values are only populated after SetRemoteDescription processes the SDP answer
+	m.updateNegotiatedParameters()
+
 	// Mark signaling as ready for future negotiations
+	m.signalingReadyTime = time.Now()
 	m.signalingReady.Store(true)
 	log.Println("[SetupSignaling] Successfully completed signaling handshake")
 	return nil
 }
 
 func (m *Manager) handleOffer(ctx context.Context, offer *webrtc.SessionDescription) error {
-	// is this right?
+	_, err := m.handleOfferAndGetAnswer(ctx, offer)
+	return err
+}
+
+// handleOfferAndGetAnswer processes an incoming offer and returns the answer
+func (m *Manager) handleOfferAndGetAnswer(ctx context.Context, offer *webrtc.SessionDescription) (*webrtc.SessionDescription, error) {
+	log.Println("[handleOfferAndGetAnswer] Starting to process incoming offer")
+	// Debug: log the incoming offer SDP to understand what ion-sfu is asking for
+	sdpLines := strings.Count(offer.SDP, "\r\n") + strings.Count(offer.SDP, "\n")
+	hasVideo := strings.Contains(offer.SDP, "m=video")
+	hasAudio := strings.Contains(offer.SDP, "m=audio")
+	hasApp := strings.Contains(offer.SDP, "m=application")
+	log.Printf("[handleOfferAndGetAnswer] Incoming offer: %d lines, hasVideo=%v, hasAudio=%v, hasApp=%v", sdpLines, hasVideo, hasAudio, hasApp)
+
 	if err := validateSDP(offer); err != nil {
-		return fmt.Errorf("remote SDP validation failed: %w", err)
+		log.Printf("[handleOfferAndGetAnswer] SDP validation failed: %v", err)
+		return nil, fmt.Errorf("remote SDP validation failed: %w", err)
+	}
+	log.Println("[handleOfferAndGetAnswer] SDP validation passed")
+
+	// Check signaling state - if we're in have-local-offer, this is a glare condition
+	currentState := m.PeerConnection.SignalingState()
+	log.Printf("[handleOfferAndGetAnswer] Current signaling state: %s", currentState)
+
+	if currentState == webrtc.SignalingStateHaveLocalOffer {
+		// Glare: we sent an offer and received one simultaneously
+		// We need to rollback our offer first (polite peer behavior)
+		log.Println("[handleOfferAndGetAnswer] Glare detected - rolling back our offer")
+		rollback := webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}
+		if err := m.PeerConnection.SetLocalDescription(rollback); err != nil {
+			log.Printf("[handleOfferAndGetAnswer] Rollback failed: %v", err)
+			return nil, fmt.Errorf("rollback failed: %w", err)
+		}
 	}
 
 	if err := m.PeerConnection.SetRemoteDescription(*offer); err != nil {
-		return err
+		log.Printf("[handleOfferAndGetAnswer] SetRemoteDescription failed: %v", err)
+		return nil, err
 	}
 
 	answer, err := m.PeerConnection.CreateAnswer(nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	// Debug: log the answer SDP we're creating
+	answerLines := strings.Count(answer.SDP, "\r\n") + strings.Count(answer.SDP, "\n")
+	answerHasVideo := strings.Contains(answer.SDP, "m=video")
+	answerHasAudio := strings.Contains(answer.SDP, "m=audio")
+	answerHasApp := strings.Contains(answer.SDP, "m=application")
+	log.Printf("[handleOfferAndGetAnswer] Created answer: %d lines, hasVideo=%v, hasAudio=%v, hasApp=%v", answerLines, answerHasVideo, answerHasAudio, answerHasApp)
 
 	if err := m.PeerConnection.SetLocalDescription(answer); err != nil {
-		return err
+		return nil, err
 	}
 	// Log the negotiated codecs
 	m.logNegotiatedCodecs("handleOffer")
 
-	return m.rpcConn.Call(ctx, "answer", answer, nil)
+	// Re-extract SSRC and PayloadType after renegotiation
+	m.updateNegotiatedParameters()
+
+	return &answer, nil
 }
 
 // handleTrack is called when a remote track arrives from the PeerConnection.
@@ -1219,6 +1287,47 @@ func (m *Manager) setupAudioTrack() (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSen
 	}
 
 	return audioTrack, audioRtpSender, nil
+}
+
+// updateNegotiatedParameters re-extracts SSRC and PayloadType from RTP senders
+// after SDP negotiation completes. These values are only available after SetRemoteDescription.
+func (m *Manager) updateNegotiatedParameters() {
+	if m.PeerConnection == nil {
+		log.Println("[updateNegotiatedParameters] PeerConnection is nil, skipping")
+		return
+	}
+
+	senders := m.PeerConnection.GetSenders()
+	log.Printf("[updateNegotiatedParameters] Checking %d senders for negotiated parameters", len(senders))
+
+	for _, sender := range senders {
+		if sender == nil || sender.Track() == nil {
+			continue
+		}
+
+		params := sender.GetParameters()
+		trackKind := sender.Track().Kind().String()
+
+		if trackKind == "video" {
+			if len(params.Encodings) > 0 && params.Encodings[0].SSRC != 0 {
+				m.negotiatedVideoSSRC = uint32(params.Encodings[0].SSRC)
+				log.Printf("[updateNegotiatedParameters] Updated video SSRC: %d", m.negotiatedVideoSSRC)
+			}
+			if len(params.Codecs) > 0 {
+				m.negotiatedVideoPayloadType = uint8(params.Codecs[0].PayloadType)
+				log.Printf("[updateNegotiatedParameters] Updated video PayloadType: %d", m.negotiatedVideoPayloadType)
+			}
+		} else if trackKind == "audio" {
+			if len(params.Encodings) > 0 && params.Encodings[0].SSRC != 0 {
+				m.negotiatedAudioSSRC = uint32(params.Encodings[0].SSRC)
+				log.Printf("[updateNegotiatedParameters] Updated audio SSRC: %d", m.negotiatedAudioSSRC)
+			}
+			if len(params.Codecs) > 0 {
+				m.negotiatedAudioPayloadType = uint8(params.Codecs[0].PayloadType)
+				log.Printf("[updateNegotiatedParameters] Updated audio PayloadType: %d", m.negotiatedAudioPayloadType)
+			}
+		}
+	}
 }
 
 func (m *Manager) handleMediaPackets(srcTrack mediadevices.Track, localTrack *webrtc.TrackLocalStaticRTP, ssrc uint32, mtu int) {
@@ -2065,6 +2174,13 @@ func (m *Manager) processRTCPWithBuffer(data []byte, attributes interface{}, med
 func (m *Manager) handleConnectionFailure() error {
 	log.Println("[handleConnectionFailure] Starting connection failure recovery process")
 
+	// Check signaling state BEFORE taking the lock to avoid blocking
+	signalingState := m.PeerConnection.SignalingState()
+	if signalingState != webrtc.SignalingStateStable {
+		log.Printf("[handleConnectionFailure] Cannot restart - signaling state is %s (must be stable)", signalingState)
+		return fmt.Errorf("cannot create offer in signaling state: %s", signalingState)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -2084,6 +2200,13 @@ func (m *Manager) handleConnectionFailure() error {
 	if currentState == webrtc.PeerConnectionStateConnected || currentState == webrtc.PeerConnectionStateConnecting {
 		log.Println("[handleConnectionFailure] Connection recovered during backoff, canceling restart")
 		m.connectionAttempts = 0 // Reset on recovery
+		return nil
+	}
+
+	// Re-check signaling state after backoff
+	signalingState = m.PeerConnection.SignalingState()
+	if signalingState != webrtc.SignalingStateStable {
+		log.Printf("[handleConnectionFailure] Signaling state changed to %s during backoff, aborting", signalingState)
 		return nil
 	}
 
@@ -2117,12 +2240,46 @@ func (m *Manager) handleConnectionFailure() error {
 		return fmt.Errorf("rpcConn is not initialized")
 	}
 
-	// Send restart offer using jsonrpc2
-	if err := m.rpcConn.Notify(m.ctx, "offer", m.PeerConnection.LocalDescription()); err != nil {
-		return fmt.Errorf("failed to notify remote peer with restart offer: %v", err)
+	// Send restart offer using ion-sfu format and get the answer
+	params := struct {
+		SID   string `json:"sid"`
+		Offer struct {
+			Type string `json:"type"`
+			SDP  string `json:"sdp"`
+		} `json:"offer"`
+	}{
+		SID: "cameraRoom",
+		Offer: struct {
+			Type string `json:"type"`
+			SDP  string `json:"sdp"`
+		}{
+			Type: offer.Type.String(),
+			SDP:  offer.SDP,
+		},
 	}
 
-	log.Println("[handleConnectionFailure] ICE restart offer sent successfully")
+	var answer webrtc.SessionDescription
+	if err := m.rpcConn.Call(m.ctx, "offer", params, &answer); err != nil {
+		// Handle "offered ignored" - this is a glare condition where ion-sfu also sent an offer
+		if strings.Contains(err.Error(), "offered ignored") {
+			log.Println("[handleConnectionFailure] Offer ignored by ion-sfu (glare), rolling back to stable state")
+			// Rollback our local description to get back to stable state
+			rollback := webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}
+			if rbErr := m.PeerConnection.SetLocalDescription(rollback); rbErr != nil {
+				log.Printf("[handleConnectionFailure] Rollback failed: %v", rbErr)
+			}
+			// ion-sfu will send us an offer which we'll handle in handleOffer
+			return nil
+		}
+		return fmt.Errorf("failed to send restart offer: %v", err)
+	}
+
+	// Set the answer from ion-sfu
+	if err := m.PeerConnection.SetRemoteDescription(answer); err != nil {
+		return fmt.Errorf("failed to set remote description from restart answer: %v", err)
+	}
+
+	log.Println("[handleConnectionFailure] ICE restart completed successfully")
 
 	// Start monitoring for restart success
 	go m.monitorRestartProgress()
@@ -2167,6 +2324,8 @@ func (m *Manager) handleDisconnection() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	log.Println("[handleDisconnection] Starting cleanup and reconnection...")
+
 	// Cleanup ConnectionDoctor resources
 	if m.ConnectionDoctor != nil {
 		m.ConnectionDoctor.Shutdown()
@@ -2187,11 +2346,31 @@ func (m *Manager) handleDisconnection() error {
 		m.PeerConnection = nil
 	}
 
-	// Wait briefly before reconnecting.
-	time.Sleep(2 * time.Second)
+	// Close the JSON-RPC connection to ion-sfu - this is critical!
+	// Without this, ion-sfu keeps the old session alive and rejects new joins
+	// with "rtc transport already exists"
+	if m.rpcConn != nil {
+		log.Println("[handleDisconnection] Closing ion-sfu RPC connection...")
+		m.rpcConn.Close()
+		m.rpcConn = nil
+	}
+
+	// Close the underlying WebSocket connection to ion-sfu
+	if m.wsConnection != nil {
+		log.Println("[handleDisconnection] Closing ion-sfu WebSocket connection...")
+		m.wsConnection.Close()
+		m.wsConnection = nil
+	}
+
+	// Reset signaling ready state
+	m.signalingReady.Store(false)
+
+	// Wait for ion-sfu to clean up the session
+	log.Println("[handleDisconnection] Waiting for ion-sfu session cleanup...")
+	time.Sleep(3 * time.Second)
 
 	// Reinitialize your connection.
-
+	log.Println("[handleDisconnection] Reinitializing WebRTC connection...")
 	codecSelector, err := m.Initialize()
 	if err != nil {
 		return fmt.Errorf("failed to reinitialize: %v", err)
@@ -2204,6 +2383,7 @@ func (m *Manager) handleDisconnection() error {
 
 	// Setup your signaling once again. This might include re-establishing
 	// the JSON-RPC connection if necessary.
+	log.Println("[handleDisconnection] Re-establishing signaling...")
 	return m.SetupSignaling()
 }
 
@@ -2275,8 +2455,10 @@ func validateSDP(sd *webrtc.SessionDescription) error {
 	if fingerprint == "" {
 		return fmt.Errorf("fingerprint for DTLS is empty")
 	}
-	if !hasAudio && !hasVideo {
-		return fmt.Errorf("no audio or video tracks found in SDP")
+	// Note: We don't require audio/video - ion-sfu may send offers without traditional media
+	// sections for subscription negotiation purposes
+	if !hasAudio && !hasVideo && mediaCount == 0 {
+		return fmt.Errorf("SDP has no media sections at all")
 	}
 
 	log.Printf("SDP Feedback - Video TWCC: %v, Audio TWCC: %v, Audio NACK: %v",
@@ -2375,19 +2557,48 @@ func (m *Manager) SetMicrophone(device mediadevices.MediaDeviceInfo) {
 }
 
 func (m *Manager) SendOffer(offer *webrtc.SessionDescription) error {
+	// ion-sfu expects nested structure with sid and offer object
 	params := struct {
-		SDP  string `json:"sdp"`
-		Type string `json:"type"`
+		SID   string `json:"sid"`
+		Offer struct {
+			Type string `json:"type"`
+			SDP  string `json:"sdp"`
+		} `json:"offer"`
 	}{
-		SDP:  offer.SDP,
-		Type: offer.Type.String(),
+		SID: "cameraRoom",
+		Offer: struct {
+			Type string `json:"type"`
+			SDP  string `json:"sdp"`
+		}{
+			Type: offer.Type.String(),
+			SDP:  offer.SDP,
+		},
 	}
 
-	var result interface{}
-	if err := m.rpcConn.Call(m.ctx, "offer", params, &result); err != nil {
+	log.Printf("[SendOffer] Sending renegotiation offer to ion-sfu (type: %s)", offer.Type.String())
+
+	var answer webrtc.SessionDescription
+	if err := m.rpcConn.Call(m.ctx, "offer", params, &answer); err != nil {
+		// Handle "offered ignored" - this is a glare condition where ion-sfu also sent an offer
+		if strings.Contains(err.Error(), "offered ignored") {
+			log.Println("[SendOffer] Offer ignored by ion-sfu (glare), rolling back to stable state")
+			// Rollback our local description to get back to stable state
+			rollback := webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}
+			if rbErr := m.PeerConnection.SetLocalDescription(rollback); rbErr != nil {
+				log.Printf("[SendOffer] Rollback failed: %v", rbErr)
+			}
+			// ion-sfu will send us an offer which we'll handle in handleOffer
+			return nil
+		}
 		return fmt.Errorf("offer request failed: %v", err)
 	}
 
+	// Set the answer from ion-sfu
+	if err := m.PeerConnection.SetRemoteDescription(answer); err != nil {
+		return fmt.Errorf("failed to set remote description from renegotiation answer: %v", err)
+	}
+
+	log.Println("[SendOffer] Renegotiation completed successfully")
 	return nil
 }
 

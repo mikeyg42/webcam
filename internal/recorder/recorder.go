@@ -113,6 +113,11 @@ func NewRecordingService(cfg *config.Config, logger recorderlog.Logger) (*Record
 
 	// Segmenter
 	segmenter := pipeline.NewSegmenter(cfg.Recording.SegmentDuration, cfg.Recording.TempDir)
+	if err := segmenter.Initialize(); err != nil {
+		return nil, fmt.Errorf("failed to initialize segmenter: %w", err)
+	}
+	// Set video config for MKV muxing
+	segmenter.SetVideoConfig(cfg.Video.Width, cfg.Video.Height, float64(cfg.Video.FrameRate))
 
 	// Prepare encoder config template. The Width/Height values here are from config
 	// but may be overridden during lazy initialization if the actual camera produces
@@ -334,6 +339,9 @@ func (r *RecordingService) ensureEncoder(frame *buffer.Frame) error {
 	r.encoder = enc
 	r.encoderInitialized.Store(true)
 
+	// Update segmenter with actual video dimensions for MKV muxing
+	r.segmenter.SetVideoConfig(actualWidth, actualHeight, actualConfig.FrameRate)
+
 	r.logger.Info("Encoder initialized successfully",
 		recorderlog.Int("width", actualWidth),
 		recorderlog.Int("height", actualHeight))
@@ -554,11 +562,11 @@ func (r *RecordingService) checkSegmentRotation() {
 			r.logger.Debug("Rotating segment",
 				recorderlog.String("recording_id", rec.ID),
 				recorderlog.String("segment_id", seg.ID))
-			// Upload in background
-			go r.uploadSegment(rec, seg)
-			r.metrics.SegmentsCreated.Add(1)
-			// Start next segment
+			// Start next segment FIRST - this finalizes the old segment (renames .tmp to .mkv)
 			r.segmenter.NewSegment(rec.ID)
+			r.metrics.SegmentsCreated.Add(1)
+			// Upload in background AFTER finalization completes
+			go r.uploadSegment(rec, seg)
 		}
 	}
 }

@@ -213,91 +213,96 @@ class RoomManager {
 class Room {
     constructor(roomId) {
         this.id = roomId;
-        // Map<clientId, WebSocket>
+        // Map<clientId, { ws: WebSocket, ionWs: WebSocket, ionWsState: string }>
         this.clients = new Map();
-        this.ionWs = null;
-        this.ionWsState = 'closed'; // 'connecting', 'open', 'closed', 'reconnecting'
-        this.reconnectAttempts = 0;
-        this.pendingMessages = []; // Messages from clients waiting for ion connection
     }
 
-    addClient(client) {
-        this.clients.set(client.id, client);
-        client.roomId = this.id;
-        client.isAlive = true; // For keepalive
+    addClient(clientWs) {
+        const clientId = clientWs.id;
 
-        // Ensure ion connection is established for this room
-        this.ensureIonConnection();
+        // Create a dedicated ion-sfu connection for this client
+        const clientData = {
+            ws: clientWs,
+            ionWs: null,
+            ionWsState: 'closed',
+            reconnectAttempts: 0,
+            pendingMessages: []
+        };
+
+        this.clients.set(clientId, clientData);
+        clientWs.roomId = this.id;
+        clientWs.isAlive = true;
+
+        // Create ion-sfu connection for this specific client
+        this._connectClientToIonSfu(clientId);
     }
 
-    removeClient(client) {
-        this.clients.delete(client.id);
+    removeClient(clientWs) {
+        const clientData = this.clients.get(clientWs.id);
+        if (clientData) {
+            // Close the client's dedicated ion-sfu connection
+            if (clientData.ionWs) {
+                clientData.ionWsState = 'closed';
+                clientData.ionWs.close();
+            }
+            this.clients.delete(clientWs.id);
+        }
     }
 
     isEmpty() {
         return this.clients.size === 0;
     }
 
-    broadcast(message, senderClient = null) {
-        this.clients.forEach(client => {
-            // Optionally skip broadcasting back to the sender
-            if (client !== senderClient && client.readyState === WebSocket.OPEN) {
-                try {
-                    // Ensure message is sent as text
-                    const messageText = typeof message === 'string' ? message : String(message);
-                    client.send(messageText);
-                } catch (error) {
-                    rateLimitedLog.error(`broadcast-${this.id}`, `Error broadcasting to client in room ${this.id}:`, error.message);
+    forwardToIon(message, clientId) {
+        const clientData = this.clients.get(clientId);
+        if (!clientData) return;
+
+        // Debug logging
+        try {
+            const msgStr = Buffer.isBuffer(message) ? message.toString('utf8') : String(message);
+            const parsed = JSON.parse(msgStr);
+            if (parsed.method) {
+                console.log(`[client ${clientId.slice(0,8)} -> ion-sfu] Method: ${parsed.method}`);
+                // Log full answer payload for debugging SDPType issue
+                if (parsed.method === 'answer') {
+                    console.log(`[DEBUG] Answer params type: ${typeof parsed.params}`);
+                    console.log(`[DEBUG] Answer params.type: ${parsed.params?.type} (type: ${typeof parsed.params?.type})`);
+                    console.log(`[DEBUG] Full answer JSON: ${JSON.stringify(parsed)}`);
                 }
             }
-        });
-    }
+        } catch (e) {}
 
-    forwardToIon(message) {
-         if (this.ionWs && this.ionWsState === 'open') {
-            // Ensure message is sent as text to ion-sfu
-           // const messageText = Buffer.isBuffer(message) ? message.toString('utf8') :
-                //               typeof message === 'string' ? message : String(message);
-           // this.ionWs.send(messageText);
-           this.ionWs.send(message);
+        if (clientData.ionWs && clientData.ionWsState === 'open') {
+            clientData.ionWs.send(message);
         } else {
-            // Store as text for pending messages
-            //const messageText = Buffer.isBuffer(message) ? message.toString('utf8') :
-           //                   typeof message === 'string' ? message : String(message);
-            //this.pendingMessages.push(messageText);
-            this.pendingMessages.push(message)
-             // Attempt to connect if not already trying
-            if (this.ionWsState === 'closed') {
-                 this.ensureIonConnection();
+            clientData.pendingMessages.push(message);
+            if (clientData.ionWsState === 'closed') {
+                this._connectClientToIonSfu(clientId);
             }
         }
     }
 
-    ensureIonConnection() {
-        if (this.ionWsState === 'closed' || this.ionWsState === 'reconnecting') {
-            this._connectToIonSfu();
-        }
-    }
+    _connectClientToIonSfu(clientId) {
+        const clientData = this.clients.get(clientId);
+        if (!clientData) return;
+        if (clientData.ionWsState === 'connecting' || clientData.ionWsState === 'open') return;
 
-    _connectToIonSfu() {
-        if (this.ionWsState === 'connecting' || this.ionWsState === 'open') return; // Already connecting or open
+        console.log(`Connecting client ${clientId.slice(0,8)} to ion-sfu for room: ${this.id}`);
+        clientData.ionWsState = 'connecting';
+        clientData.ionWs = new WebSocket(config.ionSfu.url);
 
-        console.log(`Connecting to ion-sfu for room: ${this.id} (Attempt: ${this.reconnectAttempts + 1})`);
-        this.ionWsState = 'connecting';
-        this.ionWs = new WebSocket(config.ionSfu.url);
-
-        this.ionWs.on('open', () => {
-            console.log(`Connected to ion-sfu for room: ${this.id}`);
-            this.ionWsState = 'open';
-            this.reconnectAttempts = 0;
+        clientData.ionWs.on('open', () => {
+            console.log(`Client ${clientId.slice(0,8)} connected to ion-sfu for room: ${this.id}`);
+            clientData.ionWsState = 'open';
+            clientData.reconnectAttempts = 0;
 
             // Send pending messages
-            this.pendingMessages.forEach(msg => this.ionWs.send(msg));
-            this.pendingMessages = [];
+            clientData.pendingMessages.forEach(msg => clientData.ionWs.send(msg));
+            clientData.pendingMessages = [];
         });
 
-        this.ionWs.on('message', (message) => {
-            // Ensure message is sent as text to browser clients
+        clientData.ionWs.on('message', (message) => {
+            // Route all messages from ion-sfu directly to this client
             let messageText;
             if (Buffer.isBuffer(message)) {
                 messageText = message.toString('utf8');
@@ -306,49 +311,61 @@ class Room {
             } else {
                 messageText = String(message);
             }
-            // Broadcast message from ion-sfu to all clients in this room
-            this.broadcast(messageText);
+
+            // Debug logging
+            try {
+                const parsed = JSON.parse(messageText);
+                if (parsed.method) {
+                    console.log(`[ion-sfu -> client ${clientId.slice(0,8)}] Method: ${parsed.method}`);
+                } else if (parsed.result !== undefined || parsed.error !== undefined) {
+                    console.log(`[ion-sfu -> client ${clientId.slice(0,8)}] Response`);
+                }
+            } catch (e) {}
+
+            // Send directly to this client only
+            if (clientData.ws && clientData.ws.readyState === WebSocket.OPEN) {
+                clientData.ws.send(messageText);
+            }
         });
 
-        this.ionWs.on('close', () => {
-            console.log(`ion-sfu connection closed for room: ${this.id}`);
-            this.ionWs = null; // Clear the closed socket
-            if (this.isEmpty()) {
-                 console.log(`Room ${this.id} is empty, not reconnecting ion-sfu.`);
-                 this.ionWsState = 'closed';
-                 return;
-            }
+        clientData.ionWs.on('close', () => {
+            console.log(`ion-sfu connection closed for client ${clientId.slice(0,8)} in room: ${this.id}`);
+            clientData.ionWs = null;
 
-            if (this.reconnectAttempts < config.ionSfu.maxReconnectAttempts) {
-                this.reconnectAttempts++;
-                this.ionWsState = 'reconnecting';
-                console.log(`Attempting reconnect to ion-sfu for room ${this.id} in ${config.ionSfu.reconnectInterval}ms (Attempt: ${this.reconnectAttempts})`);
-                setTimeout(() => this._connectToIonSfu(), config.ionSfu.reconnectInterval);
+            // Don't reconnect if client is gone
+            if (!this.clients.has(clientId)) return;
+
+            if (clientData.reconnectAttempts < config.ionSfu.maxReconnectAttempts) {
+                clientData.reconnectAttempts++;
+                clientData.ionWsState = 'reconnecting';
+                console.log(`Reconnecting client ${clientId.slice(0,8)} to ion-sfu (Attempt: ${clientData.reconnectAttempts})`);
+                setTimeout(() => this._connectClientToIonSfu(clientId), config.ionSfu.reconnectInterval);
             } else {
-                console.error(`Max reconnect attempts reached for ion-sfu in room: ${this.id}`);
-                this.ionWsState = 'closed';
-                // Notify clients in the room about the failure?
-                 this.broadcast(JSON.stringify({ type: 'error', message: 'Media server connection failed permanently.' }));
+                console.error(`Max reconnect attempts for client ${clientId.slice(0,8)} in room: ${this.id}`);
+                clientData.ionWsState = 'closed';
+                if (clientData.ws && clientData.ws.readyState === WebSocket.OPEN) {
+                    clientData.ws.send(JSON.stringify({ type: 'error', message: 'Media server connection failed.' }));
+                }
             }
         });
 
-        this.ionWs.on('error', (error) => {
-            rateLimitedLog.error(`ion-sfu-${this.id}`, `ion-sfu connection error for room ${this.id}:`, error.message);
-             // Close event will likely follow, triggering reconnect logic
-             if (this.ionWsState !== 'reconnecting' && this.ionWsState !== 'closed') {
-                this.ionWs.close(); // Ensure close is triggered if error doesn't auto-close
-             }
+        clientData.ionWs.on('error', (error) => {
+            rateLimitedLog.error(`ion-sfu-${clientId.slice(0,8)}`, `ion-sfu error for client ${clientId.slice(0,8)}:`, error.message);
+            if (clientData.ionWsState !== 'reconnecting' && clientData.ionWsState !== 'closed') {
+                clientData.ionWs.close();
+            }
         });
     }
 
     closeIonConnection() {
-        if (this.ionWs) {
-            console.log(`Closing ion-sfu connection explicitly for room: ${this.id}`);
-             // Prevent automatic reconnection by setting state first
-            this.ionWsState = 'closed';
-            this.ionWs.close();
-            this.ionWs = null;
-        }
+        // Close all client ion-sfu connections
+        this.clients.forEach((clientData, clientId) => {
+            if (clientData.ionWs) {
+                console.log(`Closing ion-sfu connection for client ${clientId.slice(0,8)}`);
+                clientData.ionWsState = 'closed';
+                clientData.ionWs.close();
+            }
+        });
     }
 }
 
@@ -410,7 +427,7 @@ wss.on('connection', (ws, req) => {
     ws.on('message', (message) => {
          // Ensure message is Buffer or string before forwarding
         if (Buffer.isBuffer(message) || typeof message === 'string') {
-             room.forwardToIon(message);
+             room.forwardToIon(message, clientId);
         } else {
              console.warn(`Received non-forwardable message type from ${clientId}: ${typeof message}`);
         }
@@ -439,9 +456,10 @@ wss.on('connection', (ws, req) => {
 // --- Keepalive Interval ---
 const heartbeatInterval = setInterval(() => {
     roomManager.rooms.forEach(room => {
-        room.clients.forEach(ws => {
+        room.clients.forEach((clientData, clientId) => {
+            const ws = clientData.ws;
             if (ws.isAlive === false) {
-                console.warn(`Keepalive failed for client ${ws.id} in room ${ws.roomId}. Terminating.`);
+                console.warn(`Keepalive failed for client ${clientId.slice(0,8)} in room ${ws.roomId}. Terminating.`);
                 roomManager.removeClient(ws);
                 return ws.terminate();
             }

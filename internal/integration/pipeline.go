@@ -56,8 +56,9 @@ func NewPipeline(ctx context.Context, cfg *config.Config, frameDistributor *fram
 func (p *Pipeline) Start() error {
 	log.Println("[Pipeline] Starting integration pipeline")
 
-	// Start WebRTC frame consumer (testing mode - just consumes frames)
-	go p.consumeWebRTCFrames()
+	// NOTE: WebRTC frames are now consumed by GStreamer pipeline in main.go
+	// The old consumeWebRTCFrames() was just a drain and competed with GStreamer for frames
+	// go p.consumeWebRTCFrames() // DISABLED - GStreamer pipeline is the real consumer now
 
 	// Start motion detection pipeline
 	go p.runMotionDetection()

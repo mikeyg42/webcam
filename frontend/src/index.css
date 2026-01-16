@@ -1,6 +1,153 @@
+/* Google Fonts - Martian Mono, Space Grotesk, Fraunces */
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,500&family=Martian+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap');
+
 @import "tailwindcss";
 
+/* Tailwind 4 Theme Configuration */
+@theme {
+  /* Backgrounds (dark-to-light) */
+  --color-bg-primary: #101010;
+  --color-bg-elevated: #1a1a1a;
+  --color-bg-subtle: #242424;
+  --color-bg-hover: #2a2a2a;
+
+  /* Accent (lime/chartreuse) */
+  --color-accent: #c4ff58;
+  --color-accent-muted: #9fcc47;
+  --color-accent-glow: rgba(196, 255, 88, 0.15);
+
+  /* Text */
+  --color-text-primary: #ffffff;
+  --color-text-secondary: #a3a3a3;
+  --color-text-tertiary: #666666;
+  --color-text-inverse: #101010;
+
+  /* Semantic Status */
+  --color-status-success: #4ade80;
+  --color-status-warning: #fbbf24;
+  --color-status-error: #ef4444;
+  --color-status-info: #60a5fa;
+
+  /* Borders */
+  --color-border: #3a3a3a;
+  --color-border-subtle: #2a2a2a;
+  --color-border-accent: #c4ff58;
+
+  /* Fonts */
+  --font-mono: 'Martian Mono', 'JetBrains Mono', 'SF Mono', monospace;
+  --font-display: 'Space Grotesk', 'Inter', system-ui, sans-serif;
+  --font-editorial: 'Fraunces', 'Georgia', serif;
+
+  /* Font Sizes */
+  --text-2xs: 0.625rem;
+  --text-2xs--line-height: 0.875rem;
+
+  /* Letter Spacing */
+  --tracking-label: 0.05em;
+
+  /* Border Radius */
+  --radius: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+
+  /* Shadows */
+  --shadow-glow: 0 0 20px rgba(196, 255, 88, 0.2);
+  --shadow-glow-sm: 0 0 10px rgba(196, 255, 88, 0.15);
+
+  /* Animations */
+  --animate-pulse-slow: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  --animate-spin-slow: spin 2s linear infinite;
+}
+
+/* Base Styles */
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  color-scheme: dark;
+}
+
 body {
-  background-color: #111827;
-  color: #f3f4f6;
+  background-color: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  line-height: 1.5;
+  font-weight: 400;
+}
+
+/* Typography Utilities */
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-editorial {
+  font-family: var(--font-editorial);
+}
+
+/* Label Style - uppercase, wider tracking (Michelini-inspired) */
+.label {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-secondary);
+}
+
+/* Scrollbar Styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-bg-elevated);
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3a3a3a;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #4a4a4a;
+}
+
+/* Focus Ring (accessibility) - lime accent */
+*:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* Selection color */
+::selection {
+  background-color: rgba(196, 255, 88, 0.3);
+  color: #ffffff;
+}
+
+/* Performance: Compositor-friendly animation class */
+.gpu-accelerated {
+  will-change: transform, opacity;
+  transform: translateZ(0);
+}
+
+/* Safe area handling for mobile */
+.safe-area-pb {
+  padding-bottom: max(env(safe-area-inset-bottom), 8px);
+}
+
+.safe-area-pt {
+  padding-top: max(env(safe-area-inset-top), 8px);
+}
+
+/* Reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

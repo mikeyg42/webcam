@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/at-wat/ebml-go/webm"
 	"github.com/google/uuid"
 )
 
@@ -70,6 +71,15 @@ type Segmenter struct {
 	tempDir         string
 	outputDir       string
 
+	// Video config for MKV writer
+	videoWidth  int
+	videoHeight int
+	frameRate   float64
+
+	// Cached AV1 Sequence Header for sharing between segments
+	// This ensures new segments can start playable even without a keyframe
+	cachedSequenceHeader []byte
+
 	logger Logger
 
 	segments map[string]*Segment // recordingID -> current segment
@@ -88,6 +98,15 @@ func (s *Segmenter) SetLogger(l Logger) {
 	s.logger = l
 }
 
+// SetVideoConfig sets the video configuration for MKV writing
+func (s *Segmenter) SetVideoConfig(width, height int, frameRate float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.videoWidth = width
+	s.videoHeight = height
+	s.frameRate = frameRate
+}
+
 // SegmenterMetrics tracks segmenter performance
 type SegmenterMetrics struct {
 	SegmentsCreated   atomic.Uint64
@@ -97,18 +116,21 @@ type SegmenterMetrics struct {
 	FramesWritten     atomic.Uint64
 }
 
-// MKVWriter handles MKV container writing (placeholder mux)
+// MKVWriter handles MKV container writing using ebml-go
 type MKVWriter struct {
-	file       *os.File
-	path       string
-	startTime  time.Time
-	frameCount int64
-	size       int64
-	hasVideo   bool
-	hasAudio   bool
-	width      int
-	height     int
-	frameRate  float64
+	file           *os.File
+	path           string
+	startTime      time.Time
+	frameCount     int64
+	size           int64
+	hasVideo       bool
+	hasAudio       bool
+	width          int
+	height         int
+	frameRate      float64
+	frameDurNs     int64 // frame duration in nanoseconds
+	blockWriter    webm.BlockWriteCloser
+	sequenceHeader []byte // Cached AV1 Sequence Header for prepending to non-keyframe starts
 
 	mu     sync.Mutex
 	closed atomic.Bool
@@ -128,6 +150,11 @@ func NewSegmenter(segmentDuration time.Duration, tempDir string) *Segmenter {
 
 // Initialize prepares the segmenter
 func (s *Segmenter) Initialize() error {
+	s.logger.Infow("Segmenter initializing",
+		"segment_duration", s.segmentDuration,
+		"temp_dir", s.tempDir,
+		"output_dir", s.outputDir)
+
 	// Create directories
 	dirs := []string{s.tempDir, s.outputDir}
 	for _, dir := range dirs {
@@ -163,11 +190,21 @@ func (s *Segmenter) NewSegment(recordingID string) (*Segment, error) {
 		FilePath:    filepath.Join(s.outputDir, fmt.Sprintf("%s_%03d.mkv", recordingID, index)),
 	}
 
-	// Create MKV writer
-	writer, err := NewMKVWriter(segment.TempPath)
+	// Create MKV writer with video config and cached sequence header
+	cfg := MKVWriterConfig{
+		Width:        s.videoWidth,
+		Height:       s.videoHeight,
+		FrameRate:    s.frameRate,
+		CodecPrivate: s.cachedSequenceHeader, // Pass cached AV1 Sequence Header
+	}
+	writer, err := NewMKVWriterWithConfig(segment.TempPath, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create MKV writer: %w", err)
 	}
+
+	// Pass the cached sequence header to the writer so it can prepend to non-keyframe starts
+	writer.sequenceHeader = s.cachedSequenceHeader
+
 	segment.writer = writer
 
 	s.segments[recordingID] = segment
@@ -183,17 +220,18 @@ func (s *Segmenter) NewSegment(recordingID string) (*Segment, error) {
 
 // WriteFrame writes an encoded frame to the current segment
 func (s *Segmenter) WriteFrame(recordingID string, data []byte, timestamp time.Time) error {
-	// Fast path: read lock to find the active segment
-	s.mu.RLock()
+	// Use write lock for atomic segment lookup/creation to prevent race conditions
+	s.mu.Lock()
 	segment := s.segments[recordingID]
-	s.mu.RUnlock()
-
-	// Lazy-create a segment if missing
 	if segment == nil {
+		// Create segment while still holding the lock to prevent races
+		s.mu.Unlock() // Release before NewSegment (which acquires its own lock)
 		var err error
 		if segment, err = s.NewSegment(recordingID); err != nil {
 			return fmt.Errorf("failed to create segment: %w", err)
 		}
+	} else {
+		s.mu.Unlock()
 	}
 
 	segment.mu.Lock()
@@ -201,6 +239,18 @@ func (s *Segmenter) WriteFrame(recordingID string, data []byte, timestamp time.T
 
 	if segment.writer == nil {
 		return fmt.Errorf("segment writer is nil")
+	}
+
+	// Try to extract and cache sequence header from incoming data
+	// This ensures we have it available for future segments even before finalization
+	if s.cachedSequenceHeader == nil {
+		if seqHdr := extractSequenceHeader(data); len(seqHdr) > 0 {
+			s.mu.Lock()
+			if s.cachedSequenceHeader == nil {
+				s.cachedSequenceHeader = seqHdr
+			}
+			s.mu.Unlock()
+		}
 	}
 
 	n, err := segment.writer.WriteFrame(data, timestamp)
@@ -223,6 +273,7 @@ func (s *Segmenter) WriteFrame(recordingID string, data []byte, timestamp time.T
 func (s *Segmenter) ShouldRotate(recordingID string) (*Segment, bool) {
 	s.mu.RLock()
 	segment := s.segments[recordingID]
+	segmentDur := s.segmentDuration
 	s.mu.RUnlock()
 
 	if segment == nil {
@@ -230,14 +281,16 @@ func (s *Segmenter) ShouldRotate(recordingID string) (*Segment, bool) {
 	}
 
 	segment.mu.RLock()
-	defer segment.mu.RUnlock()
+	elapsed := time.Since(segment.StartTime)
+	size := segment.Size
+	segment.mu.RUnlock()
 
-	// Duration-based
-	if time.Since(segment.StartTime) >= s.segmentDuration {
+	// Duration-based rotation
+	if elapsed >= segmentDur {
 		return segment, true
 	}
-	// Size-based (> 100MB)
-	if segment.Size > 100*1024*1024 {
+	// Size-based rotation (> 100MB)
+	if size > 100*1024*1024 {
 		return segment, true
 	}
 	return nil, false
@@ -270,6 +323,11 @@ func (s *Segmenter) finalizeSegmentLocked(segment *Segment) {
 	segment.Status = SegmentStatusFinalizing
 	segment.EndTime = time.Now()
 	segment.Duration = segment.EndTime.Sub(segment.StartTime)
+
+	// Cache the sequence header from this writer for future segments
+	if segment.writer != nil && segment.writer.sequenceHeader != nil {
+		s.cachedSequenceHeader = segment.writer.sequenceHeader
+	}
 
 	// Close writer
 	if segment.writer != nil {
@@ -371,12 +429,13 @@ func (s *Segmenter) cleanupStaleSegments() {
 	}
 }
 
-// Cleanup removes the segment file from disk (only after upload)
+// Cleanup removes the segment file from disk (after upload or on failure)
 func (seg *Segment) Cleanup() error {
 	seg.mu.Lock()
 	defer seg.mu.Unlock()
 
-	if seg.Status != SegmentStatusUploaded {
+	// Allow cleanup after upload, completion, or failure
+	if seg.Status != SegmentStatusUploaded && seg.Status != SegmentStatusCompleted && seg.Status != SegmentStatusFailed {
 		return fmt.Errorf("cannot cleanup segment in status %s", seg.Status)
 	}
 	if err := os.Remove(seg.FilePath); err != nil && !os.IsNotExist(err) {
@@ -403,106 +462,284 @@ func (s *Segmenter) GetMetrics() map[string]interface{} {
 	}
 }
 
-// NewMKVWriter creates a new MKV container writer (placeholder)
+// AV1 OBU types for keyframe detection
+const (
+	obuTypeSequenceHeader = 1
+	obuTypeFrameHeader    = 3
+	obuTypeFrame          = 6
+)
+
+// isAV1Keyframe detects if the AV1 OBU data represents a keyframe
+// Returns true if the data contains a Sequence Header OBU or a KEY_FRAME
+func isAV1Keyframe(data []byte) bool {
+	if len(data) < 2 {
+		return false
+	}
+
+	offset := 0
+	for offset < len(data) {
+		if offset >= len(data) {
+			break
+		}
+
+		// Parse OBU header
+		// Format: [forbidden_bit(1) | obu_type(4) | obu_extension_flag(1) | obu_has_size_field(1) | reserved(1)]
+		header := data[offset]
+		obuType := (header >> 3) & 0x0F
+		hasExtension := (header>>2)&1 == 1
+		hasSizeField := (header>>1)&1 == 1
+		offset++
+
+		// Skip extension header if present
+		if hasExtension && offset < len(data) {
+			offset++
+		}
+
+		// Read OBU size if present
+		var obuSize int
+		if hasSizeField && offset < len(data) {
+			// LEB128 encoded size
+			obuSize, offset = readLEB128(data, offset)
+			if obuSize < 0 {
+				return false
+			}
+		} else {
+			// Remaining data is the OBU payload
+			obuSize = len(data) - offset
+		}
+
+		// Sequence Header OBU indicates start of a keyframe sequence
+		if obuType == obuTypeSequenceHeader {
+			return true
+		}
+
+		// Bounds check before moving to next OBU
+		if obuSize > len(data)-offset {
+			// Malformed data - OBU size exceeds remaining data
+			return false
+		}
+
+		// Move to next OBU
+		offset += obuSize
+	}
+
+	return false
+}
+
+// extractSequenceHeader extracts the Sequence Header OBU from AV1 data if present
+// This is used as CodecPrivate data for the Matroska track
+func extractSequenceHeader(data []byte) []byte {
+	if len(data) < 2 {
+		return nil
+	}
+
+	offset := 0
+	for offset < len(data) {
+		if offset >= len(data) {
+			break
+		}
+
+		startOffset := offset
+
+		// Parse OBU header
+		header := data[offset]
+		obuType := (header >> 3) & 0x0F
+		hasExtension := (header>>2)&1 == 1
+		hasSizeField := (header>>1)&1 == 1
+		offset++
+
+		// Skip extension header if present
+		if hasExtension && offset < len(data) {
+			offset++
+		}
+
+		// Read OBU size if present
+		var obuSize int
+		if hasSizeField && offset < len(data) {
+			obuSize, offset = readLEB128(data, offset)
+			if obuSize < 0 {
+				return nil
+			}
+		} else {
+			obuSize = len(data) - offset
+		}
+
+		// Bounds check before processing
+		if obuSize > len(data)-offset {
+			// Malformed data - OBU size exceeds remaining data
+			return nil
+		}
+
+		// Found Sequence Header
+		if obuType == obuTypeSequenceHeader {
+			endOffset := offset + obuSize
+			// Return the complete OBU including header
+			result := make([]byte, endOffset-startOffset)
+			copy(result, data[startOffset:endOffset])
+			return result
+		}
+
+		offset += obuSize
+	}
+
+	return nil
+}
+
+// readLEB128 reads an unsigned LEB128 encoded integer from data at the given offset
+// Returns the value and new offset, or -1 and original offset on error
+func readLEB128(data []byte, offset int) (int, int) {
+	value := 0
+	shift := 0
+	for i := 0; i < 8 && offset < len(data); i++ {
+		b := data[offset]
+		offset++
+		value |= int(b&0x7F) << shift
+		if b&0x80 == 0 {
+			return value, offset
+		}
+		shift += 7
+	}
+	return -1, offset
+}
+
+// MKVWriterConfig holds configuration for MKV writer
+type MKVWriterConfig struct {
+	Width        int
+	Height       int
+	FrameRate    float64
+	CodecPrivate []byte // AV1 Sequence Header for decoder initialization
+}
+
+// NewMKVWriter creates a new MKV container writer using ebml-go
 func NewMKVWriter(path string) (*MKVWriter, error) {
+	return NewMKVWriterWithConfig(path, MKVWriterConfig{
+		Width:     640,
+		Height:    480,
+		FrameRate: 30,
+	})
+}
+
+// NewMKVWriterWithConfig creates a new MKV container writer with specific config
+func NewMKVWriterWithConfig(path string, cfg MKVWriterConfig) (*MKVWriter, error) {
 	file, err := os.Create(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create file: %w", err)
 	}
-	w := &MKVWriter{
-		file:      file,
-		path:      path,
-		startTime: time.Now(),
+
+	// Default values if not specified
+	if cfg.Width == 0 {
+		cfg.Width = 640
 	}
-	// Write header
-	if err := w.writeHeader(); err != nil {
+	if cfg.Height == 0 {
+		cfg.Height = 480
+	}
+	if cfg.FrameRate == 0 {
+		cfg.FrameRate = 30
+	}
+
+	frameDurNs := int64(float64(time.Second) / cfg.FrameRate)
+
+	// Define video track for AV1
+	// CodecID for AV1 in Matroska is "V_AV1"
+	track := webm.TrackEntry{
+		Name:            "Video",
+		TrackNumber:     1,
+		TrackUID:        1,
+		CodecID:         "V_AV1",
+		TrackType:       1, // 1 = video
+		DefaultDuration: uint64(frameDurNs),
+		Video: &webm.Video{
+			PixelWidth:  uint64(cfg.Width),
+			PixelHeight: uint64(cfg.Height),
+		},
+	}
+
+	// Add CodecPrivate (AV1 Sequence Header) if provided
+	// This allows decoders to initialize without needing a keyframe
+	if len(cfg.CodecPrivate) > 0 {
+		track.CodecPrivate = cfg.CodecPrivate
+	}
+
+	tracks := []webm.TrackEntry{track}
+
+	// Create block writers using ebml-go
+	writers, err := webm.NewSimpleBlockWriter(file, tracks)
+	if err != nil {
 		_ = file.Close()
 		_ = os.Remove(path)
-		return nil, err
+		return nil, fmt.Errorf("failed to create block writer: %w", err)
 	}
+
+	if len(writers) == 0 {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return nil, fmt.Errorf("no block writers created")
+	}
+
+	w := &MKVWriter{
+		file:        file,
+		path:        path,
+		startTime:   time.Now(),
+		width:       cfg.Width,
+		height:      cfg.Height,
+		frameRate:   cfg.FrameRate,
+		frameDurNs:  frameDurNs,
+		hasVideo:    true,
+		blockWriter: writers[0],
+	}
+
 	return w, nil
 }
 
-// writeHeader writes a minimal valid MKV/Matroska container header
-func (w *MKVWriter) writeHeader() error {
-	// EBML Header for Matroska
-	header := []byte{
-		// EBML Header (ID: 0x1A45DFA3)
-		0x1A, 0x45, 0xDF, 0xA3,
-		0x9F, // Size: variable (31 bytes)
-
-		// EBMLVersion (ID: 0x4286) = 1
-		0x42, 0x86, 0x81, 0x01,
-
-		// EBMLReadVersion (ID: 0x42F7) = 1
-		0x42, 0xF7, 0x81, 0x01,
-
-		// EBMLMaxIDLength (ID: 0x42F2) = 4
-		0x42, 0xF2, 0x81, 0x04,
-
-		// EBMLMaxSizeLength (ID: 0x42F3) = 8
-		0x42, 0xF3, 0x81, 0x08,
-
-		// DocType (ID: 0x4282) = "matroska"
-		0x42, 0x82, 0x88,
-		0x6D, 0x61, 0x74, 0x72, 0x6F, 0x73, 0x6B, 0x61, // "matroska"
-
-		// DocTypeVersion (ID: 0x4287) = 4
-		0x42, 0x87, 0x81, 0x04,
-
-		// DocTypeReadVersion (ID: 0x4285) = 2
-		0x42, 0x85, 0x81, 0x02,
-
-		// Segment (ID: 0x18538067) - size unknown (0x01FFFFFFFFFFFFFF = unknown)
-		0x18, 0x53, 0x80, 0x67,
-		0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Unknown size
-	}
-
-	if _, err := w.file.Write(header); err != nil {
-		return err
-	}
-
-	// Write Segment Info (placeholder - will be updated on close)
-	info := []byte{
-		// Info element (ID: 0x1549A966)
-		0x15, 0x49, 0xA9, 0x66,
-		0xA0, // Size: variable (~32 bytes)
-
-		// TimestampScale (ID: 0x2AD7B1) = 1000000 (1ms)
-		0x2A, 0xD7, 0xB1, 0x84,
-		0x00, 0x0F, 0x42, 0x40, // 1000000 nanoseconds
-
-		// MuxingApp (ID: 0x4D80)
-		0x4D, 0x80, 0x8C,
-		0x52, 0x65, 0x63, 0x6F, 0x72, 0x64, 0x65, 0x72, 0x20, 0x76, 0x31, 0x2E, 0x30, // "Recorder v1.0"
-
-		// WritingApp (ID: 0x5741)
-		0x57, 0x41, 0x8C,
-		0x52, 0x65, 0x63, 0x6F, 0x72, 0x64, 0x65, 0x72, 0x20, 0x76, 0x31, 0x2E, 0x30, // "Recorder v1.0"
-	}
-
-	_, err := w.file.Write(info)
-	return err
-}
-
-// WriteFrame writes an encoded frame to the MKV container
-func (w *MKVWriter) WriteFrame(data []byte, _ time.Time) (int, error) {
+// WriteFrame writes an encoded AV1 frame to the MKV container
+func (w *MKVWriter) WriteFrame(data []byte, ts time.Time) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.closed.Load() {
 		return 0, fmt.Errorf("writer is closed")
 	}
-	n, err := w.file.Write(data)
-	if err != nil {
-		return n, err
+
+	if w.blockWriter == nil {
+		return 0, fmt.Errorf("block writer not initialized")
 	}
+
+	// Calculate timestamp in nanoseconds relative to start
+	relativeTime := ts.Sub(w.startTime)
+	if relativeTime < 0 {
+		relativeTime = time.Duration(w.frameCount) * time.Duration(w.frameDurNs)
+	}
+
+	// Detect actual AV1 keyframes by parsing the OBU bitstream
+	// Keyframes contain a Sequence Header OBU
+	keyframe := isAV1Keyframe(data)
+
+	// Cache sequence header from first keyframe for later use
+	if keyframe && w.sequenceHeader == nil {
+		if seqHdr := extractSequenceHeader(data); seqHdr != nil {
+			w.sequenceHeader = seqHdr
+		}
+	}
+
+	// For the first frame, if it's not a keyframe but we have a cached sequence header,
+	// prepend it to make the segment playable from the start
+	frameData := data
+	if w.frameCount == 0 && !keyframe && w.sequenceHeader != nil {
+		frameData = append(w.sequenceHeader, data...)
+		keyframe = true // Now it starts with sequence header, mark as keyframe
+	}
+
+	_, err := w.blockWriter.Write(keyframe, int64(relativeTime.Nanoseconds()/1000), frameData)
+	if err != nil {
+		return 0, fmt.Errorf("failed to write block: %w", err)
+	}
+
 	w.frameCount++
-	w.size += int64(n)
-	return n, nil
+	w.size += int64(len(data)) // Track original data size
+	return len(data), nil
 }
 
-// Close closes the MKV writer
+// Close closes the MKV writer and finalizes the container
 func (w *MKVWriter) Close() error {
 	if !w.closed.CompareAndSwap(false, true) {
 		return nil
@@ -510,7 +747,15 @@ func (w *MKVWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// TODO: write cues/index if needed
+	// Close the block writer first (this finalizes clusters)
+	if w.blockWriter != nil {
+		if err := w.blockWriter.Close(); err != nil {
+			// Log but continue to close file
+			_ = err
+		}
+	}
+
+	// Close the file
 	return w.file.Close()
 }
 

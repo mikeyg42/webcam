@@ -512,12 +512,21 @@ func (app *Application) Initialize() error {
 	// Feed frames from distributor to GStreamer pipeline
 	go func() {
 		rawFrames := app.frameDistributor.GetWebRTCChannel()
+		log.Println("[Main] Started GStreamer frame feeder goroutine")
+		frameCount := 0
+		lastLog := time.Now()
 		for {
 			select {
 			case frame, ok := <-rawFrames:
 				if !ok {
 					log.Println("[Main] Raw frame channel closed")
 					return
+				}
+				frameCount++
+				if frameCount == 1 || time.Since(lastLog) > 5*time.Second {
+					bounds := frame.Bounds()
+					log.Printf("[Main] Feeding frame #%d to GStreamer (%dx%d)", frameCount, bounds.Dx(), bounds.Dy())
+					lastLog = time.Now()
 				}
 				if err := app.gstPipeline.FeedFrame(frame); err != nil {
 					log.Printf("[Main] Failed to feed frame to pipeline: %v", err)

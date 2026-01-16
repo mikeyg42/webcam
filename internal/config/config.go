@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v2"
@@ -96,7 +97,7 @@ type VideoConfig struct {
 	Height int `yaml:"height" json:"height" default:"480"`
 
 	// Frame rate
-	FrameRate int `yaml:"frame_rate" json:"frame_rate" default:"30"`
+	FrameRate int `yaml:"frame_rate" json:"framerate" default:"30"`
 
 	// Quality settings
 	Quality string `yaml:"quality" json:"quality" default:"high"` // low, medium, high, ultra
@@ -105,30 +106,30 @@ type VideoConfig struct {
 	BitRate int `yaml:"bitrate" json:"bitrate" default:"2000000"` // 2 Mbps
 
 	// Keyframe interval in frames
-	KeyFrameInterval int `yaml:"keyframe_interval" json:"keyframe_interval" default:"60"`
+	KeyFrameInterval int `yaml:"keyframe_interval" json:"keyframeInterval" default:"60"`
 
 	// Device selection
-	DeviceID string `yaml:"device_id" json:"device_id" default:""`
+	DeviceID string `yaml:"device_id" json:"deviceId" default:""`
 
 	// Format settings
-	InputFormat string `yaml:"input_format" json:"input_format" default:"RGBA"`
-	ColorSpace  string `yaml:"color_space" json:"color_space" default:"sRGB"`
-	PixelFormat string `yaml:"pixel_format" json:"pixel_format" default:"yuv420p"`
+	InputFormat string `yaml:"input_format" json:"inputFormat" default:"RGBA"`
+	ColorSpace  string `yaml:"color_space" json:"colorSpace" default:"sRGB"`
+	PixelFormat string `yaml:"pixel_format" json:"pixelFormat" default:"yuv420p"`
 
 	// Output path for recordings
-	OutputPath string `yaml:"output_path" json:"output_path" default:"/var/recordings"`
+	OutputPath string `yaml:"output_path" json:"outputPath" default:"/var/recordings"`
 }
 
 // AudioConfig contains audio capture settings
 type AudioConfig struct {
 	Enabled      bool   `yaml:"enabled" json:"enabled" default:"true"`
-	DeviceID     string `yaml:"device_id" json:"device_id" default:""`
-	SampleRate   int    `yaml:"sample_rate" json:"sample_rate" default:"48000"`
+	DeviceID     string `yaml:"device_id" json:"deviceId" default:""`
+	SampleRate   int    `yaml:"sample_rate" json:"sampleRate" default:"48000"`
 	Channels     int    `yaml:"channels" json:"channels" default:"2"`
-	BitDepth     int    `yaml:"bit_depth" json:"bit_depth" default:"16"`
+	BitDepth     int    `yaml:"bit_depth" json:"bitDepth" default:"16"`
 	Codec        string `yaml:"codec" json:"codec" default:"opus"`
 	BitRate      int    `yaml:"bitrate" json:"bitrate" default:"128000"` // 128 kbps
-	ChannelCount int    `yaml:"channel_count" json:"channel_count" default:"2"`
+	ChannelCount int    `yaml:"channel_count" json:"channelCount" default:"2"`
 }
 
 // EncoderConfig contains video encoding settings
@@ -235,29 +236,29 @@ type RecordingConfig struct {
 	Enabled bool `yaml:"enabled" json:"enabled" default:"true"`
 
 	// Recording modes
-	ContinuousEnabled bool `yaml:"continuous_enabled" json:"continuous_enabled" default:"true"`
-	EventEnabled      bool `yaml:"event_enabled" json:"event_enabled" default:"true"`
+	ContinuousEnabled bool `yaml:"continuous_enabled" json:"continuousEnabled" default:"true"`
+	EventEnabled      bool `yaml:"event_enabled" json:"eventEnabled" default:"true"`
 
 	// Output settings
-	OutputDir  string `yaml:"output_dir" json:"output_dir" default:"/var/recordings"`
-	FileFormat string `yaml:"file_format" json:"file_format" default:"mp4"` // mp4, webm, mkv
+	OutputDir  string `yaml:"output_dir" json:"saveDirectory" default:"/var/recordings"`
+	FileFormat string `yaml:"file_format" json:"fileFormat" default:"mp4"` // mp4, webm, mkv
 
 	// Segment configuration
-	SegmentDuration time.Duration `yaml:"segment_duration" json:"segment_duration" default:"5m"`
-	MaxSegmentSize  int64         `yaml:"max_segment_size_mb" json:"max_segment_size_mb" default:"100"`
+	SegmentDuration time.Duration `yaml:"segment_duration" json:"segmentDuration" default:"5m"`
+	MaxSegmentSize  int64         `yaml:"max_segment_size_mb" json:"maxSegmentSize" default:"100"`
 
 	// Buffer configuration
-	RingBufferSize   time.Duration `yaml:"ring_buffer_size" json:"ring_buffer_size" default:"60s"`
-	PreMotionBuffer  time.Duration `yaml:"pre_motion_buffer" json:"pre_motion_buffer" default:"10s"`
-	PostMotionBuffer time.Duration `yaml:"post_motion_buffer" json:"post_motion_buffer" default:"30s"`
+	RingBufferSize   time.Duration `yaml:"ring_buffer_size" json:"ringBufferSize" default:"60s"`
+	PreMotionBuffer  time.Duration `yaml:"pre_motion_buffer" json:"preMotionBuffer" default:"10s"`
+	PostMotionBuffer time.Duration `yaml:"post_motion_buffer" json:"postMotionBuffer" default:"30s"`
 
 	// Retention
-	RetentionDays int `yaml:"retention_days" json:"retention_days" default:"30"`
-	MaxStorageGB  int `yaml:"max_storage_gb" json:"max_storage_gb" default:"100"`
+	RetentionDays int `yaml:"retention_days" json:"retentionDays" default:"30"`
+	MaxStorageGB  int `yaml:"max_storage_gb" json:"maxStorageGB" default:"100"`
 
 	// Temporary storage
-	TempDir  string `yaml:"temp_dir" json:"temp_dir" default:"/tmp/recorder"`
-	SpoolDir string `yaml:"spool_dir" json:"spool_dir" default:"/var/spool/recorder"`
+	TempDir  string `yaml:"temp_dir" json:"tempDir" default:"/tmp/recorder"`
+	SpoolDir string `yaml:"spool_dir" json:"spoolDir" default:"/var/spool/recorder"`
 }
 
 // StorageConfig contains storage backend configuration
@@ -289,22 +290,22 @@ type LocalStorage struct {
 // MinIOConfig contains MinIO-specific settings
 type MinIOConfig struct {
 	Endpoint        string `yaml:"endpoint" json:"endpoint" default:"localhost:9000"`
-	AccessKeyID     string `yaml:"access_key_id" json:"access_key_id"`
-	SecretAccessKey string `yaml:"secret_access_key" json:"secret_access_key"`
-	UseSSL          bool   `yaml:"use_ssl" json:"use_ssl" default:"false"`
+	AccessKeyID     string `yaml:"access_key_id" json:"accessKeyId"`
+	SecretAccessKey string `yaml:"secret_access_key" json:"secretAccessKey"`
+	UseSSL          bool   `yaml:"use_ssl" json:"useSSL" default:"false"`
 	Bucket          string `yaml:"bucket" json:"bucket" default:"recordings"`
 	Region          string `yaml:"region" json:"region" default:"us-east-1"`
 
 	// Connection pooling
-	MaxUploads   int `yaml:"max_uploads" json:"max_uploads" default:"10"`
-	MaxDownloads int `yaml:"max_downloads" json:"max_downloads" default:"20"`
+	MaxUploads   int `yaml:"max_uploads" json:"maxUploads" default:"10"`
+	MaxDownloads int `yaml:"max_downloads" json:"maxDownloads" default:"20"`
 
 	// Timeouts
-	ConnectTimeout time.Duration `yaml:"connect_timeout" json:"connect_timeout" default:"30s"`
-	RequestTimeout time.Duration `yaml:"request_timeout" json:"request_timeout" default:"5m"`
+	ConnectTimeout time.Duration `yaml:"connect_timeout" json:"connectTimeout" default:"30s"`
+	RequestTimeout time.Duration `yaml:"request_timeout" json:"requestTimeout" default:"5m"`
 
 	// Multipart upload settings
-	PartSize    int64 `yaml:"part_size_mb" json:"part_size_mb" default:"64"` // MB
+	PartSize    int64 `yaml:"part_size_mb" json:"partSizeMb" default:"64"` // MB
 	Concurrency int   `yaml:"concurrency" json:"concurrency" default:"4"`
 }
 
@@ -324,65 +325,65 @@ type PostgresConfig struct {
 	Database        string        `yaml:"database" json:"database" default:"recordings"`
 	Username        string        `yaml:"username" json:"username" default:"recorder"`
 	Password        string        `yaml:"password" json:"password" default:""`
-	SSLMode         string        `yaml:"ssl_mode" json:"ssl_mode" default:"disable"`
-	MaxConnections  int           `yaml:"max_connections" json:"max_connections" default:"25"`
-	MaxIdleConns    int           `yaml:"max_idle_conns" json:"max_idle_conns" default:"5"`
-	ConnMaxLifetime time.Duration `yaml:"conn_max_lifetime" json:"conn_max_lifetime" default:"5m"`
-	ConnMaxIdleTime time.Duration `yaml:"conn_max_idle_time" json:"conn_max_idle_time" default:"5m"`
+	SSLMode         string        `yaml:"ssl_mode" json:"sslMode" default:"disable"`
+	MaxConnections  int           `yaml:"max_connections" json:"maxConnections" default:"25"`
+	MaxIdleConns    int           `yaml:"max_idle_conns" json:"maxIdleConns" default:"5"`
+	ConnMaxLifetime time.Duration `yaml:"conn_max_lifetime" json:"connMaxLifetime" default:"5m"`
+	ConnMaxIdleTime time.Duration `yaml:"conn_max_idle_time" json:"connMaxIdleTime" default:"5m"`
 }
 
 // MotionConfig contains motion detection settings
 type MotionConfig struct {
 	Enabled       bool    `yaml:"enabled" json:"enabled" default:"true"`
 	Sensitivity   float64 `yaml:"sensitivity" json:"sensitivity" default:"0.3"`
-	MinConfidence float64 `yaml:"min_confidence" json:"min_confidence" default:"0.5"`
+	MinConfidence float64 `yaml:"min_confidence" json:"minConfidence" default:"0.5"`
 
-	NoMotionDelay        time.Duration `yaml:"no_motion_delay" json:"no_motion_delay" default:"2s"`
-	MinConsecutiveFrames int           `yaml:"min_consecutive_frames" json:"min_consecutive_frames" default:"3"`
-	MaxConsecutiveFrames int           `yaml:"max_consecutive_frames" json:"max_consecutive_frames" default:"10"`
+	NoMotionDelay        time.Duration `yaml:"no_motion_delay" json:"noMotionDelay" default:"2s"`
+	MinConsecutiveFrames int           `yaml:"min_consecutive_frames" json:"minConsecutiveFrames" default:"3"`
+	MaxConsecutiveFrames int           `yaml:"max_consecutive_frames" json:"maxConsecutiveFrames" default:"10"`
 
 	// Detection parameters
-	MinArea        int     `yaml:"min_area" json:"min_area" default:"100"`
-	MaxArea        int     `yaml:"max_area" json:"max_area" default:"0"` // 0 = no limit
-	MinAspectRatio float64 `yaml:"min_aspect_ratio" json:"min_aspect_ratio" default:"0.5"`
-	MaxAspectRatio float64 `yaml:"max_aspect_ratio" json:"max_aspect_ratio" default:"2.0"`
+	MinArea        int     `yaml:"min_area" json:"minimumArea" default:"100"`
+	MaxArea        int     `yaml:"max_area" json:"maximumArea" default:"0"` // 0 = no limit
+	MinAspectRatio float64 `yaml:"min_aspect_ratio" json:"minAspectRatio" default:"0.5"`
+	MaxAspectRatio float64 `yaml:"max_aspect_ratio" json:"maxAspectRatio" default:"2.0"`
 
 	// Background subtraction parameters
-	LearningRate float64 `yaml:"learning_rate" json:"learning_rate" default:"0.01"`
+	LearningRate float64 `yaml:"learning_rate" json:"learningRate" default:"0.01"`
 	Threshold    int     `yaml:"threshold" json:"threshold" default:"25"`
 
 	// Processing
-	BlurSize       int `yaml:"blur_size" json:"blur_size" default:"21"`
-	DilationSize   int `yaml:"dilation_size" json:"dilation_size" default:"5"`
-	MorphologySize int `yaml:"morphology_size" json:"morphology_size" default:"5"`
+	BlurSize       int `yaml:"blur_size" json:"blurSize" default:"21"`
+	DilationSize   int `yaml:"dilation_size" json:"dilationSize" default:"5"`
+	MorphologySize int `yaml:"morphology_size" json:"morphologySize" default:"5"`
 
 	// Cooldown
-	CooldownPeriod time.Duration `yaml:"cooldown_period" json:"cooldown_period" default:"5s"`
+	CooldownPeriod time.Duration `yaml:"cooldown_period" json:"cooldownPeriod" default:"5s"`
 }
 
 // WebRTCConfig contains WebRTC settings
 type WebRTCConfig struct {
 	// ICE servers
-	ICEServers []ICEServer `yaml:"ice_servers" json:"ice_servers"`
+	ICEServers []ICEServer `yaml:"ice_servers" json:"iceServers"`
 
 	// Authentication
 	Username string `yaml:"username" json:"username" default:""`
 	Password string `yaml:"password" json:"password" default:""`
 
 	// Connection policies
-	ICETransportPolicy   string `yaml:"ice_transport_policy" json:"ice_transport_policy" default:"all"`
-	BundlePolicy         string `yaml:"bundle_policy" json:"bundle_policy" default:"max-bundle"`
-	RTCPMuxPolicy        string `yaml:"rtcp_mux_policy" json:"rtcp_mux_policy" default:"require"`
-	ICECandidatePoolSize int    `yaml:"ice_candidate_pool_size" json:"ice_candidate_pool_size" default:"3"`
+	ICETransportPolicy   string `yaml:"ice_transport_policy" json:"iceTransportPolicy" default:"all"`
+	BundlePolicy         string `yaml:"bundle_policy" json:"bundlePolicy" default:"max-bundle"`
+	RTCPMuxPolicy        string `yaml:"rtcp_mux_policy" json:"rtcpMuxPolicy" default:"require"`
+	ICECandidatePoolSize int    `yaml:"ice_candidate_pool_size" json:"iceCandidatePoolSize" default:"3"`
 
 	// Timeouts
-	ConnectionTimeout   time.Duration `yaml:"connection_timeout" json:"connection_timeout" default:"30s"`
-	DisconnectedTimeout time.Duration `yaml:"disconnected_timeout" json:"disconnected_timeout" default:"5s"`
-	FailedTimeout       time.Duration `yaml:"failed_timeout" json:"failed_timeout" default:"5s"`
-	KeepaliveInterval   time.Duration `yaml:"keepalive_interval" json:"keepalive_interval" default:"10s"`
+	ConnectionTimeout   time.Duration `yaml:"connection_timeout" json:"connectionTimeout" default:"30s"`
+	DisconnectedTimeout time.Duration `yaml:"disconnected_timeout" json:"disconnectedTimeout" default:"5s"`
+	FailedTimeout       time.Duration `yaml:"failed_timeout" json:"failedTimeout" default:"5s"`
+	KeepaliveInterval   time.Duration `yaml:"keepalive_interval" json:"keepaliveInterval" default:"10s"`
 
 	// Adaptive quality management
-	QualityPriority string `yaml:"quality_priority" json:"quality_priority" default:"maximize_quality"` // maximize_quality, minimize_latency, minimize_device_strain
+	QualityPriority string `yaml:"quality_priority" json:"qualityPriority" default:"maximize_quality"` // maximize_quality, minimize_latency, minimize_device_strain
 }
 
 // WebRTCAuth is an alias for WebRTCConfig for backward compatibility
@@ -398,15 +399,15 @@ type ICEServer struct {
 // TailscaleConfig contains Tailscale VPN settings
 type TailscaleConfig struct {
 	Enabled         bool   `yaml:"enabled" json:"enabled" default:"true"`
-	AuthKey         string `yaml:"auth_key" json:"auth_key"`
-	ControlURL      string `yaml:"control_url" json:"control_url" default:""`
+	AuthKey         string `yaml:"auth_key" json:"authKey"`
+	ControlURL      string `yaml:"control_url" json:"controlUrl" default:""`
 	Hostname        string `yaml:"hostname" json:"hostname"`
-	NodeName        string `yaml:"node_name" json:"node_name" default:""`
-	StateDir        string `yaml:"state_dir" json:"state_dir" default:"/var/lib/tailscale"`
-	AcceptRoutes    bool   `yaml:"accept_routes" json:"accept_routes" default:"false"`
-	ShieldsUp       bool   `yaml:"shields_up" json:"shields_up" default:"false"`
-	ExitNode        string `yaml:"exit_node" json:"exit_node"`
-	AdvertiseRoutes string `yaml:"advertise_routes" json:"advertise_routes"`
+	NodeName        string `yaml:"node_name" json:"nodeName" default:""`
+	StateDir        string `yaml:"state_dir" json:"stateDir" default:"/var/lib/tailscale"`
+	AcceptRoutes    bool   `yaml:"accept_routes" json:"acceptRoutes" default:"false"`
+	ShieldsUp       bool   `yaml:"shields_up" json:"shieldsUp" default:"false"`
+	ExitNode        string `yaml:"exit_node" json:"exitNode"`
+	AdvertiseRoutes string `yaml:"advertise_routes" json:"advertiseRoutes"`
 }
 
 // PipelineConfig contains media pipeline settings
@@ -749,10 +750,18 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	// Try to parse as YAML first, then JSON
-	if err := yaml.Unmarshal(data, config); err != nil {
+	// Parse based on file extension
+	if strings.HasSuffix(path, ".json") {
 		if err := json.Unmarshal(data, config); err != nil {
-			return nil, fmt.Errorf("failed to parse config file: %w", err)
+			return nil, fmt.Errorf("failed to parse JSON config file: %w", err)
+		}
+	} else {
+		// Try YAML for .yaml, .yml, or unknown extensions
+		if err := yaml.Unmarshal(data, config); err != nil {
+			// Fallback to JSON
+			if err := json.Unmarshal(data, config); err != nil {
+				return nil, fmt.Errorf("failed to parse config file: %w", err)
+			}
 		}
 	}
 

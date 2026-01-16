@@ -153,6 +153,7 @@ log_info "Starting Go security camera application..."
 # Preserve environment variables if they were set
 export WEBRTC_USERNAME="${WEBRTC_USERNAME:-testuser}"
 export WEBRTC_PASSWORD="${WEBRTC_PASSWORD:-testing123}"
+export TAILSCALE_DEV_MODE="${TAILSCALE_DEV_MODE:-true}"
 
 # Start the application in background
 ./security-camera -debug > "$LOG_DIR/go-camera.log" 2>&1 &

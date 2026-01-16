@@ -1,24 +1,30 @@
 import { useEffect, useState, useMemo } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
 import { useConfigStore } from '../../stores/configStore';
+import { QuickSetup } from './QuickSetup';
+import { AdvancedSettings } from './AdvancedSettings';
+import { SkeletonCard } from '../feedback/Skeleton';
+import { Progress } from '../feedback/Progress';
+import { StatusIndicator } from '../feedback/StatusIndicator';
+import { Button } from '../primitives/Button';
+import { Card } from '../layout/Card';
+import { slideUp, fadeIn } from '../../lib/motion';
 import type { ConfigResponse } from '../../types/api';
-import { VideoSection } from './VideoSection';
-import { AudioSection } from './AudioSection';
-import { MotionSection } from './MotionSection';
-import { EmailSection } from './EmailSection';
-import { RecordingSection } from './RecordingSection';
-import { StorageSection } from './StorageSection';
-import { TailscaleSection } from './TailscaleSection';
-import { WebRTCSection } from './WebRTCSection';
 
 interface ConfigFormProps {
   onConfigComplete?: () => void;
 }
 
+type SaveState = 'idle' | 'saving' | 'restarting' | 'checking' | 'success' | 'error';
+
 export function ConfigForm({ onConfigComplete }: ConfigFormProps) {
   const { config, isLoading, isSaving, error, loadConfig, updateConfig } = useConfigStore();
   const [formData, setFormData] = useState<ConfigResponse | null>(null);
-  const [saveStatus, setSaveStatus] = useState<string>('');
+  const [saveState, setSaveState] = useState<SaveState>('idle');
+  const [saveProgress, setSaveProgress] = useState(0);
+  const [saveMessage, setSaveMessage] = useState('');
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   useEffect(() => {
     loadConfig();
@@ -30,20 +36,21 @@ export function ConfigForm({ onConfigComplete }: ConfigFormProps) {
     }
   }, [config]);
 
+  // Validation logic
   const validateForm = useMemo(() => {
     if (!formData) return { isValid: false, errors: [] };
 
     const errors: string[] = [];
 
-    if (!formData.video.width || formData.video.width < 320 || formData.video.width > 3840) {
+    if (formData.video.width < 320 || formData.video.width > 3840) {
       errors.push('Video width must be between 320 and 3840 pixels');
     }
-    if (!formData.video.height || formData.video.height < 240 || formData.video.height > 2160) {
+    if (formData.video.height < 240 || formData.video.height > 2160) {
       errors.push('Video height must be between 240 and 2160 pixels');
     }
 
     if (formData.audio.enabled) {
-      if (!formData.audio.sampleRate || formData.audio.sampleRate < 8000 || formData.audio.sampleRate > 48000) {
+      if (formData.audio.sampleRate < 8000 || formData.audio.sampleRate > 48000) {
         errors.push('Audio sample rate must be between 8000 and 48000 Hz');
       }
     }
@@ -52,50 +59,17 @@ export function ConfigForm({ onConfigComplete }: ConfigFormProps) {
       if (formData.motion.threshold < 0 || formData.motion.threshold > 255) {
         errors.push('Motion threshold must be between 0 and 255');
       }
-      if (!formData.motion.minimumArea || formData.motion.minimumArea < 0) {
-        errors.push('Motion minimum area must be a positive number');
-      }
-      if (formData.motion.cooldownPeriod < 0) {
-        errors.push('Motion cooldown period must be a positive number');
-      }
-      if (formData.motion.noMotionDelay < 0) {
-        errors.push('Motion no-motion delay must be a positive number');
-      }
-      if (!formData.motion.minConsecutiveFrames || formData.motion.minConsecutiveFrames < 1) {
-        errors.push('Motion minimum consecutive frames must be at least 1');
-      }
-    }
-
-    if (formData.email.method !== 'disabled') {
-      if (!formData.email.fromEmail || !formData.email.fromEmail.includes('@')) {
-        errors.push('Valid "from" email address is required');
-      }
-      if (!formData.email.toEmail || !formData.email.toEmail.includes('@')) {
-        errors.push('Valid "to" email address is required');
-      }
     }
 
     if (formData.recording.continuousEnabled || formData.recording.eventEnabled) {
-      if (!formData.recording.saveDirectory || formData.recording.saveDirectory.trim() === '') {
+      if (!formData.recording.saveDirectory?.trim()) {
         errors.push('Recording save directory is required');
-      }
-      if (!formData.recording.segmentDuration || formData.recording.segmentDuration < 1) {
-        errors.push('Recording segment duration must be at least 1 minute');
-      }
-      if (!formData.recording.retentionDays || formData.recording.retentionDays < 1) {
-        errors.push('Recording retention days must be at least 1 day');
       }
     }
 
     if (formData.tailscale.enabled) {
-      if (!formData.tailscale.nodeName || formData.tailscale.nodeName.trim() === '') {
-        errors.push('Tailscale node name is required when enabled');
-      }
-      if (!formData.tailscale.hostname || formData.tailscale.hostname.trim() === '') {
-        errors.push('Tailscale hostname is required when enabled');
-      }
-      if (!formData.tailscale.listenPort || formData.tailscale.listenPort < 1 || formData.tailscale.listenPort > 65535) {
-        errors.push('Tailscale listen port must be between 1 and 65535');
+      if (!formData.tailscale.nodeName?.trim()) {
+        errors.push('Tailscale node name is required');
       }
     }
 
@@ -106,175 +80,142 @@ export function ConfigForm({ onConfigComplete }: ConfigFormProps) {
     setValidationErrors(validateForm.errors);
   }, [validateForm]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!formData) return;
-
-    if (!validateForm.isValid) {
-      setSaveStatus('Please fix validation errors before saving');
-      return;
-    }
-
-    try {
-      setSaveStatus('');
-      // Step 1: Save configuration
-      await updateConfig(formData);
-
-      // Step 2: Trigger backend restart
-      setSaveStatus('Configuration saved! Please hold while we restart the backend to apply changes...');
-
-      try {
-        // Import API client dynamically
-        const { apiClient } = await import('../../api/client');
-        await apiClient.restartBackend();
-
-        // Step 3: Wait for backend to come back up
-        setSaveStatus('Backend restarting... Please wait...');
-
-        // Poll health check until backend is back
-        let isBackendUp = false;
-        const maxAttempts = 30; // 30 seconds max wait
-
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
-
-          try {
-            await apiClient.healthCheck();
-            isBackendUp = true;
-            break;
-          } catch (error) {
-            // Backend not up yet, continue waiting
-          }
-        }
-
-        if (isBackendUp) {
-          setSaveStatus('✓ Configuration applied successfully! Backend restarted with new settings.');
-          if (onConfigComplete) {
-            onConfigComplete();
-          }
-        } else {
-          setSaveStatus('Configuration saved, but backend restart is taking longer than expected. Please check manually.');
-        }
-      } catch (restartError: any) {
-        // Restart failed, but config was saved
-        setSaveStatus('Configuration saved, but automatic restart failed. Please restart the backend manually using: ./restart-backend-fast.sh');
-      }
-    } catch (error: any) {
-      setSaveStatus(`Error: ${error.message}`);
-    }
-  };
-
-  const updateFormData = (section: keyof ConfigResponse, data: any) => {
+  const updateFormData = (section: keyof ConfigResponse, data: Partial<ConfigResponse[keyof ConfigResponse]>) => {
     if (!formData) return;
     setFormData({
       ...formData,
-      [section]: {
-        ...formData[section],
-        ...data,
-      },
+      [section]: { ...(formData[section] as object), ...data },
     });
   };
 
+  const handleSave = async () => {
+    if (!formData || !validateForm.isValid) return;
+
+    try {
+      setSaveState('saving');
+      setSaveProgress(20);
+      setSaveMessage('Saving configuration...');
+
+      await updateConfig(formData);
+      setSaveProgress(40);
+
+      setSaveState('restarting');
+      setSaveMessage('Restarting backend...');
+
+      const { apiClient } = await import('../../api/client');
+      await apiClient.restartBackend();
+      setSaveProgress(60);
+
+      setSaveState('checking');
+      setSaveMessage('Verifying connection...');
+
+      let isBackendUp = false;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        setSaveProgress(60 + Math.floor((attempt / 30) * 35));
+        try {
+          await apiClient.healthCheck();
+          isBackendUp = true;
+          break;
+        } catch { /* continue */ }
+      }
+
+      if (isBackendUp) {
+        setSaveState('success');
+        setSaveProgress(100);
+        setSaveMessage('Configuration applied successfully!');
+        onConfigComplete?.();
+        setTimeout(() => { setSaveState('idle'); setSaveProgress(0); }, 3000);
+      } else {
+        setSaveState('error');
+        setSaveMessage('Backend restart timed out.');
+      }
+    } catch (err: unknown) {
+      setSaveState('error');
+      setSaveMessage(err instanceof Error ? err.message : 'An error occurred');
+    }
+  };
+
   if (isLoading || !formData) {
-    return (
-      <div className="flex items-center justify-center min-h-screen">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4" />
-          <p className="text-gray-400">Loading configuration...</p>
-        </div>
-      </div>
-    );
+    return <div className="space-y-4"><SkeletonCard /><SkeletonCard /><SkeletonCard /></div>;
   }
 
   return (
-    <div className="max-w-4xl mx-auto p-6">
-      <h1 className="text-3xl font-bold mb-6 text-white">Security Camera Configuration</h1>
-
+    <div className="space-y-6">
       {error && (
-        <div className="bg-red-900/50 border border-red-500 text-red-200 px-4 py-3 rounded mb-6">
-          {error}
-        </div>
+        <motion.div variants={fadeIn} initial="hidden" animate="visible"
+          className="bg-status-error/10 border border-status-error/30 rounded-lg p-4">
+          <p className="text-sm text-status-error">{error}</p>
+        </motion.div>
       )}
 
       {validationErrors.length > 0 && (
-        <div className="bg-yellow-900/50 border border-yellow-500 text-yellow-200 px-4 py-3 rounded mb-6">
-          <p className="font-semibold mb-2">Please fix the following errors:</p>
-          <ul className="list-disc list-inside space-y-1">
-            {validationErrors.map((error, index) => (
-              <li key={index} className="text-sm">{error}</li>
-            ))}
+        <motion.div variants={fadeIn} initial="hidden" animate="visible"
+          className="bg-status-warning/10 border border-status-warning/30 rounded-lg p-4">
+          <p className="text-xs font-medium uppercase tracking-label text-status-warning mb-2">
+            Please fix the following:
+          </p>
+          <ul className="space-y-1">
+            {validationErrors.map((err, i) => <li key={i} className="text-sm text-text-secondary">• {err}</li>)}
           </ul>
+        </motion.div>
+      )}
+
+      <AnimatePresence>
+        {saveState !== 'idle' && saveState !== 'success' && (
+          <motion.div variants={fadeIn} initial="hidden" animate="visible" exit="exit">
+            <Card padding="md">
+              <div className="text-center space-y-4">
+                <StatusIndicator status={saveState === 'error' ? 'error' : 'loading'} label={saveMessage} />
+                {saveState !== 'error' && <Progress value={saveProgress} showLabel />}
+                {saveState === 'error' && (
+                  <Button variant="secondary" onClick={() => { setSaveState('idle'); setSaveProgress(0); }}>
+                    Dismiss
+                  </Button>
+                )}
+              </div>
+            </Card>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {saveState === 'success' && (
+          <motion.div variants={slideUp} initial="hidden" animate="visible" exit="exit"
+            className="bg-status-success/10 border border-status-success/30 rounded-lg p-4">
+            <StatusIndicator status="success" label={saveMessage} />
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {saveState === 'idle' && (
+        <QuickSetup config={formData} onUpdate={updateFormData} onSave={handleSave} isSaving={isSaving} />
+      )}
+
+      {saveState === 'idle' && (
+        <div className="text-center">
+          <button type="button" onClick={() => setShowAdvanced(!showAdvanced)}
+            className="text-xs uppercase tracking-label text-text-tertiary hover:text-accent transition-colors">
+            {showAdvanced ? 'Hide Advanced Settings' : 'Show Advanced Settings'}
+          </button>
         </div>
       )}
 
-      {saveStatus && (
-        <div className={`px-4 py-3 rounded mb-6 ${
-          saveStatus.startsWith('Error') || saveStatus.startsWith('Please fix')
-            ? 'bg-red-900/50 border border-red-500 text-red-200'
-            : 'bg-green-900/50 border border-green-500 text-green-200'
-        }`}>
-          {saveStatus}
-        </div>
-      )}
-
-      <form onSubmit={handleSubmit} className="space-y-6">
-        <VideoSection
-          data={formData.video}
-          onChange={(data) => updateFormData('video', data)}
-        />
-
-        <AudioSection
-          data={formData.audio}
-          onChange={(data) => updateFormData('audio', data)}
-        />
-
-        <MotionSection
-          data={formData.motion}
-          onChange={(data) => updateFormData('motion', data)}
-        />
-
-        <RecordingSection
-          data={formData.recording}
-          onChange={(data) => updateFormData('recording', data)}
-        />
-
-        <StorageSection
-          data={formData.storage}
-          onChange={(data) => updateFormData('storage', data)}
-        />
-
-        <TailscaleSection
-          data={formData.tailscale}
-          onChange={(data) => updateFormData('tailscale', data)}
-        />
-
-        <WebRTCSection
-          data={formData.webrtc}
-          onChange={(data) => updateFormData('webrtc', data)}
-        />
-
-        <EmailSection
-          data={formData.email}
-          onChange={(data) => updateFormData('email', data)}
-        />
-
-        <div className="flex gap-4 pt-6 border-t border-gray-700">
-          <button
-            type="submit"
-            disabled={isSaving || !validateForm.isValid}
-            className="px-6 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
-          >
-            {isSaving ? 'Saving...' : 'Save Configuration'}
-          </button>
-          <button
-            type="button"
-            onClick={() => setFormData(config)}
-            className="px-6 py-3 bg-gray-700 hover:bg-gray-600 text-white rounded-lg font-medium transition-colors"
-          >
-            Reset
-          </button>
-        </div>
-      </form>
+      <AnimatePresence>
+        {showAdvanced && saveState === 'idle' && (
+          <motion.div variants={slideUp} initial="hidden" animate="visible" exit="exit">
+            <AdvancedSettings config={formData} onUpdate={updateFormData} />
+            <div className="mt-6 flex gap-4">
+              <Button onClick={handleSave} loading={isSaving} disabled={!validateForm.isValid} className="flex-1">
+                Save All Changes
+              </Button>
+              <Button variant="secondary" onClick={() => setFormData(config)}>Reset</Button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
+
+ConfigForm.displayName = 'ConfigForm';

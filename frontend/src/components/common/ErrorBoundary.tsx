@@ -1,5 +1,6 @@
 import { Component } from 'react';
 import type { ErrorInfo, ReactNode } from 'react';
+import { AlertTriangle, RefreshCw } from 'lucide-react';
 
 interface Props {
   children: ReactNode;
@@ -12,6 +13,8 @@ interface State {
 }
 
 export class ErrorBoundary extends Component<Props, State> {
+  static displayName = 'ErrorBoundary';
+
   public state: State = {
     hasError: false,
     error: null,
@@ -32,25 +35,31 @@ export class ErrorBoundary extends Component<Props, State> {
       }
 
       return (
-        <div className="min-h-screen flex items-center justify-center bg-gray-900 p-6">
-          <div className="max-w-lg w-full bg-gray-800 rounded-lg p-8 border border-red-500">
-            <h1 className="text-2xl font-bold text-red-400 mb-4">
-              Something went wrong
-            </h1>
-            <p className="text-gray-300 mb-4">
+        <div className="min-h-screen flex items-center justify-center bg-bg-primary p-6">
+          <div className="max-w-lg w-full bg-bg-elevated rounded-lg p-8 border border-status-error/30">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-12 h-12 rounded-full bg-status-error/10 flex items-center justify-center">
+                <AlertTriangle className="w-6 h-6 text-status-error" />
+              </div>
+              <h1 className="font-display text-xl font-semibold text-text-primary">
+                Something went wrong
+              </h1>
+            </div>
+            <p className="text-sm text-text-secondary mb-4">
               The application encountered an unexpected error. Please refresh the page to try again.
             </p>
             {this.state.error && (
-              <div className="bg-gray-900 rounded p-4 mb-4">
-                <p className="text-sm font-mono text-red-300 whitespace-pre-wrap">
+              <div className="bg-bg-primary rounded-lg p-4 mb-6 border border-border">
+                <p className="text-xs font-mono text-status-error whitespace-pre-wrap">
                   {this.state.error.toString()}
                 </p>
               </div>
             )}
             <button
               onClick={() => window.location.reload()}
-              className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
+              className="inline-flex items-center gap-2 px-4 py-2.5 bg-accent text-bg-primary font-medium text-sm rounded-lg hover:bg-accent-muted transition-colors"
             >
+              <RefreshCw className="w-4 h-4" />
               Refresh Page
             </button>
           </div>
