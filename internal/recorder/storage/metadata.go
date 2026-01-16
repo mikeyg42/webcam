@@ -524,17 +524,21 @@ func (s *PostgresStore) DeleteRecording(ctx context.Context, id string) error {
 
 // SaveSegment saves a segment
 func (s *PostgresStore) SaveSegment(ctx context.Context, segment *Segment) error {
-	// First get the internal recording ID
-	var recordingID string
-	err := s.db.QueryRowContext(ctx, 
-		"SELECT id FROM recordings WHERE external_id = $1", 
+	// Verify the recording exists first
+	var exists bool
+	err := s.db.QueryRowContext(ctx,
+		"SELECT EXISTS(SELECT 1 FROM recordings WHERE external_id = $1)",
 		segment.RecordingID,
-	).Scan(&recordingID)
-	
+	).Scan(&exists)
+
 	if err != nil {
-		return fmt.Errorf("failed to find recording: %w", err)
+		return fmt.Errorf("failed to check recording: %w", err)
 	}
-	
+	if !exists {
+		return fmt.Errorf("recording not found: %s", segment.RecordingID)
+	}
+
+	// Use external_id directly since FK references recordings(external_id)
 	query := `
 		INSERT INTO segments (
 			recording_id, segment_index, start_time, end_time, duration_seconds,
@@ -549,17 +553,17 @@ func (s *PostgresStore) SaveSegment(ctx context.Context, segment *Segment) error
 			frame_count = EXCLUDED.frame_count,
 			checksum = EXCLUDED.checksum,
 			status = EXCLUDED.status,
-			uploaded_at = CASE 
-				WHEN EXCLUDED.status = 'completed' THEN NOW() 
-				ELSE segments.uploaded_at 
+			uploaded_at = CASE
+				WHEN EXCLUDED.status = 'completed' THEN NOW()
+				ELSE segments.uploaded_at
 			END
 		RETURNING id
 	`
-	
+
 	var segmentID string
 	err = s.db.QueryRowContext(
 		ctx, query,
-		recordingID, segment.Index, segment.StartTime, segment.EndTime, segment.Duration.Seconds(),
+		segment.RecordingID, segment.Index, segment.StartTime, segment.EndTime, segment.Duration.Seconds(),
 		segment.StorageKey, segment.Size, segment.FrameCount, segment.Checksum, segment.Status,
 	).Scan(&segmentID)
 	
