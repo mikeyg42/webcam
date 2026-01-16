@@ -1,8 +1,8 @@
 # Known Issues
 
-## Recording Pipeline Status: PARTIALLY WORKING
+## Recording Pipeline Status: WORKING
 
-The recording system produces playable MKV files with AV1 video. First segments work correctly; subsequent segments need keyframe forcing at rotation.
+The recording system produces playable MKV files with AV1 video. All segments are independently playable.
 
 ### Architecture: ✅ VERIFIED WORKING
 ```
@@ -18,28 +18,14 @@ Recording is **network-independent** - frames flow directly from FrameDistributo
 - ✅ Direct frame path from FrameDistributor
 - ✅ AV1 encoding via GStreamer SVT-AV1
 - ✅ MKV container muxing via ebml-go/webm
-- ✅ 5-second segment rotation
+- ✅ 5-second segment rotation with keyframe forcing
 - ✅ MinIO upload (segments appear in bucket)
-- ✅ First segment (segment_000.mkv) plays correctly
+- ✅ All segments play correctly (keyframe at each segment start)
 - ✅ Disk space checks before recording
 - ✅ Segment checksums (SHA256)
-
-### Current Problems (Verified)
-
-#### 1. PostgreSQL Foreign Key Constraint Error
-**Symptom**: `pq: insert or update on table "segments" violates foreign key constraint "fk_segments_recording"`
-**Cause**: Recording metadata not saved to DB before segments are uploaded
-**Impact**: Segment metadata not tracked in database (upload still works)
-**File**: `internal/recorder/recorder.go` - need to save recording on continuous start
-
-#### 2. Subsequent Segments Missing Keyframes
-**Symptom**: `ffprobe` shows "Missing reference frame needed for show_existing_frame"
-**Cause**: Segment rotation happens at arbitrary frame boundaries, not at keyframes
-**Impact**: segment_001.mkv and later won't play standalone
-**Fix needed**: Force keyframe from encoder when starting new segment
+- ✅ Segment metadata saved to PostgreSQL
 
 ### What's NOT Implemented (Phase 2 & 3)
-- ❌ Keyframe forcing at segment rotation
 - ❌ Emergency buffers (fallback when primary buffer full)
 - ❌ Recording watchdog (detect hangs/failures)
 - ❌ Crash recovery for interrupted recordings
@@ -48,6 +34,16 @@ Recording is **network-independent** - frames flow directly from FrameDistributo
 ---
 
 ## Recently Fixed (January 2025)
+
+### PostgreSQL FK Constraint Error (HIGH - FIXED)
+**Problem**: `pq: insert or update on table "segments" violates foreign key constraint "fk_segments_recording"`
+**Cause**: SaveSegment was using incorrect column - FK references `recordings(external_id)` not `recordings(id)`
+**Fix**: Use `segment.RecordingID` (external_id) directly in `metadata.go:SaveSegment()`
+
+### Keyframe at Segment Rotation (HIGH - FIXED)
+**Problem**: Subsequent segments (001+) wouldn't play - "Missing reference frame needed for show_existing_frame"
+**Cause**: Segment rotation happened at arbitrary frame boundaries, not at keyframes
+**Fix**: Added `ForceKeyframe()` to Encoder interface, called before `NewSegment()` in `recorder.go:checkSegmentRotation()`
 
 ### WriteFrame Race Condition (CRITICAL - FIXED)
 **Problem**: ShouldRotate() saw 0 segments while WriteFrame() was creating one
@@ -115,16 +111,16 @@ macOS permissions issue. Grant in System Preferences > Privacy & Security > Came
 
 ### Recording produces small/empty segments
 1. Check if continuous recording is enabled: `cat ~/.webcam2/config.json | jq '.recording.continuousEnabled'`
-2. First segment should be larger (~100KB+), subsequent segments may be small until keyframe fix is applied
+2. All segments should be playable with similar sizes
 3. Check MinIO for uploads: `docker exec webcam2-minio mc ls local/recordings/ --recursive`
 
 ### Verify segment playback
 ```bash
 # Download from MinIO
-docker exec webcam2-minio mc cp local/recordings/continuous/2026-01-13/<recording-id>/segment_000.mkv /tmp/
-docker cp webcam2-minio:/tmp/segment_000.mkv /tmp/test.mkv
+docker exec webcam2-minio mc cp local/recordings/continuous/2026-01-16/<recording-id>/segment_001.mkv /tmp/
+docker cp webcam2-minio:/tmp/segment_001.mkv /tmp/test.mkv
 
-# Test playback
+# Test playback - all segments should decode without errors
 ffmpeg -i /tmp/test.mkv -f null -
-# Should show "frame= XXX" with no errors for segment_000
+# Should show "frame= XXX" with no errors
 ```
