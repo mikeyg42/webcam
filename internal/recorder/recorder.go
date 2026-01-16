@@ -562,6 +562,13 @@ func (r *RecordingService) checkSegmentRotation() {
 			r.logger.Debug("Rotating segment",
 				recorderlog.String("recording_id", rec.ID),
 				recorderlog.String("segment_id", seg.ID))
+
+			// Force encoder to produce a keyframe for the next segment
+			// This ensures the new segment can be decoded independently
+			if r.encoder != nil {
+				r.encoder.ForceKeyframe()
+			}
+
 			// Start next segment FIRST - this finalizes the old segment (renames .tmp to .mkv)
 			r.segmenter.NewSegment(rec.ID)
 			r.metrics.SegmentsCreated.Add(1)

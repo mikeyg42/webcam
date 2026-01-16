@@ -651,14 +651,15 @@ import (
 
 // VideoToolboxEncoder implements hardware-accelerated encoding on macOS
 type VideoToolboxEncoder struct {
-	ctx        *C.EncoderContext
-	config     EncoderConfig
-	metrics    EncoderMetrics
-	mu         sync.RWMutex
-	closed     atomic.Bool
-	pixelPool  *PixelBufferPool
-	startTime  time.Time
-	lastEncode time.Time
+	ctx           *C.EncoderContext
+	config        EncoderConfig
+	metrics       EncoderMetrics
+	mu            sync.RWMutex
+	closed        atomic.Bool
+	forceKeyframe atomic.Bool // Flag to force next frame to be a keyframe
+	pixelPool     *PixelBufferPool
+	startTime     time.Time
+	lastEncode    time.Time
 }
 
 // NewVideoToolboxEncoder creates a new hardware-accelerated encoder
@@ -729,11 +730,13 @@ func (e *VideoToolboxEncoder) Encode(frame image.Image, pts time.Duration) ([]by
 	timestamp := C.uint64_t(pts.Microseconds())
 	duration := C.uint64_t(frameDurationMicros)
 
-	// Force a keyframe on interval
+	// Force a keyframe on interval or if explicitly requested
 	forceKey := C.int(0)
-	if e.metrics.FramesEncoded > 0 && e.config.KeyframeInterval > 0 &&
+	if e.forceKeyframe.CompareAndSwap(true, false) {
+		forceKey = 1 // Explicit request via ForceKeyframe()
+	} else if e.metrics.FramesEncoded > 0 && e.config.KeyframeInterval > 0 &&
 		e.metrics.FramesEncoded%uint64(e.config.KeyframeInterval) == 0 {
-		forceKey = 1
+		forceKey = 1 // Regular interval
 	}
 
 	// Call the C wrapper with void* cast
@@ -847,6 +850,12 @@ func (e *VideoToolboxEncoder) GetMetrics() *EncoderMetrics {
 
 	m := e.metrics // copy
 	return &m
+}
+
+// ForceKeyframe requests the next encoded frame be a keyframe.
+// This is used when starting new segments to ensure independent decodability.
+func (e *VideoToolboxEncoder) ForceKeyframe() {
+	e.forceKeyframe.Store(true)
 }
 
 // Close releases all resources

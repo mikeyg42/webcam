@@ -15,6 +15,9 @@ type Encoder interface {
 	Flush() ([][]byte, error)
 	Close() error
 	GetMetrics() *EncoderMetrics
+	// ForceKeyframe requests the next encoded frame be a keyframe (IDR frame).
+	// Used when starting new segments to ensure they can be decoded independently.
+	ForceKeyframe()
 }
 
 // EncoderMetrics provides runtime statistics

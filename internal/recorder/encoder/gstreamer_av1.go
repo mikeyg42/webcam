@@ -32,11 +32,12 @@ type GStreamerAV1Encoder struct {
 	cancel        context.CancelFunc
 
 	// State management
-	mu           sync.RWMutex
-	running      atomic.Bool
-	frameCount   atomic.Uint64
-	bytesEncoded atomic.Uint64
-	keyFrames    atomic.Uint64
+	mu            sync.RWMutex
+	running       atomic.Bool
+	frameCount    atomic.Uint64
+	bytesEncoded  atomic.Uint64
+	keyFrames     atomic.Uint64
+	forceKeyframe atomic.Bool // Flag to force next frame to be a keyframe
 
 	// Lifecycle
 	wg sync.WaitGroup
@@ -535,6 +536,29 @@ func (e *GStreamerAV1Encoder) GetMetrics() *EncoderMetrics {
 		KeyFrames:           e.keyFrames.Load(),
 		HardwareAccelerated: false, // AV1 is software encoding
 		CurrentBitrate:      currentBitrate,
+	}
+}
+
+// ForceKeyframe requests the next encoded frame be a keyframe.
+// This is used when starting new segments to ensure independent decodability.
+func (e *GStreamerAV1Encoder) ForceKeyframe() {
+	e.forceKeyframe.Store(true)
+	log.Println("[AV1 Encoder] Keyframe requested for next frame")
+
+	// Send GstForceKeyUnit custom event to the encoder element
+	// Event type for downstream force-key-unit is 20483 (GST_EVENT_CUSTOM_DOWNSTREAM | GST_EVENT_TYPE_SERIALIZED)
+	if e.encoder != nil {
+		// Create a structure for the force-key-unit event
+		structure := gst.NewStructure("GstForceKeyUnit")
+		if structure != nil {
+			// EventType for custom downstream serialized event
+			event := gst.NewCustomEvent(gst.EventType(20483), structure)
+			if event != nil {
+				if !e.encoder.SendEvent(event) {
+					log.Println("[AV1 Encoder] Warning: failed to send force-key-unit event")
+				}
+			}
+		}
 	}
 }
 
