@@ -11,23 +11,6 @@ export function VideoAdvanced({ data, onChange }: VideoAdvancedProps) {
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-4">
         <Input
-          label="Width"
-          type="number"
-          value={data.width}
-          onChange={(e) => onChange({ width: parseInt(e.target.value, 10) || 1920 })}
-          helper="320-3840 pixels"
-        />
-        <Input
-          label="Height"
-          type="number"
-          value={data.height}
-          onChange={(e) => onChange({ height: parseInt(e.target.value, 10) || 1080 })}
-          helper="240-2160 pixels"
-        />
-      </div>
-
-      <div className="grid grid-cols-2 gap-4">
-        <Input
           label="Framerate"
           type="number"
           value={data.framerate}
@@ -42,6 +25,9 @@ export function VideoAdvanced({ data, onChange }: VideoAdvancedProps) {
           helper="Bits per second (e.g., 2000000)"
         />
       </div>
+      <p className="text-xs text-text-tertiary">
+        Resolution is auto-detected from camera
+      </p>
     </div>
   );
 }

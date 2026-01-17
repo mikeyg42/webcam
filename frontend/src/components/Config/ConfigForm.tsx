@@ -32,7 +32,11 @@ export function ConfigForm({ onConfigComplete }: ConfigFormProps) {
 
   useEffect(() => {
     if (config) {
-      setFormData(config);
+      // Ensure Tailscale is always enabled (it's required for this app)
+      setFormData({
+        ...config,
+        tailscale: { ...config.tailscale, enabled: true },
+      });
     }
   }, [config]);
 
@@ -42,12 +46,7 @@ export function ConfigForm({ onConfigComplete }: ConfigFormProps) {
 
     const errors: string[] = [];
 
-    if (formData.video.width < 320 || formData.video.width > 3840) {
-      errors.push('Video width must be between 320 and 3840 pixels');
-    }
-    if (formData.video.height < 240 || formData.video.height > 2160) {
-      errors.push('Video height must be between 240 and 2160 pixels');
-    }
+    // Note: Video resolution is auto-detected from camera, no validation needed
 
     if (formData.audio.enabled) {
       if (formData.audio.sampleRate < 8000 || formData.audio.sampleRate > 48000) {
@@ -67,10 +66,9 @@ export function ConfigForm({ onConfigComplete }: ConfigFormProps) {
       }
     }
 
-    if (formData.tailscale.enabled) {
-      if (!formData.tailscale.nodeName?.trim()) {
-        errors.push('Tailscale node name is required');
-      }
+    // Tailscale is always required
+    if (!formData.tailscale.nodeName?.trim()) {
+      errors.push('Tailscale node name is required');
     }
 
     return { isValid: errors.length === 0, errors };

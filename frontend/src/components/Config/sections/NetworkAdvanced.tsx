@@ -1,5 +1,4 @@
 import { Input } from '../../primitives/Input';
-import { Toggle } from '../../primitives/Toggle';
 import { Select } from '../../primitives/Select';
 import type { TailscaleSettings, WebRTCSettings } from '../../../types/api';
 
@@ -27,49 +26,26 @@ export function NetworkAdvanced({
       {/* Tailscale Section */}
       <div>
         <p className="text-xs uppercase tracking-label text-text-secondary mb-3">
-          Tailscale VPN
+          Tailscale VPN (Required)
         </p>
         <div className="space-y-4">
-          <Toggle
-            checked={tailscale.enabled}
-            onChange={(enabled) => onUpdateTailscale({ enabled })}
-            label="Enable Tailscale"
-            description="Use Tailscale mesh network for secure connections"
-          />
-
-          {tailscale.enabled && (
-            <>
-              <div className="grid grid-cols-2 gap-4">
-                <Input
-                  label="Node Name"
-                  value={tailscale.nodeName}
-                  onChange={(e) => onUpdateTailscale({ nodeName: e.target.value })}
-                  helper="Your Tailscale node name"
-                />
-                <Input
-                  label="Hostname"
-                  value={tailscale.hostname}
-                  onChange={(e) => onUpdateTailscale({ hostname: e.target.value })}
-                  helper="Network hostname"
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <Input
-                  label="Listen Port"
-                  type="number"
-                  value={tailscale.listenPort}
-                  onChange={(e) => onUpdateTailscale({ listenPort: parseInt(e.target.value, 10) || 41641 })}
-                />
-                <Input
-                  label="Auth Key"
-                  type="password"
-                  value={tailscale.authKey || ''}
-                  onChange={(e) => onUpdateTailscale({ authKey: e.target.value })}
-                  optional
-                />
-              </div>
-            </>
-          )}
+          <div className="grid grid-cols-2 gap-4">
+            <Input
+              label="Listen Port"
+              type="number"
+              value={tailscale.listenPort}
+              onChange={(e) => onUpdateTailscale({ listenPort: parseInt(e.target.value, 10) || 41641 })}
+              helper="Default: 41641"
+            />
+            <Input
+              label="Auth Key"
+              type="password"
+              value={tailscale.authKey || ''}
+              onChange={(e) => onUpdateTailscale({ authKey: e.target.value })}
+              optional
+              helper="Optional pre-auth key"
+            />
+          </div>
         </div>
       </div>
 

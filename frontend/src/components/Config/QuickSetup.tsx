@@ -1,10 +1,10 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
-import { Camera, Mic, MonitorPlay, Zap, Play } from 'lucide-react';
+import { Camera, Mic, Zap, Play, Network } from 'lucide-react';
 import { Button } from '../primitives/Button';
 import { Select, type SelectOption } from '../primitives/Select';
 import { Toggle } from '../primitives/Toggle';
-import { Label } from '../primitives/Label';
+import { Input } from '../primitives/Input';
 import { Card } from '../layout/Card';
 import { slideUp } from '../../lib/motion';
 import type { ConfigResponse, CameraDevice, MicrophoneDevice } from '../../types/api';
@@ -16,13 +16,6 @@ interface QuickSetupProps {
   isSaving: boolean;
   hasAdvancedChanges?: boolean;
 }
-
-// Resolution presets
-const resolutionPresets: { label: string; width: number; height: number }[] = [
-  { label: '720p', width: 1280, height: 720 },
-  { label: '1080p', width: 1920, height: 1080 },
-  { label: '4K', width: 3840, height: 2160 },
-];
 
 // Recording mode options
 type RecordingMode = 'none' | 'continuous' | 'motion';
@@ -66,11 +59,6 @@ export function QuickSetup({
 
     fetchDevices();
   }, []);
-
-  // Determine current resolution preset
-  const currentResolution = resolutionPresets.find(
-    (p) => p.width === config.video.width && p.height === config.video.height
-  );
 
   // Determine current recording mode
   const getRecordingMode = (): RecordingMode => {
@@ -173,52 +161,6 @@ export function QuickSetup({
         </div>
       </Card>
 
-      {/* Resolution Presets */}
-      <Card padding="md">
-        <div className="flex items-start gap-4">
-          <div className="w-10 h-10 rounded-lg bg-accent/10 flex items-center justify-center shrink-0">
-            <MonitorPlay className="w-5 h-5 text-accent" />
-          </div>
-          <div className="flex-1 min-w-0">
-            <Label helper="Higher resolution uses more storage and bandwidth">
-              Resolution
-            </Label>
-            <div className="flex gap-2 mt-2">
-              {resolutionPresets.map((preset) => {
-                const isSelected =
-                  config.video.width === preset.width &&
-                  config.video.height === preset.height;
-                return (
-                  <button
-                    key={preset.label}
-                    type="button"
-                    onClick={() =>
-                      onUpdate('video', { width: preset.width, height: preset.height })
-                    }
-                    className={`
-                      flex-1 py-2 px-3 rounded text-sm font-medium uppercase tracking-label
-                      transition-colors duration-150
-                      ${
-                        isSelected
-                          ? 'bg-accent text-text-inverse'
-                          : 'bg-bg-subtle text-text-secondary hover:bg-bg-hover hover:text-text-primary border border-border'
-                      }
-                    `}
-                  >
-                    {preset.label}
-                  </button>
-                );
-              })}
-            </div>
-            {!currentResolution && (
-              <p className="text-2xs text-text-tertiary mt-2">
-                Custom: {config.video.width}×{config.video.height}
-              </p>
-            )}
-          </div>
-        </div>
-      </Card>
-
       {/* Recording Mode */}
       <Card padding="md">
         <div className="flex items-start gap-4">
@@ -250,6 +192,37 @@ export function QuickSetup({
               label="Motion Detection"
               description="Analyze video for movement and trigger events"
             />
+          </div>
+        </div>
+      </Card>
+
+      {/* Tailscale Network */}
+      <Card padding="md">
+        <div className="flex items-start gap-4">
+          <div className="w-10 h-10 rounded-lg bg-accent/10 flex items-center justify-center shrink-0">
+            <Network className="w-5 h-5 text-accent" />
+          </div>
+          <div className="flex-1 min-w-0 space-y-4">
+            <div>
+              <p className="text-sm font-medium text-text-primary mb-1">Tailscale Network</p>
+              <p className="text-xs text-text-secondary mb-3">
+                Secure mesh network for remote access
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <Input
+                label="Node Name"
+                value={config.tailscale.nodeName}
+                onChange={(e) => onUpdate('tailscale', { nodeName: e.target.value })}
+                helper="Your Tailscale node name"
+              />
+              <Input
+                label="Hostname"
+                value={config.tailscale.hostname}
+                onChange={(e) => onUpdate('tailscale', { hostname: e.target.value })}
+                helper="Network hostname"
+              />
+            </div>
           </div>
         </div>
       </Card>
