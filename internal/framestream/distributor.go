@@ -12,6 +12,7 @@ import (
 
 	"github.com/pion/mediadevices"
 	"github.com/pion/mediadevices/pkg/prop"
+	"github.com/pion/mediadevices/pkg/wave"
 )
 
 // ============================================================================
@@ -24,6 +25,11 @@ type FrameDistributor struct {
 	camera        mediadevices.MediaDeviceInfo
 	stream        mediadevices.MediaStream
 
+	// Audio configuration
+	microphone         mediadevices.MediaDeviceInfo
+	audioEnabled       bool
+	audioStream        mediadevices.MediaStream
+
 	// Lifecycle management
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -32,10 +38,12 @@ type FrameDistributor struct {
 	// State management with atomic for race-free checks
 	isRunning atomic.Bool
 
-	// Consumer channels
-	webrtcChannel chan image.Image  // H.264 for WebRTC streaming
-	motionChannel chan image.Image
-	recordChannel chan image.Image
+	// Broadcasters for subscription-based distribution
+	// These survive Stop/Start cycles - subscriptions remain valid
+	webrtcBroadcaster *Broadcaster[image.Image]
+	motionBroadcaster *Broadcaster[image.Image]
+	recordBroadcaster *Broadcaster[image.Image]
+	audioBroadcaster  *Broadcaster[*AudioFrame]
 
 	// Pre-motion buffer
 	preMotionBuffer *CircularFrameBuffer
@@ -47,6 +55,7 @@ type FrameDistributor struct {
 		webrtcSent     atomic.Int64  // H.264 frames sent to WebRTC
 		motionSent     atomic.Int64
 		recordSent     atomic.Int64
+		audioSent      atomic.Int64  // Audio frames sent to recorder
 		lastFrameTime  atomic.Value // stores time.Time
 	}
 }
@@ -58,6 +67,7 @@ type DistributorStats struct {
 	WebRTCSent    int64  // H.264 frames sent to WebRTC
 	MotionSent    int64
 	RecordSent    int64
+	AudioSent     int64  // Audio frames sent to recorder
 	LastFrameTime time.Time
 }
 
@@ -68,8 +78,16 @@ type ImageFrame struct {
 	Sequence  int64
 }
 
+// AudioFrame wraps audio data with metadata for recording
+type AudioFrame struct {
+	Data      []byte
+	Timestamp time.Time
+	Duration  time.Duration
+}
+
 // NewFrameDistributor creates a new single-source frame distributor
-func NewFrameDistributor(ctx context.Context, camera mediadevices.MediaDeviceInfo) (*FrameDistributor, error) {
+func NewFrameDistributor(ctx context.Context, camera mediadevices.MediaDeviceInfo,
+	microphone mediadevices.MediaDeviceInfo, audioEnabled bool) (*FrameDistributor, error) {
 
 	fdCtx, cancel := context.WithCancel(ctx)
 
@@ -77,13 +95,16 @@ func NewFrameDistributor(ctx context.Context, camera mediadevices.MediaDeviceInf
 	preMotionBuffer := NewCircularFrameBuffer(75)
 
 	fd := &FrameDistributor{
-		camera:          camera,
-		ctx:             fdCtx,
-		cancel:          cancel,
-		webrtcChannel:   make(chan image.Image, 10),  // H.264 for WebRTC
-		motionChannel:   make(chan image.Image, 5),
-		recordChannel:   make(chan image.Image, 30),
-		preMotionBuffer: preMotionBuffer,
+		camera:            camera,
+		microphone:        microphone,
+		audioEnabled:      audioEnabled,
+		ctx:               fdCtx,
+		cancel:            cancel,
+		webrtcBroadcaster: NewBroadcaster[image.Image]("WebRTC", 10),
+		motionBroadcaster: NewBroadcaster[image.Image]("Motion", 5),
+		recordBroadcaster: NewBroadcaster[image.Image]("Record", 60),
+		audioBroadcaster:  NewBroadcaster[*AudioFrame]("Audio", 50),
+		preMotionBuffer:   preMotionBuffer,
 	}
 
 	// Initialize last frame time
@@ -101,6 +122,15 @@ func (fd *FrameDistributor) Start(width, height int) error {
 	}
 
 	log.Printf("[FrameDistributor] Starting single camera capture at %dx%d", width, height)
+
+	// Resume broadcasters (subscriptions survive restarts)
+	fd.webrtcBroadcaster.Resume()
+	fd.motionBroadcaster.Resume()
+	fd.recordBroadcaster.Resume()
+	fd.audioBroadcaster.Resume()
+
+	// Create new cancellable context for this run
+	fd.ctx, fd.cancel = context.WithCancel(context.Background())
 
 	// Configure camera constraints (no codec - raw frames only)
 	constraints := mediadevices.MediaStreamConstraints{
@@ -123,6 +153,15 @@ func (fd *FrameDistributor) Start(width, height int) error {
 	// Start distribution goroutine
 	fd.wg.Add(1)
 	go fd.distributeFrames()
+
+	// Start audio capture if enabled
+	if fd.audioEnabled && fd.microphone.DeviceID != "" {
+		if err := fd.startAudioCapture(); err != nil {
+			log.Printf("[FrameDistributor] Warning: Failed to start audio capture: %v", err)
+		} else {
+			log.Printf("[FrameDistributor] Audio capture started")
+		}
+	}
 
 	log.Printf("[FrameDistributor] Started successfully - single camera source active")
 	return nil
@@ -251,36 +290,35 @@ func (fd *FrameDistributor) efficientClone(img image.Image) image.Image {
 	}
 }
 
-// sendToConsumers distributes frame to all consumer channels
+// sendToConsumers distributes frame to all subscribers via broadcasters
 func (fd *FrameDistributor) sendToConsumers(img image.Image) {
-	// H.264 WebRTC encoder channel (non-blocking)
-	select {
-	case fd.webrtcChannel <- img:
-		fd.stats.webrtcSent.Add(1)
-	default:
-		fd.stats.droppedFrames.Add(1)
-		// Only log every 100th dropped frame to avoid spam
-		if fd.stats.droppedFrames.Load()%100 == 0 {
-			log.Printf("[FrameDistributor] VP9 channel full, total dropped: %d",
-				fd.stats.droppedFrames.Load())
+	// CRITICAL: Clone the image before broadcasting!
+	// The camera's underlying buffer is released after processFrame returns (via release()).
+	// Without cloning, subscribers receive frames that may be overwritten by the next capture.
+	// This caused calibration to show 0% motion - optical flow compared identical/corrupted frames.
+	cloned := fd.efficientClone(img)
+	if cloned == nil {
+		return
+	}
+
+	// Debug: log frame data fingerprint every 30 frames to verify cloning works
+	seq := fd.stats.totalFrames.Load()
+	if seq%30 == 0 {
+		if ycbcr, ok := cloned.(*image.YCbCr); ok && len(ycbcr.Y) > 100 {
+			// Sample first few Y pixels as fingerprint
+			log.Printf("[FrameDistributor] Frame %d fingerprint: Y[0:8]=%v", seq, ycbcr.Y[0:8])
 		}
 	}
 
-	// Motion detection channel
-	select {
-	case fd.motionChannel <- img:
-		fd.stats.motionSent.Add(1)
-	default:
-		fd.stats.droppedFrames.Add(1)
-	}
+	// Broadcast cloned frame to all subscribers
+	fd.webrtcBroadcaster.Broadcast(cloned)
+	fd.stats.webrtcSent.Add(1)
 
-	// Recording channel
-	select {
-	case fd.recordChannel <- img:
-		fd.stats.recordSent.Add(1)
-	default:
-		fd.stats.droppedFrames.Add(1)
-	}
+	fd.motionBroadcaster.Broadcast(cloned)
+	fd.stats.motionSent.Add(1)
+
+	fd.recordBroadcaster.Broadcast(cloned)
+	fd.stats.recordSent.Add(1)
 }
 
 // logStats prints current statistics
@@ -337,10 +375,18 @@ func (fd *FrameDistributor) cleanup() {
 		}
 	}
 
-	// Close channels (safe because distributeFrames has exited)
-	close(fd.webrtcChannel)
-	close(fd.motionChannel)
-	close(fd.recordChannel)
+	// Close audio stream if it exists
+	if fd.audioStream != nil {
+		for _, track := range fd.audioStream.GetTracks() {
+			track.Close()
+		}
+	}
+
+	// Pause broadcasters (subscriptions remain valid for restart)
+	fd.webrtcBroadcaster.Pause()
+	fd.motionBroadcaster.Pause()
+	fd.recordBroadcaster.Pause()
+	fd.audioBroadcaster.Pause()
 
 	// Clear pre-motion buffer
 	fd.preMotionBuffer.Clear()
@@ -348,19 +394,161 @@ func (fd *FrameDistributor) cleanup() {
 	log.Printf("[FrameDistributor] Cleanup completed")
 }
 
-// GetWebRTCChannel returns the channel for H.264 WebRTC encoder frames
-func (fd *FrameDistributor) GetWebRTCChannel() <-chan image.Image {
-	return fd.webrtcChannel
+// startAudioCapture initializes microphone capture and starts audio distribution
+func (fd *FrameDistributor) startAudioCapture() error {
+	// Configure microphone constraints for Opus-compatible settings
+	constraints := mediadevices.MediaStreamConstraints{
+		Audio: func(c *mediadevices.MediaTrackConstraints) {
+			c.DeviceID = prop.String(fd.microphone.DeviceID)
+			c.SampleRate = prop.IntExact(48000)  // 48kHz for Opus
+			c.ChannelCount = prop.IntExact(2)    // Stereo
+		},
+	}
+
+	// Create audio stream
+	audioStream, err := mediadevices.GetUserMedia(constraints)
+	if err != nil {
+		return fmt.Errorf("failed to get audio media: %v", err)
+	}
+	fd.audioStream = audioStream
+
+	// Start audio distribution goroutine
+	fd.wg.Add(1)
+	go fd.distributeAudioFrames()
+
+	return nil
 }
 
-// GetMotionChannel returns the channel for motion detection frames
-func (fd *FrameDistributor) GetMotionChannel() <-chan image.Image {
-	return fd.motionChannel
+// distributeAudioFrames reads from the microphone and distributes to the audio channel
+func (fd *FrameDistributor) distributeAudioFrames() {
+	defer fd.wg.Done()
+
+	// Get audio track
+	audioTracks := fd.audioStream.GetAudioTracks()
+	if len(audioTracks) == 0 {
+		log.Printf("[FrameDistributor] ERROR: No audio tracks available")
+		return
+	}
+
+	track := audioTracks[0]
+	log.Printf("[FrameDistributor] Processing audio from track: %s", track.ID())
+
+	audioTrack, ok := track.(*mediadevices.AudioTrack)
+	if !ok {
+		log.Printf("[FrameDistributor] ERROR: Track is not an AudioTrack: %T", track)
+		return
+	}
+
+	// Create reader for raw audio samples
+	audioReader := audioTrack.NewReader(false)
+
+	for {
+		select {
+		case <-fd.ctx.Done():
+			log.Printf("[FrameDistributor] Stopping audio capture due to context cancellation")
+			return
+
+		default:
+			// Read next audio chunk
+			chunk, release, err := audioReader.Read()
+			if err != nil {
+				log.Printf("[FrameDistributor] Error reading audio: %v", err)
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+
+			// Get chunk info for duration calculation
+			info := chunk.ChunkInfo()
+
+			// Calculate duration from samples: duration = samples / sampleRate
+			var durationNs int64
+			if info.SamplingRate > 0 {
+				durationNs = int64(info.Len) * int64(time.Second) / int64(info.SamplingRate)
+			} else {
+				durationNs = int64(20 * time.Millisecond) // Default Opus frame duration
+			}
+
+			// Convert audio samples to raw bytes
+			var audioData []byte
+			switch audio := chunk.(type) {
+			case *wave.Int16Interleaved:
+				// Convert int16 samples to bytes (little-endian)
+				audioData = make([]byte, len(audio.Data)*2)
+				for i, sample := range audio.Data {
+					audioData[i*2] = byte(sample)
+					audioData[i*2+1] = byte(sample >> 8)
+				}
+			case *wave.Float32Interleaved:
+				// Convert float32 samples to int16 bytes (little-endian)
+				audioData = make([]byte, len(audio.Data)*2)
+				for i, sample := range audio.Data {
+					// Clamp and convert float32 [-1.0, 1.0] to int16
+					s := int16(sample * 32767)
+					audioData[i*2] = byte(s)
+					audioData[i*2+1] = byte(s >> 8)
+				}
+			default:
+				// Generic fallback: read samples using the interface
+				audioData = make([]byte, info.Len*info.Channels*2)
+				for i := 0; i < info.Len; i++ {
+					for ch := 0; ch < info.Channels; ch++ {
+						sample := chunk.At(i, ch)
+						// Convert sample to int16
+						var s int16
+						switch v := sample.(type) {
+						case wave.Int16Sample:
+							s = int16(v)
+						case wave.Float32Sample:
+							s = int16(float32(v) * 32767)
+						}
+						idx := (i*info.Channels + ch) * 2
+						audioData[idx] = byte(s)
+						audioData[idx+1] = byte(s >> 8)
+					}
+				}
+			}
+
+			// Create audio frame
+			frame := &AudioFrame{
+				Data:      audioData,
+				Timestamp: time.Now(),
+				Duration:  time.Duration(durationNs),
+			}
+
+			// Release the original buffer
+			if release != nil {
+				release()
+			}
+
+			// Broadcast to all audio subscribers
+			fd.audioBroadcaster.Broadcast(frame)
+			fd.stats.audioSent.Add(1)
+		}
+	}
 }
 
-// GetRecordChannel returns the channel for recording frames
-func (fd *FrameDistributor) GetRecordChannel() <-chan image.Image {
-	return fd.recordChannel
+// SubscribeWebRTC creates a subscription for WebRTC encoder frames.
+// The subscription survives distributor restarts.
+func (fd *FrameDistributor) SubscribeWebRTC() *Subscription[image.Image] {
+	return fd.webrtcBroadcaster.Subscribe()
+}
+
+// SubscribeMotion creates a subscription for motion detection frames.
+// The subscription survives distributor restarts.
+func (fd *FrameDistributor) SubscribeMotion() *Subscription[image.Image] {
+	return fd.motionBroadcaster.Subscribe()
+}
+
+// SubscribeRecord creates a subscription for recording frames.
+// The subscription survives distributor restarts.
+func (fd *FrameDistributor) SubscribeRecord() *Subscription[image.Image] {
+	return fd.recordBroadcaster.Subscribe()
+}
+
+// SubscribeAudio creates a subscription for audio recording frames.
+// The subscription survives distributor restarts.
+func (fd *FrameDistributor) SubscribeAudio() *Subscription[*AudioFrame] {
+	return fd.audioBroadcaster.Subscribe()
 }
 
 // GetPreMotionFrames returns buffered frames from before motion was detected
@@ -373,6 +561,34 @@ func (fd *FrameDistributor) IsRunning() bool {
 	return fd.isRunning.Load()
 }
 
+// UpdateDevices updates the camera and microphone devices.
+// Must be called while the distributor is stopped.
+// Returns error if the distributor is currently running or if device validation fails.
+func (fd *FrameDistributor) UpdateDevices(camera mediadevices.MediaDeviceInfo,
+	microphone mediadevices.MediaDeviceInfo, audioEnabled bool) error {
+	if fd.isRunning.Load() {
+		return fmt.Errorf("cannot update devices while distributor is running")
+	}
+
+	// Validate camera device - DeviceID is required
+	if camera.DeviceID == "" {
+		return fmt.Errorf("camera DeviceID is required")
+	}
+
+	// Validate microphone device if audio is enabled
+	if audioEnabled && microphone.DeviceID == "" {
+		return fmt.Errorf("microphone DeviceID is required when audio is enabled")
+	}
+
+	fd.camera = camera
+	fd.microphone = microphone
+	fd.audioEnabled = audioEnabled
+
+	log.Printf("[FrameDistributor] Devices updated - Camera: %s, Microphone: %s, Audio: %v",
+		camera.Label, microphone.Label, audioEnabled)
+	return nil
+}
+
 // GetStats returns current statistics
 func (fd *FrameDistributor) GetStats() DistributorStats {
 	lastTime, _ := fd.stats.lastFrameTime.Load().(time.Time)
@@ -380,9 +596,10 @@ func (fd *FrameDistributor) GetStats() DistributorStats {
 	return DistributorStats{
 		TotalFrames:   fd.stats.totalFrames.Load(),
 		DroppedFrames: fd.stats.droppedFrames.Load(),
-		WebRTCSent:   fd.stats.webrtcSent.Load(),
-		MotionSent:   fd.stats.motionSent.Load(),
-		RecordSent:   fd.stats.recordSent.Load(),
+		WebRTCSent:    fd.stats.webrtcSent.Load(),
+		MotionSent:    fd.stats.motionSent.Load(),
+		RecordSent:    fd.stats.recordSent.Load(),
+		AudioSent:     fd.stats.audioSent.Load(),
 		LastFrameTime: lastTime,
 	}
 }

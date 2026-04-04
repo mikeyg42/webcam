@@ -328,6 +328,13 @@ func (e *GStreamerAV1Encoder) configureAppSink() error {
 				// Update metrics
 				e.bytesEncoded.Add(uint64(len(encoded)))
 
+				// Track keyframes by scanning OBUs for Sequence Header (type=1).
+				// GStreamer SVT-AV1 typically emits a temporal delimiter (type=2) before
+				// the sequence header, so we scan the first few OBUs.
+				if containsSequenceHeader(encoded) {
+					e.keyFrames.Add(1)
+				}
+
 				// Send to channel (non-blocking)
 				select {
 				case e.encodedFrames <- encoded:
@@ -381,6 +388,23 @@ func (e *GStreamerAV1Encoder) Encode(frame image.Image, pts time.Duration) ([]by
 	buffer := gst.NewBufferFromBytes(data)
 	buffer.SetPresentationTimestamp(gst.ClockTime(pts.Nanoseconds()))
 	buffer.SetDuration(gst.ClockTime(time.Second.Nanoseconds() / int64(e.config.FrameRate)))
+
+	// If a keyframe was requested, consume the flag and re-send force-key-unit event
+	// directly on the encoder element (belt-and-suspenders with ForceKeyframe() method)
+	if e.forceKeyframe.CompareAndSwap(true, false) {
+		e.mu.RLock()
+		enc := e.encoder
+		e.mu.RUnlock()
+		if enc != nil {
+			structure := gst.NewStructure("GstForceKeyUnit")
+			if structure != nil {
+				event := gst.NewCustomEvent(gst.EventType(20483), structure)
+				if event != nil {
+					enc.SendEvent(event)
+				}
+			}
+		}
+	}
 
 	// Push to pipeline
 	if ret := e.appSrc.PushBuffer(buffer); ret != gst.FlowOK {
@@ -541,25 +565,47 @@ func (e *GStreamerAV1Encoder) GetMetrics() *EncoderMetrics {
 
 // ForceKeyframe requests the next encoded frame be a keyframe.
 // This is used when starting new segments to ensure independent decodability.
+// Sets an atomic flag that Encode() consumes on the next call, sending the
+// GstForceKeyUnit event synchronously during encoding for reliable delivery.
 func (e *GStreamerAV1Encoder) ForceKeyframe() {
 	e.forceKeyframe.Store(true)
 	log.Println("[AV1 Encoder] Keyframe requested for next frame")
+}
 
-	// Send GstForceKeyUnit custom event to the encoder element
-	// Event type for downstream force-key-unit is 20483 (GST_EVENT_CUSTOM_DOWNSTREAM | GST_EVENT_TYPE_SERIALIZED)
-	if e.encoder != nil {
-		// Create a structure for the force-key-unit event
-		structure := gst.NewStructure("GstForceKeyUnit")
-		if structure != nil {
-			// EventType for custom downstream serialized event
-			event := gst.NewCustomEvent(gst.EventType(20483), structure)
-			if event != nil {
-				if !e.encoder.SendEvent(event) {
-					log.Println("[AV1 Encoder] Warning: failed to send force-key-unit event")
+// containsSequenceHeader scans AV1 OBU headers to check if the bitstream contains a
+// Sequence Header OBU (type=1), which indicates a keyframe. GStreamer SVT-AV1 typically
+// emits a Temporal Delimiter OBU before the Sequence Header, so we must scan past it.
+func containsSequenceHeader(data []byte) bool {
+	offset := 0
+	for offset < len(data) && offset < 32 { // Only scan first 32 bytes
+		header := data[offset]
+		obuType := (header >> 3) & 0x0F
+		if obuType == 1 { // OBU_SEQUENCE_HEADER
+			return true
+		}
+		hasExtension := (header>>2)&1 == 1
+		hasSizeField := (header>>1)&1 == 1
+		offset++
+		if hasExtension && offset < len(data) {
+			offset++ // Skip extension header
+		}
+		if hasSizeField && offset < len(data) {
+			// Read LEB128 size
+			size := 0
+			for shift := 0; offset < len(data); shift += 7 {
+				b := data[offset]
+				offset++
+				size |= int(b&0x7F) << shift
+				if b&0x80 == 0 {
+					break
 				}
 			}
+			offset += size
+		} else {
+			break // Can't skip without size field
 		}
 	}
+	return false
 }
 
 // Ensure GStreamerAV1Encoder implements Encoder interface

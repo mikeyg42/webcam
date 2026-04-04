@@ -3,7 +3,6 @@ package api
 
 import (
 	"context"
-	"image"
 	"log"
 	"net/http"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/mikeyg42/webcam/internal/calibration"
 	"github.com/mikeyg42/webcam/internal/config"
 	"github.com/mikeyg42/webcam/internal/database"
+	"github.com/mikeyg42/webcam/internal/framestream"
 	"github.com/mikeyg42/webcam/internal/motion"
 	"github.com/mikeyg42/webcam/internal/tailscale"
 )
@@ -28,12 +28,8 @@ type Server struct {
 }
 
 // NewServer creates a new API server
-func NewServer(ctx context.Context, cfg *config.Config, addr string, calibService *calibration.Service, detector *motion.Detector, frameDistributor interface {
-	GetMotionChannel() <-chan image.Image
-	Start(width, height int) error
-	Stop()
-	IsRunning() bool
-}, credDB *database.DB, tsManager *tailscale.TailscaleManager) *Server {
+func NewServer(ctx context.Context, cfg *config.Config, addr string, calibService *calibration.Service, detector *motion.Detector,
+	frameDistributor *framestream.FrameDistributor, credDB *database.DB, tsManager *tailscale.TailscaleManager) *Server {
 	mux := http.NewServeMux()
 
 	// Create configuration handler with motion detector for runtime updates
@@ -50,7 +46,10 @@ func NewServer(ctx context.Context, cfg *config.Config, addr string, calibServic
 	// Create calibration handler (if provided)
 	var calibrationHandler *CalibrationHandler
 	if calibService != nil && detector != nil && frameDistributor != nil {
-		calibrationHandler = NewCalibrationHandler(ctx, calibService, detector, frameDistributor)
+		calibrationHandler = NewCalibrationHandler(ctx, calibService, detector, frameDistributor, cfg)
+		if tsManager != nil {
+			calibrationHandler.SetTailscaleManager(tsManager)
+		}
 		calibrationHandler.RegisterRoutes(mux)
 	}
 
@@ -118,6 +117,22 @@ func (s *Server) SetQualityHandler(provider QualityManagerProvider) {
 		s.qualityHandler = NewQualityHandler(provider)
 		s.qualityHandler.RegisterRoutes(s.mux)
 		log.Println("[APIServer] Quality metrics endpoint registered at /api/quality/metrics")
+	}
+}
+
+// SetRecordingHealthHandler sets the recording health handler (called after recorder service is initialized)
+func (s *Server) SetRecordingHealthHandler(provider RecordingHealthProvider) {
+	if provider != nil {
+		handler := NewRecordingHealthHandler(provider)
+		handler.RegisterRoutes(s.mux)
+	}
+}
+
+// SetRecordingControlHandler sets the recording control handler (called after recorder service is initialized)
+func (s *Server) SetRecordingControlHandler(controller RecordingController) {
+	if controller != nil {
+		handler := NewRecordingControlHandler(controller)
+		handler.RegisterRoutes(s.mux)
 	}
 }
 

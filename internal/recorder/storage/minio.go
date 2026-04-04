@@ -54,10 +54,6 @@ type MinIOConfig struct {
 	// Retry settings (best-effort; MinIO client also retries internally)
 	MaxRetries   int
 	RetryBackoff time.Duration
-
-	// Multipart settings
-	PartSize    int64 // default: 64MB
-	Concurrency int   // concurrent part uploads
 }
 
 // MinIOMetrics tracks MinIO operations
@@ -87,12 +83,6 @@ func NewMinIOStore(config MinIOConfig) (*MinIOStore, error) {
 	}
 	if config.RequestTimeout == 0 {
 		config.RequestTimeout = 5 * time.Minute
-	}
-	if config.PartSize == 0 {
-		config.PartSize = 64 * 1024 * 1024 // 64MB
-	}
-	if config.Concurrency == 0 {
-		config.Concurrency = 4
 	}
 	if config.MaxRetries < 0 {
 		config.MaxRetries = 0
@@ -185,6 +175,7 @@ func (s *MinIOStore) Put(ctx context.Context, key string, reader io.Reader, size
 		if s.config.RetryBackoff > 0 {
 			ebo.InitialInterval = s.config.RetryBackoff
 		}
+		ebo.MaxElapsedTime = 2 * time.Minute
 		ebo.Reset()
 		if s.config.MaxRetries > 0 {
 			return backoff.WithMaxRetries(ebo, uint64(s.config.MaxRetries))
@@ -493,43 +484,6 @@ func (s *MinIOStore) GeneratePresignedUploadURL(ctx context.Context, key string,
 		return "", &StorageError{Op: "generate_upload_url", Key: key, Err: err}
 	}
 	return u.String(), nil
-}
-
-// InitiateMultipartUpload starts a multipart upload (simplified placeholder)
-func (s *MinIOStore) InitiateMultipartUpload(ctx context.Context, key string, _ ...PutOption) (string, error) {
-	uploadID := fmt.Sprintf("upload_%s_%d", key, time.Now().UnixNano())
-	s.logger.Info("Initiated multipart upload",
-		zap.String("key", key),
-		zap.String("upload_id", uploadID))
-	return uploadID, nil
-}
-
-// UploadPart uploads a part of a multipart upload (simplified placeholder)
-func (s *MinIOStore) UploadPart(_ context.Context, key, uploadID string, partNumber int, _ io.Reader, size int64) (string, error) {
-	etag := fmt.Sprintf("etag_%d", partNumber)
-	s.logger.Debug("Uploaded part",
-		zap.String("key", key),
-		zap.String("upload_id", uploadID),
-		zap.Int("part_number", partNumber),
-		zap.Int64("size", size))
-	return etag, nil
-}
-
-// CompleteMultipartUpload completes a multipart upload (simplified placeholder)
-func (s *MinIOStore) CompleteMultipartUpload(_ context.Context, key, uploadID string, parts []CompletedPart) error {
-	s.logger.Info("Completed multipart upload",
-		zap.String("key", key),
-		zap.String("upload_id", uploadID),
-		zap.Int("parts", len(parts)))
-	return nil
-}
-
-// AbortMultipartUpload aborts a multipart upload (simplified placeholder)
-func (s *MinIOStore) AbortMultipartUpload(_ context.Context, key, uploadID string) error {
-	s.logger.Info("Aborted multipart upload",
-		zap.String("key", key),
-		zap.String("upload_id", uploadID))
-	return nil
 }
 
 // GetBucketInfo returns information about the bucket

@@ -21,6 +21,7 @@ type MetadataStore interface {
 	// Recording operations
 	SaveRecording(ctx context.Context, recording *Recording) error
 	UpdateRecording(ctx context.Context, id string, updates map[string]interface{}) error
+	UpdateRecordingStatus(ctx context.Context, id string, status string) error
 	GetRecording(ctx context.Context, id string) (*Recording, error)
 	QueryRecordings(ctx context.Context, query RecordingQuery) ([]*Recording, error)
 	DeleteRecording(ctx context.Context, id string) error
@@ -29,8 +30,10 @@ type MetadataStore interface {
 	SaveSegment(ctx context.Context, segment *Segment) error
 	GetSegment(ctx context.Context, recordingID string, index int) (*Segment, error)
 	GetSegments(ctx context.Context, recordingID string) ([]*Segment, error)
+	GetNextSegmentIndex(ctx context.Context, recordingID string) (int, error)
 	UpdateSegmentStatus(ctx context.Context, segmentID string, status SegmentStatus) error
 	DeleteOldSegments(ctx context.Context, olderThan time.Time) (int64, error)
+	GetExpiredSegmentKeys(ctx context.Context, olderThan time.Time) ([]string, error)
 	
 	// Event operations
 	SaveMotionEvent(ctx context.Context, event *MotionEvent) error
@@ -140,7 +143,7 @@ func (s *PostgresStore) initSchema(ctx context.Context) error {
 		id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
 		external_id VARCHAR(255) UNIQUE NOT NULL,
 		type VARCHAR(20) NOT NULL CHECK (type IN ('continuous', 'event')),
-		status VARCHAR(20) NOT NULL CHECK (status IN ('recording', 'processing', 'completed', 'failed')),
+		status VARCHAR(30) NOT NULL CHECK (status IN ('recording', 'processing', 'completed', 'failed', 'crashed', 'panic_recovered')),
 		
 		started_at TIMESTAMPTZ NOT NULL,
 		ended_at TIMESTAMPTZ,
@@ -174,45 +177,48 @@ func (s *PostgresStore) initSchema(ctx context.Context) error {
 	);
 	
 	-- Segments table
+	-- NOTE: recording_id references external_id (the application-generated UUID),
+	-- not the internal Postgres id. This allows the app to use its own IDs consistently.
 	CREATE TABLE IF NOT EXISTS segments (
 		id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-		recording_id UUID REFERENCES recordings(id) ON DELETE CASCADE,
+		recording_id VARCHAR(255) REFERENCES recordings(external_id) ON DELETE CASCADE,
 		segment_index INTEGER NOT NULL,
-		
+
 		start_time TIMESTAMPTZ NOT NULL,
 		end_time TIMESTAMPTZ NOT NULL,
 		duration_seconds FLOAT NOT NULL,
-		
+
 		storage_key VARCHAR(500) NOT NULL,
 		size_bytes BIGINT NOT NULL,
 		frame_count BIGINT DEFAULT 0,
 		checksum VARCHAR(64),
-		
-		status VARCHAR(20) NOT NULL CHECK (status IN ('recording', 'uploading', 'completed', 'verified', 'failed')),
+
+		status VARCHAR(20) NOT NULL CHECK (status IN ('recording', 'finalizing', 'uploading', 'uploaded', 'completed', 'verified', 'failed')),
 		upload_attempts INTEGER DEFAULT 0,
 		last_error TEXT,
-		
+
 		created_at TIMESTAMPTZ DEFAULT NOW(),
 		uploaded_at TIMESTAMPTZ,
-		
+
 		UNIQUE(recording_id, segment_index)
 	);
 	
 	-- Motion events table
+	-- NOTE: recording_id references external_id for consistency with segments table
 	CREATE TABLE IF NOT EXISTS motion_events (
 		id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-		recording_id UUID REFERENCES recordings(id) ON DELETE CASCADE,
-		
+		recording_id VARCHAR(255) REFERENCES recordings(external_id) ON DELETE CASCADE,
+
 		event_time TIMESTAMPTZ NOT NULL,
 		confidence FLOAT NOT NULL,
 		duration_seconds FLOAT,
-		
+
 		regions JSONB, -- Array of detected regions
 		peak_confidence FLOAT,
 		total_motion_frames INTEGER,
-		
+
 		metadata JSONB DEFAULT '{}',
-		
+
 		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
 	
@@ -345,6 +351,26 @@ func (s *PostgresStore) UpdateRecording(ctx context.Context, id string, updates 
 		return fmt.Errorf("recording not found: %s", id)
 	}
 	
+	return nil
+}
+
+// UpdateRecordingStatus updates just the status field of a recording
+func (s *PostgresStore) UpdateRecordingStatus(ctx context.Context, id string, status string) error {
+	query := `UPDATE recordings SET status = $1, updated_at = NOW() WHERE external_id = $2`
+	result, err := s.db.ExecContext(ctx, query, status, id)
+	if err != nil {
+		return fmt.Errorf("failed to update recording status: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rows == 0 {
+		return fmt.Errorf("recording not found: %s", id)
+	}
+
 	return nil
 }
 
@@ -522,11 +548,17 @@ func (s *PostgresStore) DeleteRecording(ctx context.Context, id string) error {
 	return nil
 }
 
-// SaveSegment saves a segment
+// SaveSegment saves a segment and updates recording stats atomically
 func (s *PostgresStore) SaveSegment(ctx context.Context, segment *Segment) error {
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Verify the recording exists first
 	var exists bool
-	err := s.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		"SELECT EXISTS(SELECT 1 FROM recordings WHERE external_id = $1)",
 		segment.RecordingID,
 	).Scan(&exists)
@@ -538,13 +570,20 @@ func (s *PostgresStore) SaveSegment(ctx context.Context, segment *Segment) error
 		return fmt.Errorf("recording not found: %s", segment.RecordingID)
 	}
 
+	// Determine uploaded_at value
+	var uploadedAt sql.NullTime
+	if segment.Status == SegmentStatusCompleted || segment.Status == SegmentStatusUploaded {
+		uploadedAt = sql.NullTime{Time: time.Now(), Valid: true}
+	}
+
 	// Use external_id directly since FK references recordings(external_id)
+	// Include uploaded_at in INSERT, and use xmax=0 to detect insert vs update
 	query := `
 		INSERT INTO segments (
 			recording_id, segment_index, start_time, end_time, duration_seconds,
-			storage_key, size_bytes, frame_count, checksum, status
+			storage_key, size_bytes, frame_count, checksum, status, uploaded_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
 		)
 		ON CONFLICT (recording_id, segment_index) DO UPDATE SET
 			end_time = EXCLUDED.end_time,
@@ -553,48 +592,51 @@ func (s *PostgresStore) SaveSegment(ctx context.Context, segment *Segment) error
 			frame_count = EXCLUDED.frame_count,
 			checksum = EXCLUDED.checksum,
 			status = EXCLUDED.status,
-			uploaded_at = CASE
-				WHEN EXCLUDED.status = 'completed' THEN NOW()
-				ELSE segments.uploaded_at
-			END
-		RETURNING id
+			uploaded_at = COALESCE(EXCLUDED.uploaded_at, segments.uploaded_at)
+		RETURNING id, (xmax = 0) AS inserted
 	`
 
 	var segmentID string
-	err = s.db.QueryRowContext(
+	var wasInserted bool
+	err = tx.QueryRowContext(
 		ctx, query,
 		segment.RecordingID, segment.Index, segment.StartTime, segment.EndTime, segment.Duration.Seconds(),
-		segment.StorageKey, segment.Size, segment.FrameCount, segment.Checksum, segment.Status,
-	).Scan(&segmentID)
-	
+		segment.StorageKey, segment.Size, segment.FrameCount, segment.Checksum, segment.Status, uploadedAt,
+	).Scan(&segmentID, &wasInserted)
+
 	if err != nil {
 		return fmt.Errorf("failed to save segment: %w", err)
 	}
-	
+
 	segment.ID = segmentID
-	
-	// Update recording stats
-	_, err = s.db.ExecContext(ctx, `
-		UPDATE recordings 
-		SET 
-			segment_count = segment_count + 1,
-			total_size_bytes = total_size_bytes + $1
-		WHERE external_id = $2
-	`, segment.Size, segment.RecordingID)
-	
-	return err
+
+	// Only update recording stats on actual insert (not upsert) to prevent inflation
+	if wasInserted {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE recordings
+			SET
+				segment_count = segment_count + 1,
+				total_size_bytes = total_size_bytes + $1
+			WHERE external_id = $2
+		`, segment.Size, segment.RecordingID)
+
+		if err != nil {
+			return fmt.Errorf("failed to update recording stats: %w", err)
+		}
+	}
+
+	return tx.Commit()
 }
 
 // GetSegment retrieves a specific segment
 func (s *PostgresStore) GetSegment(ctx context.Context, recordingID string, index int) (*Segment, error) {
 	query := `
-		SELECT 
+		SELECT
 			s.id, s.segment_index, s.start_time, s.end_time, s.duration_seconds,
 			s.storage_key, s.size_bytes, s.frame_count, s.checksum, s.status,
 			s.created_at, s.uploaded_at
 		FROM segments s
-		JOIN recordings r ON s.recording_id = r.id
-		WHERE r.external_id = $1 AND s.segment_index = $2
+		WHERE s.recording_id = $1 AND s.segment_index = $2
 	`
 	
 	var seg Segment
@@ -622,13 +664,12 @@ func (s *PostgresStore) GetSegment(ctx context.Context, recordingID string, inde
 // GetSegments retrieves all segments for a recording
 func (s *PostgresStore) GetSegments(ctx context.Context, recordingID string) ([]*Segment, error) {
 	query := `
-		SELECT 
+		SELECT
 			s.id, s.segment_index, s.start_time, s.end_time, s.duration_seconds,
 			s.storage_key, s.size_bytes, s.frame_count, s.checksum, s.status,
 			s.created_at, s.uploaded_at
 		FROM segments s
-		JOIN recordings r ON s.recording_id = r.id
-		WHERE r.external_id = $1
+		WHERE s.recording_id = $1
 		ORDER BY s.segment_index ASC
 	`
 	
@@ -660,6 +701,28 @@ func (s *PostgresStore) GetSegments(ctx context.Context, recordingID string) ([]
 	return segments, nil
 }
 
+// GetNextSegmentIndex returns MAX(segment_index)+1 for a recording.
+// This is used to initialize the in-memory segment counter after a restart,
+// ensuring indices are never reused even across process restarts.
+func (s *PostgresStore) GetNextSegmentIndex(ctx context.Context, recordingID string) (int, error) {
+	var maxIndex sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		"SELECT MAX(segment_index) FROM segments WHERE recording_id = $1",
+		recordingID,
+	).Scan(&maxIndex)
+
+	if err != nil {
+		return 0, fmt.Errorf("failed to get max segment index: %w", err)
+	}
+
+	if !maxIndex.Valid {
+		// No segments exist yet
+		return 0, nil
+	}
+
+	return int(maxIndex.Int64) + 1, nil
+}
+
 // UpdateSegmentStatus updates a segment's status
 func (s *PostgresStore) UpdateSegmentStatus(ctx context.Context, segmentID string, status SegmentStatus) error {
 	query := "UPDATE segments SET status = $1 WHERE id = $2"
@@ -681,54 +744,82 @@ func (s *PostgresStore) UpdateSegmentStatus(ctx context.Context, segmentID strin
 	return nil
 }
 
-// DeleteOldSegments deletes segments older than the specified time
+// DeleteOldSegments deletes segments older than the specified time and returns their storage keys
+// so the caller can also remove them from object storage.
 func (s *PostgresStore) DeleteOldSegments(ctx context.Context, olderThan time.Time) (int64, error) {
 	result, err := s.db.ExecContext(ctx,
 		"DELETE FROM segments WHERE created_at < $1",
 		olderThan,
 	)
-	
+
 	if err != nil {
 		return 0, fmt.Errorf("failed to delete old segments: %w", err)
 	}
-	
+
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return 0, err
 	}
-	
+
 	if rows > 0 {
 		s.logger.Info("Deleted old segments",
 			recorderlog.Int64("count", rows),
 			recorderlog.Time("older_than", olderThan))
 	}
-	
+
 	return rows, nil
+}
+
+// GetExpiredSegmentKeys returns storage keys for segments older than the specified time.
+// Used by retention cleanup to delete from object storage before removing DB records.
+func (s *PostgresStore) GetExpiredSegmentKeys(ctx context.Context, olderThan time.Time) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT storage_key FROM segments WHERE created_at < $1 AND storage_key != ''",
+		olderThan,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query expired segments: %w", err)
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("failed to scan storage key: %w", err)
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
 }
 
 // SaveMotionEvent saves a motion event
 func (s *PostgresStore) SaveMotionEvent(ctx context.Context, event *MotionEvent) error {
-	// Get internal recording ID
-	var recordingID string
+	// Verify the recording exists first
+	var exists bool
 	err := s.db.QueryRowContext(ctx,
-		"SELECT id FROM recordings WHERE external_id = $1",
+		"SELECT EXISTS(SELECT 1 FROM recordings WHERE external_id = $1)",
 		event.RecordingID,
-	).Scan(&recordingID)
-	
+	).Scan(&exists)
+
 	if err != nil {
-		return fmt.Errorf("failed to find recording: %w", err)
+		return fmt.Errorf("failed to check recording: %w", err)
 	}
-	
+	if !exists {
+		return fmt.Errorf("recording not found: %s", event.RecordingID)
+	}
+
 	regionsJSON, err := json.Marshal(event.Regions)
 	if err != nil {
 		return fmt.Errorf("failed to marshal regions: %w", err)
 	}
-	
+
 	metadataJSON, err := json.Marshal(event.Metadata)
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
-	
+
+	// Use external_id directly since FK now references recordings(external_id)
 	query := `
 		INSERT INTO motion_events (
 			recording_id, event_time, confidence, duration_seconds,
@@ -737,26 +828,25 @@ func (s *PostgresStore) SaveMotionEvent(ctx context.Context, event *MotionEvent)
 			$1, $2, $3, $4, $5, $6, $7, $8
 		) RETURNING id
 	`
-	
+
 	err = s.db.QueryRowContext(
 		ctx, query,
-		recordingID, event.EventTime, event.Confidence, event.Duration.Seconds(),
+		event.RecordingID, event.EventTime, event.Confidence, event.Duration.Seconds(),
 		regionsJSON, event.PeakConfidence, event.TotalMotionFrames, metadataJSON,
 	).Scan(&event.ID)
-	
+
 	return err
 }
 
 // GetMotionEvents retrieves motion events for a recording
 func (s *PostgresStore) GetMotionEvents(ctx context.Context, recordingID string) ([]*MotionEvent, error) {
 	query := `
-		SELECT 
+		SELECT
 			m.id, m.event_time, m.confidence, m.duration_seconds,
 			m.regions, m.peak_confidence, m.total_motion_frames, m.metadata,
 			m.created_at
 		FROM motion_events m
-		JOIN recordings r ON m.recording_id = r.id
-		WHERE r.external_id = $1
+		WHERE m.recording_id = $1
 		ORDER BY m.event_time DESC
 	`
 	

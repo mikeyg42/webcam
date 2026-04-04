@@ -2,10 +2,12 @@ package calibration
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"image"
 	"log"
 	"math"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -27,12 +29,15 @@ const (
 
 // CalibrationResult contains the computed baseline and threshold
 type CalibrationResult struct {
-	Baseline  float64 // Mean + standard deviation of motion samples
-	Threshold float64 // Baseline + sensitivity offset (0.05 for "hair trigger")
-	Samples   int     // Number of samples collected
-	Mean      float64 // Mean motion area
-	StdDev    float64 // Standard deviation
+	Version   int     `json:"version"`   // Schema version for persistence compatibility
+	Baseline  float64 `json:"baseline"`  // Mean + standard deviation of motion samples
+	Threshold float64 `json:"threshold"` // Baseline + sensitivity offset (0.05 for "hair trigger")
+	Samples   int     `json:"samples"`   // Number of samples collected
+	Mean      float64 `json:"mean"`      // Mean motion area
+	StdDev    float64 `json:"stddev"`    // Standard deviation
 }
+
+const calibrationResultVersion = 1
 
 // CalibrationProgress tracks the current progress
 type CalibrationProgress struct {
@@ -65,19 +70,23 @@ type Service struct {
 	cancelFn context.CancelFunc
 }
 
-// NewService creates a calibration service
+// NewService creates a calibration service.
+// It attempts to load a previously persisted calibration result from disk.
 func NewService(outputDir string) *Service {
-	return &Service{
+	s := &Service{
 		calibrationDuration: 10 * time.Second,
 		outputDir:           outputDir,
 		videoFormat:         "mp4",
 		state:               StateIdle,
 	}
+	s.loadPersistedResult()
+	return s
 }
 
 // StartCalibration begins async calibration process
 // It receives frames from frameChan, records them to video, and computes calibration
-func (s *Service) StartCalibration(ctx context.Context, frameChan <-chan image.Image) error {
+// The optional cleanup function is called when calibration completes (success or failure)
+func (s *Service) StartCalibration(ctx context.Context, frameChan <-chan image.Image, cleanup ...func()) error {
 	s.mu.Lock()
 	if s.state != StateIdle && s.state != StateComplete && s.state != StateError {
 		s.mu.Unlock()
@@ -99,14 +108,31 @@ func (s *Service) StartCalibration(ctx context.Context, frameChan <-chan image.I
 	s.cancelFn = cancel
 	s.cancelMu.Unlock()
 
+	// Combine cleanup functions
+	var cleanupFn func()
+	if len(cleanup) > 0 {
+		cleanupFn = func() {
+			for _, fn := range cleanup {
+				if fn != nil {
+					fn()
+				}
+			}
+		}
+	}
+
 	// Run calibration in background
-	go s.runCalibration(calibCtx, frameChan)
+	go s.runCalibration(calibCtx, frameChan, cleanupFn)
 
 	return nil
 }
 
 // runCalibration performs the calibration workflow
-func (s *Service) runCalibration(ctx context.Context, frameChan <-chan image.Image) {
+func (s *Service) runCalibration(ctx context.Context, frameChan <-chan image.Image, cleanup func()) {
+	// Ensure cleanup is called when calibration finishes
+	if cleanup != nil {
+		defer cleanup()
+	}
+
 	log.Println("[Calibration] Starting calibration workflow...")
 
 	// Generate video path
@@ -128,6 +154,15 @@ func (s *Service) runCalibration(ctx context.Context, frameChan <-chan image.Ima
 	calibChan := make(chan gocv.Mat, 30)
 	doneChan := make(chan CalibrationResult, 1)
 
+	// Use sync.Once to prevent double-close of calibChan which causes panic
+	var closeOnce sync.Once
+	closeCalibChan := func() {
+		closeOnce.Do(func() {
+			close(calibChan)
+		})
+	}
+	defer closeCalibChan()
+
 	// Start calibration processor
 	go s.processCalibration(ctx, calibChan, doneChan)
 
@@ -141,13 +176,20 @@ func (s *Service) runCalibration(ctx context.Context, frameChan <-chan image.Ima
 		case frame, ok := <-frameChan:
 			if !ok {
 				// Input channel closed
-				close(calibChan)
+				closeCalibChan()
 				result := <-doneChan
 				s.finalizeCalibration(videoPath, result)
 				return
 			}
 
 			frameCount++
+
+			// Debug: log frame fingerprint to verify frames are different
+			if frameCount%30 == 0 {
+				if ycbcr, ok := frame.(*image.YCbCr); ok && len(ycbcr.Y) > 100 {
+					log.Printf("[Calibration] Received frame %d fingerprint: Y[0:8]=%v", frameCount, ycbcr.Y[0:8])
+				}
+			}
 
 			// Convert image.Image to gocv.Mat
 			mat, err := imageToMat(frame)
@@ -181,14 +223,14 @@ func (s *Service) runCalibration(ctx context.Context, frameChan <-chan image.Ima
 
 		case <-timeout:
 			// Calibration duration complete
-			close(calibChan)
+			closeCalibChan()
 			result := <-doneChan
 			s.finalizeCalibration(videoPath, result)
 			return
 
 		case <-ctx.Done():
 			// Cancelled
-			close(calibChan)
+			closeCalibChan()
 			s.setError(fmt.Errorf("calibration cancelled"))
 			return
 		}
@@ -217,8 +259,10 @@ func (s *Service) processCalibration(ctx context.Context, calibChan <-chan gocv.
 	}()
 
 	samples := make([]float64, 0, 150)
+	frameNum := 0
 
 	for frame := range calibChan {
+		frameNum++
 		select {
 		case <-ctx.Done():
 			frame.Close()
@@ -228,7 +272,7 @@ func (s *Service) processCalibration(ctx context.Context, calibChan <-chan gocv.
 		}
 
 		// Process frame with optical flow
-		motionArea := s.processFrame(frame, &prevSmall, &currSmall, &flow, &tempGray, &tempSmall, &magnitude)
+		motionArea := s.processFrame(frame, &prevSmall, &currSmall, &flow, &tempGray, &tempSmall, &magnitude, frameNum)
 		frame.Close()
 
 		if motionArea >= 0 {
@@ -242,7 +286,7 @@ func (s *Service) processCalibration(ctx context.Context, calibChan <-chan gocv.
 }
 
 // processFrame analyzes a single frame using optical flow
-func (s *Service) processFrame(frame gocv.Mat, prevSmall, currSmall, flow, tempGray, tempSmall, magnitude *gocv.Mat) float64 {
+func (s *Service) processFrame(frame gocv.Mat, prevSmall, currSmall, flow, tempGray, tempSmall, magnitude *gocv.Mat, frameNum int) float64 {
 	// Convert to grayscale
 	if frame.Channels() > 1 {
 		gocv.CvtColor(frame, tempGray, gocv.ColorBGRToGray)
@@ -251,8 +295,17 @@ func (s *Service) processFrame(frame gocv.Mat, prevSmall, currSmall, flow, tempG
 	}
 
 	// Downsample for performance
-	size := image.Pt(tempGray.Cols()/2, tempGray.Rows()/2)
-	gocv.PyrDown(*tempGray, tempSmall, size, gocv.BorderDefault)
+	// NOTE: PyrDown was producing all-zero output on some gocv versions.
+	// Using Resize with 0.5 scale factor instead - more reliable.
+	gocv.Resize(*tempGray, tempSmall, image.Point{}, 0.5, 0.5, gocv.InterpolationLinear)
+
+	// Debug: log pixel values every 30 frames
+	if frameNum%30 == 0 {
+		if data, err := tempSmall.DataPtrUint8(); err == nil && len(data) > 100 {
+			log.Printf("[Calibration] Frame %d grayscale pixels[0:8]: %v (size: %dx%d)",
+				frameNum, data[0:8], tempSmall.Cols(), tempSmall.Rows())
+		}
+	}
 
 	// First frame - just store
 	if prevSmall.Empty() {
@@ -262,6 +315,16 @@ func (s *Service) processFrame(frame gocv.Mat, prevSmall, currSmall, flow, tempG
 
 	// Copy current frame
 	tempSmall.CopyTo(currSmall)
+
+	// Debug: compare prev vs curr pixels
+	if frameNum%30 == 0 {
+		if prevData, err := prevSmall.DataPtrUint8(); err == nil && len(prevData) > 100 {
+			if currData, err := currSmall.DataPtrUint8(); err == nil && len(currData) > 100 {
+				log.Printf("[Calibration] Frame %d comparison - prev[0:8]=%v, curr[0:8]=%v",
+					frameNum, prevData[0:8], currData[0:8])
+			}
+		}
+	}
 
 	// Calculate optical flow using Farneback algorithm
 	gocv.CalcOpticalFlowFarneback(
@@ -277,6 +340,11 @@ func (s *Service) processFrame(frame gocv.Mat, prevSmall, currSmall, flow, tempG
 
 	// Analyze flow to get motion area
 	motionArea := s.analyzeFlow(*flow, magnitude)
+
+	// Debug: log motion area
+	if frameNum%30 == 0 {
+		log.Printf("[Calibration] Frame %d motion area: %.6f%%", frameNum, motionArea)
+	}
 
 	// Swap frames for next iteration
 	currSmall.CopyTo(prevSmall)
@@ -383,6 +451,64 @@ func (s *Service) finalizeCalibration(videoPath string, result CalibrationResult
 
 	log.Printf("[Calibration] Complete - Video: %s, Baseline: %.4f%%, Threshold: %.4f%%",
 		videoPath, result.Baseline, result.Threshold)
+
+	s.persistResult(&result)
+}
+
+// persistResult writes the calibration result to disk as JSON using atomic write-then-rename.
+func (s *Service) persistResult(result *CalibrationResult) {
+	result.Version = calibrationResultVersion
+
+	path := s.persistPath()
+	data, err := json.Marshal(result)
+	if err != nil {
+		log.Printf("[Calibration] Warning: failed to marshal result for persistence: %v", err)
+		return
+	}
+
+	// Atomic write: write to temp file, then rename
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		log.Printf("[Calibration] Warning: failed to write temp file %s: %v", tmpPath, err)
+		return
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		log.Printf("[Calibration] Warning: failed to rename %s to %s: %v", tmpPath, path, err)
+		return
+	}
+	log.Printf("[Calibration] Result persisted to %s", path)
+}
+
+// loadPersistedResult loads a previously saved calibration result from disk
+func (s *Service) loadPersistedResult() {
+	path := s.persistPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // No persisted result or can't read — not an error
+	}
+
+	var result CalibrationResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		log.Printf("[Calibration] Warning: failed to parse persisted result: %v", err)
+		return
+	}
+
+	if result.Version != calibrationResultVersion {
+		log.Printf("[Calibration] Ignoring persisted result with incompatible version %d (expected %d)",
+			result.Version, calibrationResultVersion)
+		return
+	}
+
+	s.result = &result
+	s.state = StateComplete
+	s.progress = 100
+	s.message = "Calibration loaded from disk"
+	log.Printf("[Calibration] Loaded persisted result: baseline=%.4f%%, threshold=%.4f%%",
+		result.Baseline, result.Threshold)
+}
+
+func (s *Service) persistPath() string {
+	return filepath.Join(s.outputDir, "calibration_result.json")
 }
 
 // updateState updates the calibration state and progress
@@ -429,6 +555,28 @@ func (s *Service) Cancel() {
 	s.cancelMu.Unlock()
 
 	s.updateState(StateIdle, 0, "Calibration cancelled")
+}
+
+// Reset clears any error state and returns to idle.
+// This allows the user to retry calibration after an error.
+func (s *Service) Reset() {
+	s.cancelMu.Lock()
+	if s.cancelFn != nil {
+		s.cancelFn()
+		s.cancelFn = nil
+	}
+	s.cancelMu.Unlock()
+
+	s.mu.Lock()
+	s.state = StateIdle
+	s.progress = 0
+	s.message = "Ready for calibration"
+	s.result = nil
+	s.err = nil
+	s.videoPath = ""
+	s.mu.Unlock()
+
+	log.Println("[Calibration] State reset to idle")
 }
 
 // imageToMat converts image.Image to gocv.Mat

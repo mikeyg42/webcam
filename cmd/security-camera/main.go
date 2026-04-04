@@ -17,7 +17,6 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/mediadevices"
-	"github.com/pion/mediadevices/pkg/driver"
 
 	"gocv.io/x/gocv"
 
@@ -157,7 +156,7 @@ func main() {
 	flag.Parse()
 
 	// Create application instance
-	app, err := NewApplication(ctx, cfg, testingMode)
+	app, err := NewApplication(ctx, cfg, testingMode, debugMode)
 	if err != nil {
 		log.Fatalf("Failed to create application: %v", err)
 	}
@@ -230,6 +229,12 @@ func main() {
 		apiServer.SetQualityHandler(app.webrtcManager.ConnectionDoctor)
 	}
 
+	// Register recording health and control API endpoints
+	if app.recorderService != nil {
+		apiServer.SetRecordingHealthHandler(app.recorderService)
+		apiServer.SetRecordingControlHandler(app.recorderService)
+	}
+
 	// DON'T start frame distributor yet - it will be started when user clicks "Calibrate Camera"
 	// This prevents the camera from running before calibration
 
@@ -269,7 +274,7 @@ func main() {
 }
 
 // NewApplication creates a new application instance
-func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (*Application, error) {
+func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool, debugMode bool) (*Application, error) {
 	appCtx, cancel := context.WithCancel(ctx)
 
 	// Create logger for recorder service
@@ -344,7 +349,7 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool) (
 		log.Println("WebSocket connected")
 
 		// Create WebRTC manager
-		webrtcManager, err := rtcManager.NewManager(appCtx, cfg, wsConn, nil)
+		webrtcManager, err := rtcManager.NewManager(appCtx, cfg, wsConn, nil, debugMode)
 		if err != nil {
 			wsConn.Close()
 			resultChan <- initResult{name: "webrtc", err: fmt.Errorf("failed to create WebRTC manager: %v", err), value: nil}
@@ -452,8 +457,8 @@ func (app *Application) Initialize() error {
 			return fmt.Errorf("WebRTC initialization failed: %v", err)
 		}
 
-		// Select devices without codec selector
-		camera, microphone, err = app.selectDevicesSimple()
+		// Select devices based on config (with fallback to first available)
+		camera, microphone, err = app.selectDevices()
 	}
 
 	if err != nil {
@@ -463,10 +468,14 @@ func (app *Application) Initialize() error {
 	app.selectedCamera = camera
 	app.selectedMicrophone = microphone
 
-	// Create frame distributor (captures raw frames only)
-	app.frameDistributor, err = framestream.NewFrameDistributor(app.ctx, camera)
+	// Create frame distributor with audio support if microphone is available and enabled
+	audioEnabled := app.config.Audio.Enabled && microphone.DeviceID != ""
+	app.frameDistributor, err = framestream.NewFrameDistributor(app.ctx, camera, microphone, audioEnabled)
 	if err != nil {
 		return fmt.Errorf("failed to create frame distributor: %v", err)
+	}
+	if audioEnabled {
+		log.Printf("[Main] Audio recording enabled with microphone: %s", microphone.Label)
 	}
 
 	// Start camera at 640x480
@@ -510,16 +519,18 @@ func (app *Application) Initialize() error {
 	}
 
 	// Feed frames from distributor to GStreamer pipeline
+	// Use subscription for restart-safe frame delivery
 	go func() {
-		rawFrames := app.frameDistributor.GetWebRTCChannel()
-		log.Println("[Main] Started GStreamer frame feeder goroutine")
+		webrtcSub := app.frameDistributor.SubscribeWebRTC()
+		defer webrtcSub.Close()
+		log.Println("[Main] Started GStreamer frame feeder goroutine (subscription-based)")
 		frameCount := 0
 		lastLog := time.Now()
 		for {
 			select {
-			case frame, ok := <-rawFrames:
+			case frame, ok := <-webrtcSub.Frames():
 				if !ok {
-					log.Println("[Main] Raw frame channel closed")
+					log.Println("[Main] WebRTC subscription closed")
 					return
 				}
 				frameCount++
@@ -670,16 +681,21 @@ func (app *Application) runCalibrationPhase() CalibrationResult {
 }
 
 // drainChannelsDuringCalibration prevents channel overflow
-// Runs until pipeline is ready to consume frames
+// Uses subscriptions for restart-safe operation during calibration
 func (app *Application) drainChannelsDuringCalibration(done chan struct{}) {
-	webrtcChan := app.frameDistributor.GetWebRTCChannel()
-	recordChan := app.frameDistributor.GetRecordChannel()
+	webrtcSub := app.frameDistributor.SubscribeWebRTC()
+	recordSub := app.frameDistributor.SubscribeRecord()
+	defer webrtcSub.Close()
+	defer recordSub.Close()
+
+	webrtcChan := webrtcSub.Frames()
+	recordChan := recordSub.Frames()
 
 	for {
 		select {
 		case _, ok := <-webrtcChan:
 			if !ok {
-				webrtcChan = nil // Prevent further reads from closed channel
+				webrtcChan = nil // Subscription closed
 			}
 		case _, ok := <-recordChan:
 			if !ok {
@@ -692,22 +708,22 @@ func (app *Application) drainChannelsDuringCalibration(done chan struct{}) {
 			return
 		default:
 			if webrtcChan == nil && recordChan == nil {
-				return // Both channels closed
+				return // Both subscriptions closed
 			}
 		}
 	}
 }
 
 // feedCalibrationFrames converts and feeds frames for calibration
+// Uses subscription for restart-safe operation during calibration
 func (app *Application) feedCalibrationFrames(calibChan chan<- gocv.Mat) {
-	motionChan := app.frameDistributor.GetMotionChannel()
+	motionSub := app.frameDistributor.SubscribeMotion()
+	motionChan := motionSub.Frames()
 	timeout := time.After(11 * time.Second)
 
 	defer func() {
 		close(calibChan)
-		for range motionChan {
-			// drain to prevent leaks
-		}
+		motionSub.Close() // Clean up subscription
 	}()
 
 	for {
@@ -935,6 +951,31 @@ func (app *Application) startProcessing() error {
 	}
 	app.logger.Info("Recording service started")
 
+	// Wire audio frames from distributor to recorder service if audio is enabled
+	// Use subscription for restart-safe frame delivery
+	if app.config.Audio.Enabled {
+		go func() {
+			audioSub := app.frameDistributor.SubscribeAudio()
+			defer audioSub.Close()
+			log.Println("[Main] Started audio routing goroutine (subscription-based)")
+			for {
+				select {
+				case frame, ok := <-audioSub.Frames():
+					if !ok {
+						log.Println("[Main] Audio subscription closed")
+						return
+					}
+					if err := app.recorderService.HandleAudioFrame(frame); err != nil {
+						// Audio errors are not fatal, just log
+						log.Printf("[Main] Audio frame error: %v", err)
+					}
+				case <-app.ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
 	// DON'T start motion detector automatically - it requires calibration first
 	// The GUI will start it via API after calibration is complete
 	log.Println("Motion detector ready (waiting for calibration and GUI trigger)")
@@ -1014,29 +1055,88 @@ func (app *Application) Cleanup() {
 	app.cancel()
 }
 
-// selectDevices selects camera and microphone (simplified for brevity)
-func (app *Application) selectDevices(codecSelector *mediadevices.CodecSelector) (
-	camera, microphone mediadevices.MediaDeviceInfo, err error) {
+// selectDevices enumerates and selects camera and microphone devices based on config
+func (app *Application) selectDevices() (
+	cameraDevice, microphoneDevice mediadevices.MediaDeviceInfo, err error) {
 
-	// Using hardcoded devices as in your original
-	camera = mediadevices.MediaDeviceInfo{
-		DeviceID:   "hardcoded-camera-0",
-		Label:      "0x83330001d6c0103",
-		Kind:       mediadevices.VideoInput,
-		DeviceType: driver.Camera,
+	// Enumerate all available devices
+	devices := mediadevices.EnumerateDevices()
+
+	if len(devices) == 0 {
+		// Try re-initializing drivers one more time
+		camera.Initialize()
+		microphone.Initialize()
+		time.Sleep(100 * time.Millisecond) // Brief delay for enumeration
+		devices = mediadevices.EnumerateDevices()
 	}
 
-	microphone = mediadevices.MediaDeviceInfo{
-		DeviceID:   "hardcoded-microphone-2",
-		Label:      "4170706c65555342417564696f456e67696e653a4d61727368616c6c20456c656374726f6e69637320202020203a4d584c203939302055534220202020202020202020202020203a383333343030303a31",
-		Kind:       mediadevices.AudioInput,
-		DeviceType: driver.Microphone,
+	log.Printf("[Devices] EnumerateDevices found %d total devices", len(devices))
+	for i, dev := range devices {
+		log.Printf("[Devices] Device %d: Type=%s, Kind=%d, ID=%s, Label=%s", i, dev.DeviceType, dev.Kind, dev.DeviceID, dev.Label)
 	}
 
-	return camera, microphone, nil
+	// Get configured device IDs from config
+	configuredCameraID := app.config.Video.DeviceID
+	configuredMicID := app.config.Audio.DeviceID
+
+	log.Printf("[Devices] Looking for configured camera: %s", configuredCameraID)
+	log.Printf("[Devices] Looking for configured microphone: %s", configuredMicID)
+
+	var cameraFound, micFound bool
+
+	// First, try to find devices matching configured IDs
+	for _, device := range devices {
+		if device.Kind == mediadevices.VideoInput && device.DeviceID == configuredCameraID {
+			cameraDevice = device
+			cameraFound = true
+			log.Printf("[Devices] Found configured camera: %s (%s)", device.Label, device.DeviceID)
+		}
+		if device.Kind == mediadevices.AudioInput && device.DeviceID == configuredMicID {
+			microphoneDevice = device
+			micFound = true
+			log.Printf("[Devices] Found configured microphone: %s (%s)", device.Label, device.DeviceID)
+		}
+
+		if cameraFound && micFound {
+			return cameraDevice, microphoneDevice, nil
+		}
+	}
+
+	// Fallback: if configured devices not found, use first available devices
+	log.Printf("[Devices] Configured devices not found, falling back to first available devices")
+
+	for _, device := range devices {
+		if device.Kind == mediadevices.VideoInput && !cameraFound {
+			cameraDevice = device
+			cameraFound = true
+			log.Printf("[Devices] Using fallback camera: %s (%s)", device.Label, device.DeviceID)
+		}
+		if device.Kind == mediadevices.AudioInput && !micFound {
+			microphoneDevice = device
+			micFound = true
+			log.Printf("[Devices] Using fallback microphone: %s (%s)", device.Label, device.DeviceID)
+		}
+
+		if cameraFound && micFound {
+			break
+		}
+	}
+
+	if !cameraFound {
+		return mediadevices.MediaDeviceInfo{}, mediadevices.MediaDeviceInfo{},
+			fmt.Errorf("no camera found - please check camera permissions and ensure a camera is connected")
+	}
+
+	if !micFound {
+		log.Printf("[Devices] Warning: No microphone found, audio will be disabled")
+	}
+
+	return cameraDevice, microphoneDevice, nil
 }
 
-// selectDevicesSimple selects devices without codec selector (for GStreamer)
+/*
+// selectDevicesSimple - DEPRECATED: Use selectDevices() instead
+// Kept for reference only
 func (app *Application) selectDevicesSimple() (
 	cameraDevice, microphoneDevice mediadevices.MediaDeviceInfo, err error) {
 
@@ -1114,6 +1214,7 @@ func (app *Application) selectDevicesSimple() (
 
 	return cameraDevice, microphoneDevice, nil
 }
+*/
 
 // selectDevicesForTesting selects devices in testing mode
 func (app *Application) selectDevicesForTesting() (

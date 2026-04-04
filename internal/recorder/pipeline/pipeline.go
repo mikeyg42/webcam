@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,8 +62,10 @@ type Segment struct {
 	UploadedAt  time.Time
 	Error       error
 
-	writer *MKVWriter
-	mu     sync.RWMutex
+	writer       *MKVWriter
+	lastSyncTime time.Time     // Last time we called fsync
+	syncInterval time.Duration // Interval between fsyncs (default 5s)
+	mu           sync.RWMutex
 }
 
 // Segmenter manages recording segments
@@ -76,15 +79,20 @@ type Segmenter struct {
 	videoHeight int
 	frameRate   float64
 
+	// Audio config for MKV writer
+	audioEnabled    bool
+	audioSampleRate int
+	audioChannels   int
+
 	// Cached AV1 Sequence Header for sharing between segments
 	// This ensures new segments can start playable even without a keyframe
 	cachedSequenceHeader []byte
 
 	logger Logger
 
-	segments map[string]*Segment // recordingID -> current segment
-	pending  []*Segment          // segments pending upload
-	mu       sync.RWMutex
+	segments     map[string]*Segment // recordingID -> current segment
+	segmentIndex map[string]int      // recordingID -> next segment index (monotonic, never reused)
+	mu           sync.RWMutex
 
 	metrics SegmenterMetrics
 }
@@ -107,6 +115,15 @@ func (s *Segmenter) SetVideoConfig(width, height int, frameRate float64) {
 	s.frameRate = frameRate
 }
 
+// SetAudioConfig sets the audio configuration for MKV writing
+func (s *Segmenter) SetAudioConfig(enabled bool, sampleRate, channels int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.audioEnabled = enabled
+	s.audioSampleRate = sampleRate
+	s.audioChannels = channels
+}
+
 // SegmenterMetrics tracks segmenter performance
 type SegmenterMetrics struct {
 	SegmentsCreated   atomic.Uint64
@@ -116,12 +133,21 @@ type SegmenterMetrics struct {
 	FramesWritten     atomic.Uint64
 }
 
+// RecoveryReport contains results from crash recovery
+type RecoveryReport struct {
+	OrphanedFiles    int           // Total orphaned .tmp files found
+	RecoveredFiles   int           // Files successfully recovered (.recovered.mkv)
+	QuarantinedFiles int           // Files that failed validation (.quarantine.mkv)
+	RecoveryTime     time.Duration // Time taken for recovery
+}
+
 // MKVWriter handles MKV container writing using ebml-go
 type MKVWriter struct {
 	file           *os.File
 	path           string
 	startTime      time.Time
 	frameCount     int64
+	audioCount     int64 // Audio frame count
 	size           int64
 	hasVideo       bool
 	hasAudio       bool
@@ -130,7 +156,8 @@ type MKVWriter struct {
 	frameRate      float64
 	frameDurNs     int64 // frame duration in nanoseconds
 	blockWriter    webm.BlockWriteCloser
-	sequenceHeader []byte // Cached AV1 Sequence Header for prepending to non-keyframe starts
+	audioWriter    webm.BlockWriteCloser // Audio track writer
+	sequenceHeader []byte                // Cached AV1 Sequence Header for prepending to non-keyframe starts
 
 	mu     sync.Mutex
 	closed atomic.Bool
@@ -143,7 +170,7 @@ func NewSegmenter(segmentDuration time.Duration, tempDir string) *Segmenter {
 		tempDir:         tempDir,
 		outputDir:       filepath.Join(tempDir, "segments"),
 		segments:        make(map[string]*Segment),
-		pending:         make([]*Segment, 0),
+		segmentIndex:    make(map[string]int),
 		logger:          noopLogger{},
 	}
 }
@@ -162,40 +189,60 @@ func (s *Segmenter) Initialize() error {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
-	// Clean up any stale segments
-	s.cleanupStaleSegments()
+
+	// Run crash recovery to handle orphaned files from previous runs
+	report := s.recoverFromCrash()
+	if report.OrphanedFiles > 0 || report.RecoveredFiles > 0 || report.QuarantinedFiles > 0 {
+		s.logger.Infow("Crash recovery completed",
+			"orphaned_files", report.OrphanedFiles,
+			"recovered_files", report.RecoveredFiles,
+			"quarantined_files", report.QuarantinedFiles,
+			"recovery_time", report.RecoveryTime)
+	}
+
 	return nil
 }
 
-// NewSegment creates a new segment for a recording
+// NewSegment creates a new segment for a recording.
+// This acquires the lock internally - for lock-held scenarios use newSegmentLocked.
 func (s *Segmenter) NewSegment(recordingID string) (*Segment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.newSegmentLocked(recordingID)
+}
 
+// newSegmentLocked creates a new segment (requires s.mu to be held).
+// This is the core segment creation logic used by both NewSegment and WriteFrame.
+func (s *Segmenter) newSegmentLocked(recordingID string) (*Segment, error) {
 	// Finalize existing segment if present
 	if existing, ok := s.segments[recordingID]; ok && existing != nil {
 		s.finalizeSegmentLocked(existing)
 	}
 
-	// Determine segment index
-	index := s.getNextSegmentIndex(recordingID)
+	// Get monotonic segment index (never reused even after file deletion)
+	index := s.getNextSegmentIndexLocked(recordingID)
 
 	segment := &Segment{
-		ID:          uuid.New().String(),
-		RecordingID: recordingID,
-		Index:       index,
-		StartTime:   time.Now(),
-		Status:      SegmentStatusRecording,
-		TempPath:    filepath.Join(s.tempDir, fmt.Sprintf("%s_%03d.mkv.tmp", recordingID, index)),
-		FilePath:    filepath.Join(s.outputDir, fmt.Sprintf("%s_%03d.mkv", recordingID, index)),
+		ID:           uuid.New().String(),
+		RecordingID:  recordingID,
+		Index:        index,
+		StartTime:    time.Now(),
+		Status:       SegmentStatusRecording,
+		TempPath:     filepath.Join(s.tempDir, fmt.Sprintf("%s_%03d.mkv.tmp", recordingID, index)),
+		FilePath:     filepath.Join(s.outputDir, fmt.Sprintf("%s_%03d.mkv", recordingID, index)),
+		lastSyncTime: time.Now(),
+		syncInterval: 5 * time.Second,
 	}
 
-	// Create MKV writer with video config and cached sequence header
+	// Create MKV writer with video config, audio config, and cached sequence header
 	cfg := MKVWriterConfig{
 		Width:        s.videoWidth,
 		Height:       s.videoHeight,
 		FrameRate:    s.frameRate,
 		CodecPrivate: s.cachedSequenceHeader, // Pass cached AV1 Sequence Header
+		AudioEnabled: s.audioEnabled,
+		SampleRate:   s.audioSampleRate,
+		Channels:     s.audioChannels,
 	}
 	writer, err := NewMKVWriterWithConfig(segment.TempPath, cfg)
 	if err != nil {
@@ -220,37 +267,36 @@ func (s *Segmenter) NewSegment(recordingID string) (*Segment, error) {
 
 // WriteFrame writes an encoded frame to the current segment
 func (s *Segmenter) WriteFrame(recordingID string, data []byte, timestamp time.Time) error {
-	// Use write lock for atomic segment lookup/creation to prevent race conditions
+	// Atomic segment lookup/creation under single lock to prevent race conditions.
+	// Two goroutines (e.g., pre-motion buffer + live frames) could both see nil and
+	// race to create segments if we released the lock between check and create.
 	s.mu.Lock()
 	segment := s.segments[recordingID]
 	if segment == nil {
-		// Create segment while still holding the lock to prevent races
-		s.mu.Unlock() // Release before NewSegment (which acquires its own lock)
+		// Create segment while holding the lock - prevents race where multiple
+		// goroutines see nil and all try to create segments
 		var err error
-		if segment, err = s.NewSegment(recordingID); err != nil {
+		segment, err = s.newSegmentLocked(recordingID)
+		if err != nil {
+			s.mu.Unlock()
 			return fmt.Errorf("failed to create segment: %w", err)
 		}
-	} else {
-		s.mu.Unlock()
 	}
 
+	// Extract and cache sequence header while we have s.mu
+	if s.cachedSequenceHeader == nil {
+		if seqHdr := extractSequenceHeader(data); len(seqHdr) > 0 {
+			s.cachedSequenceHeader = seqHdr
+		}
+	}
+	s.mu.Unlock()
+
+	// Now lock the segment for writing
 	segment.mu.Lock()
 	defer segment.mu.Unlock()
 
 	if segment.writer == nil {
 		return fmt.Errorf("segment writer is nil")
-	}
-
-	// Try to extract and cache sequence header from incoming data
-	// This ensures we have it available for future segments even before finalization
-	if s.cachedSequenceHeader == nil {
-		if seqHdr := extractSequenceHeader(data); len(seqHdr) > 0 {
-			s.mu.Lock()
-			if s.cachedSequenceHeader == nil {
-				s.cachedSequenceHeader = seqHdr
-			}
-			s.mu.Unlock()
-		}
 	}
 
 	n, err := segment.writer.WriteFrame(data, timestamp)
@@ -265,6 +311,45 @@ func (s *Segmenter) WriteFrame(recordingID string, data []byte, timestamp time.T
 	segment.FrameCount++
 	s.metrics.BytesWritten.Add(uint64(n))
 	s.metrics.FramesWritten.Add(1)
+
+	// Periodic fsync to ensure data durability
+	if time.Since(segment.lastSyncTime) > segment.syncInterval {
+		if syncErr := segment.writer.Sync(); syncErr != nil {
+			s.logger.Warnw("Failed to fsync segment",
+				"segment_id", segment.ID,
+				"error", syncErr)
+		}
+		segment.lastSyncTime = time.Now()
+	}
+
+	return nil
+}
+
+// WriteAudioFrame writes an encoded audio frame to the current segment
+func (s *Segmenter) WriteAudioFrame(recordingID string, data []byte, timestamp time.Time) error {
+	s.mu.RLock()
+	segment := s.segments[recordingID]
+	s.mu.RUnlock()
+
+	if segment == nil {
+		return fmt.Errorf("no active segment for recording %s", recordingID)
+	}
+
+	segment.mu.Lock()
+	defer segment.mu.Unlock()
+
+	if segment.writer == nil {
+		return fmt.Errorf("segment writer is nil")
+	}
+
+	_, err := segment.writer.WriteAudioFrame(data, timestamp)
+	if err != nil {
+		segment.Status = SegmentStatusFailed
+		segment.Error = err
+		s.metrics.SegmentsFailed.Add(1)
+		return fmt.Errorf("failed to write audio frame: %w", err)
+	}
+
 	return nil
 }
 
@@ -339,7 +424,26 @@ func (s *Segmenter) finalizeSegmentLocked(segment *Segment) {
 		segment.writer = nil
 	}
 
-	// Move from temp to final location
+	// Full durability sequence for crash resilience:
+	// 1. Fsync file data
+	// 2. Fsync temp directory (ensures file's directory entry is durable)
+	// 3. Rename (atomic move)
+	// 4. Fsync output directory (ensures rename is durable)
+
+	// Step 1: Fsync file data
+	if f, err := os.OpenFile(segment.TempPath, os.O_RDONLY, 0); err == nil {
+		if syncErr := f.Sync(); syncErr != nil {
+			s.logger.Warnw("Failed to fsync segment data",
+				"segment_id", segment.ID,
+				"error", syncErr)
+		}
+		f.Close()
+	}
+
+	// Step 2: Fsync temp directory
+	s.fsyncDir(s.tempDir)
+
+	// Step 3: Atomic rename
 	if err := os.Rename(segment.TempPath, segment.FilePath); err != nil {
 		s.logger.Errorw("Failed to move segment file",
 			"segment_id", segment.ID,
@@ -350,34 +454,20 @@ func (s *Segmenter) finalizeSegmentLocked(segment *Segment) {
 		return
 	}
 
-	// Calculate checksum (placeholder)
+	// Step 4: Fsync output directory to make rename durable
+	s.fsyncDir(s.outputDir)
+
+	// Calculate checksum
 	segment.Checksum = s.calculateChecksum(segment.FilePath)
 
 	segment.Status = SegmentStatusCompleted
 	s.metrics.SegmentsCompleted.Add(1)
-
-	// Enqueue for upload
-	s.pending = append(s.pending, segment)
 
 	s.logger.Infow("Segment finalized",
 		"segment_id", segment.ID,
 		"duration", segment.Duration,
 		"size", segment.Size,
 		"frames", segment.FrameCount)
-}
-
-// GetPendingSegments returns segments waiting to be uploaded and clears the queue
-func (s *Segmenter) GetPendingSegments() []*Segment {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Return copy
-	result := make([]*Segment, len(s.pending))
-	copy(result, s.pending)
-
-	// Clear pending
-	s.pending = s.pending[:0]
-	return result
 }
 
 // GetCurrentSegment returns the current segment for a recording
@@ -387,12 +477,51 @@ func (s *Segmenter) GetCurrentSegment(recordingID string) *Segment {
 	return s.segments[recordingID]
 }
 
-// getNextSegmentIndex determines the next segment index for a recording
-func (s *Segmenter) getNextSegmentIndex(recordingID string) int {
-	// Simple heuristic: count files on disk
-	pattern := filepath.Join(s.outputDir, fmt.Sprintf("%s_*.mkv", recordingID))
-	matches, _ := filepath.Glob(pattern)
-	return len(matches)
+// getNextSegmentIndexLocked returns the next monotonic segment index for a recording.
+// MUST be called with s.mu held. Indices are never reused, even after files are deleted.
+func (s *Segmenter) getNextSegmentIndexLocked(recordingID string) int {
+	index := s.segmentIndex[recordingID]
+	s.segmentIndex[recordingID] = index + 1
+	return index
+}
+
+// SetInitialSegmentIndex sets the starting segment index for a recording.
+// This should be called when starting/resuming a recording, with the value
+// from MAX(segment_index)+1 in the database to ensure crash persistence.
+// Without this, a process restart would reset the counter to 0.
+func (s *Segmenter) SetInitialSegmentIndex(recordingID string, index int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.segmentIndex[recordingID] = index
+}
+
+// ClearRecordingState removes all state for a finished recording.
+// This prevents memory leaks from accumulating segmentIndex entries.
+func (s *Segmenter) ClearRecordingState(recordingID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.segmentIndex, recordingID)
+	delete(s.segments, recordingID)
+}
+
+// fsyncDir fsyncs a directory to ensure directory entries are durable.
+// This is required for crash resilience: without it, a power loss after rename
+// could leave the directory entry missing even though the file data exists.
+func (s *Segmenter) fsyncDir(dirPath string) {
+	dir, err := os.Open(dirPath)
+	if err != nil {
+		s.logger.Warnw("Failed to open directory for fsync",
+			"dir", dirPath,
+			"error", err)
+		return
+	}
+	defer dir.Close()
+
+	if err := dir.Sync(); err != nil {
+		s.logger.Warnw("Failed to fsync directory",
+			"dir", dirPath,
+			"error", err)
+	}
 }
 
 // calculateChecksum computes SHA256 checksum of a file
@@ -413,7 +542,158 @@ func (s *Segmenter) calculateChecksum(path string) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
-// cleanupStaleSegments removes old temporary files
+// recoverFromCrash handles orphaned temporary files from crashes/power outages
+func (s *Segmenter) recoverFromCrash() RecoveryReport {
+	start := time.Now()
+	report := RecoveryReport{}
+
+	// Find all .tmp files (any age) - these are potentially incomplete recordings
+	tmpFiles, err := filepath.Glob(filepath.Join(s.tempDir, "*.mkv.tmp"))
+	if err != nil {
+		s.logger.Warnw("Failed to glob for orphaned files", "error", err)
+		return report
+	}
+	report.OrphanedFiles = len(tmpFiles)
+
+	for _, tmpFile := range tmpFiles {
+		info, err := os.Stat(tmpFile)
+		if err != nil {
+			continue
+		}
+
+		s.logger.Infow("Found orphaned segment",
+			"file", tmpFile,
+			"size", info.Size(),
+			"modified", info.ModTime())
+
+		if s.isValidMKV(tmpFile) {
+			// Valid MKV structure - rename to .recovered.mkv for manual review
+			recoveredPath := strings.TrimSuffix(tmpFile, ".tmp") + ".recovered.mkv"
+			if err := os.Rename(tmpFile, recoveredPath); err != nil {
+				s.logger.Warnw("Failed to rename recovered segment",
+					"file", tmpFile,
+					"error", err)
+				continue
+			}
+			report.RecoveredFiles++
+			s.logger.Infow("Recovered orphaned segment",
+				"original", tmpFile,
+				"recovered", recoveredPath,
+				"size", info.Size())
+		} else {
+			// Failed validation - quarantine instead of delete for safety
+			// Files may still be partially recoverable with specialized tools
+			quarantinePath := strings.TrimSuffix(tmpFile, ".tmp") + ".quarantine.mkv"
+			if err := os.Rename(tmpFile, quarantinePath); err != nil {
+				s.logger.Warnw("Failed to quarantine corrupted segment",
+					"file", tmpFile,
+					"error", err)
+				continue
+			}
+			report.QuarantinedFiles++
+			s.logger.Warnw("Quarantined corrupted segment",
+				"file", tmpFile,
+				"quarantine", quarantinePath,
+				"size", info.Size())
+		}
+	}
+
+	report.RecoveryTime = time.Since(start)
+	return report
+}
+
+// isValidMKV checks if a file is a valid, potentially recoverable MKV.
+// This goes beyond just checking the magic bytes - it verifies:
+// 1. Minimum file size (files too small can't contain useful data)
+// 2. EBML header magic (0x1A 0x45 0xDF 0xA3)
+// 3. Presence of Segment element (0x18 0x53 0x80 0x67)
+// 4. Presence of at least one Cluster (0x1F 0x43 0xB6 0x75)
+//
+// Files that pass these checks are likely to be at least partially playable.
+func (s *Segmenter) isValidMKV(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+
+	// Minimum size check: require at least 1KB to be worth recovering
+	// (EBML header + Segment header + some actual content)
+	const minRecoverableSize = 1024
+	if info.Size() < minRecoverableSize {
+		s.logger.Debugw("File too small to recover",
+			"path", path,
+			"size", info.Size(),
+			"min_required", minRecoverableSize)
+		return false
+	}
+
+	// Read first chunk of file for structure validation
+	// Scan up to 256KB to ensure we find the first Cluster element,
+	// which may appear after headers, tracks, and codec private data
+	scanSize := int64(256 * 1024)
+	if info.Size() < scanSize {
+		scanSize = info.Size()
+	}
+	data := make([]byte, scanSize)
+	n, err := f.Read(data)
+	if err != nil || n < 4 {
+		return false
+	}
+	data = data[:n]
+
+	// Check 1: EBML header magic (0x1A 0x45 0xDF 0xA3)
+	if data[0] != 0x1A || data[1] != 0x45 || data[2] != 0xDF || data[3] != 0xA3 {
+		s.logger.Debugw("Invalid EBML magic", "path", path)
+		return false
+	}
+
+	// Check 2: Look for Segment element ID (0x18 0x53 0x80 0x67)
+	segmentID := []byte{0x18, 0x53, 0x80, 0x67}
+	hasSegment := containsSequence(data, segmentID)
+	if !hasSegment {
+		s.logger.Debugw("No Segment element found", "path", path)
+		return false
+	}
+
+	// Check 3: Look for at least one Cluster element ID (0x1F 0x43 0xB6 0x75)
+	// A file without clusters has no actual media data
+	clusterID := []byte{0x1F, 0x43, 0xB6, 0x75}
+	hasCluster := containsSequence(data, clusterID)
+	if !hasCluster {
+		s.logger.Debugw("No Cluster element found", "path", path)
+		return false
+	}
+
+	return true
+}
+
+// containsSequence checks if data contains the given byte sequence
+func containsSequence(data, seq []byte) bool {
+	if len(seq) == 0 || len(data) < len(seq) {
+		return false
+	}
+	for i := 0; i <= len(data)-len(seq); i++ {
+		match := true
+		for j := 0; j < len(seq); j++ {
+			if data[i+j] != seq[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanupStaleSegments removes old temporary files (legacy method, kept for compatibility)
 func (s *Segmenter) cleanupStaleSegments() {
 	tempFiles, _ := filepath.Glob(filepath.Join(s.tempDir, "*.tmp"))
 	for _, file := range tempFiles {
@@ -448,7 +728,6 @@ func (seg *Segment) Cleanup() error {
 func (s *Segmenter) GetMetrics() map[string]interface{} {
 	s.mu.RLock()
 	activeSegments := len(s.segments)
-	pendingCount := len(s.pending)
 	s.mu.RUnlock()
 
 	return map[string]interface{}{
@@ -458,7 +737,6 @@ func (s *Segmenter) GetMetrics() map[string]interface{} {
 		"bytes_written":      s.metrics.BytesWritten.Load(),
 		"frames_written":     s.metrics.FramesWritten.Load(),
 		"active_segments":    activeSegments,
-		"pending_uploads":    pendingCount,
 	}
 }
 
@@ -469,9 +747,11 @@ const (
 	obuTypeFrame          = 6
 )
 
-// isAV1Keyframe detects if the AV1 OBU data represents a keyframe
-// Returns true if the data contains a Sequence Header OBU or a KEY_FRAME
-func isAV1Keyframe(data []byte) bool {
+// IsAV1Keyframe detects if the AV1 OBU data represents a keyframe.
+// Returns true if the data contains a Sequence Header OBU, which indicates
+// an independently decodable frame (IDR/keyframe in AV1).
+// This function is exported for use by the recording service during segment rotation.
+func IsAV1Keyframe(data []byte) bool {
 	if len(data) < 2 {
 		return false
 	}
@@ -608,6 +888,9 @@ type MKVWriterConfig struct {
 	Height       int
 	FrameRate    float64
 	CodecPrivate []byte // AV1 Sequence Header for decoder initialization
+	AudioEnabled bool   // Whether to include audio track
+	SampleRate   int    // Audio sample rate (48000 for Opus)
+	Channels     int    // Audio channel count (2 for stereo)
 }
 
 // NewMKVWriter creates a new MKV container writer using ebml-go
@@ -636,12 +919,18 @@ func NewMKVWriterWithConfig(path string, cfg MKVWriterConfig) (*MKVWriter, error
 	if cfg.FrameRate == 0 {
 		cfg.FrameRate = 30
 	}
+	if cfg.AudioEnabled && cfg.SampleRate == 0 {
+		cfg.SampleRate = 48000 // Default for Opus
+	}
+	if cfg.AudioEnabled && cfg.Channels == 0 {
+		cfg.Channels = 2 // Stereo
+	}
 
 	frameDurNs := int64(float64(time.Second) / cfg.FrameRate)
 
 	// Define video track for AV1
 	// CodecID for AV1 in Matroska is "V_AV1"
-	track := webm.TrackEntry{
+	videoTrack := webm.TrackEntry{
 		Name:            "Video",
 		TrackNumber:     1,
 		TrackUID:        1,
@@ -657,10 +946,27 @@ func NewMKVWriterWithConfig(path string, cfg MKVWriterConfig) (*MKVWriter, error
 	// Add CodecPrivate (AV1 Sequence Header) if provided
 	// This allows decoders to initialize without needing a keyframe
 	if len(cfg.CodecPrivate) > 0 {
-		track.CodecPrivate = cfg.CodecPrivate
+		videoTrack.CodecPrivate = cfg.CodecPrivate
 	}
 
-	tracks := []webm.TrackEntry{track}
+	tracks := []webm.TrackEntry{videoTrack}
+
+	// Add audio track if enabled
+	// Audio data arrives as raw PCM (int16 little-endian) from FrameDistributor
+	if cfg.AudioEnabled {
+		audioTrack := webm.TrackEntry{
+			Name:        "Audio",
+			TrackNumber: 2,
+			TrackUID:    2,
+			CodecID:     "A_PCM/INT/LIT",
+			TrackType:   2, // 2 = audio
+			Audio: &webm.Audio{
+				SamplingFrequency: float64(cfg.SampleRate),
+				Channels:          uint64(cfg.Channels),
+			},
+		}
+		tracks = append(tracks, audioTrack)
+	}
 
 	// Create block writers using ebml-go
 	writers, err := webm.NewSimpleBlockWriter(file, tracks)
@@ -685,7 +991,13 @@ func NewMKVWriterWithConfig(path string, cfg MKVWriterConfig) (*MKVWriter, error
 		frameRate:   cfg.FrameRate,
 		frameDurNs:  frameDurNs,
 		hasVideo:    true,
+		hasAudio:    cfg.AudioEnabled,
 		blockWriter: writers[0],
+	}
+
+	// Store audio writer if audio is enabled
+	if cfg.AudioEnabled && len(writers) > 1 {
+		w.audioWriter = writers[1]
 	}
 
 	return w, nil
@@ -704,7 +1016,7 @@ func (w *MKVWriter) WriteFrame(data []byte, ts time.Time) (int, error) {
 		return 0, fmt.Errorf("block writer not initialized")
 	}
 
-	// Calculate timestamp in nanoseconds relative to start
+	// Calculate timestamp in milliseconds relative to start (ebml-go TimecodeScale = 1ms)
 	relativeTime := ts.Sub(w.startTime)
 	if relativeTime < 0 {
 		relativeTime = time.Duration(w.frameCount) * time.Duration(w.frameDurNs)
@@ -712,7 +1024,7 @@ func (w *MKVWriter) WriteFrame(data []byte, ts time.Time) (int, error) {
 
 	// Detect actual AV1 keyframes by parsing the OBU bitstream
 	// Keyframes contain a Sequence Header OBU
-	keyframe := isAV1Keyframe(data)
+	keyframe := IsAV1Keyframe(data)
 
 	// Cache sequence header from first keyframe for later use
 	if keyframe && w.sequenceHeader == nil {
@@ -729,13 +1041,43 @@ func (w *MKVWriter) WriteFrame(data []byte, ts time.Time) (int, error) {
 		keyframe = true // Now it starts with sequence header, mark as keyframe
 	}
 
-	_, err := w.blockWriter.Write(keyframe, int64(relativeTime.Nanoseconds()/1000), frameData)
+	_, err := w.blockWriter.Write(keyframe, int64(relativeTime.Milliseconds()), frameData)
 	if err != nil {
 		return 0, fmt.Errorf("failed to write block: %w", err)
 	}
 
 	w.frameCount++
 	w.size += int64(len(data)) // Track original data size
+	return len(data), nil
+}
+
+// WriteAudioFrame writes a raw PCM audio frame to the MKV container
+func (w *MKVWriter) WriteAudioFrame(data []byte, ts time.Time) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed.Load() {
+		return 0, fmt.Errorf("writer is closed")
+	}
+
+	if !w.hasAudio || w.audioWriter == nil {
+		return 0, fmt.Errorf("audio track not configured")
+	}
+
+	// Calculate timestamp in milliseconds relative to start (ebml-go TimecodeScale = 1ms)
+	relativeTime := ts.Sub(w.startTime)
+	if relativeTime < 0 {
+		relativeTime = 0
+	}
+
+	// Audio frames in MKV are always keyframes
+	_, err := w.audioWriter.Write(true, int64(relativeTime.Milliseconds()), data)
+	if err != nil {
+		return 0, fmt.Errorf("failed to write audio block: %w", err)
+	}
+
+	w.audioCount++
+	w.size += int64(len(data))
 	return len(data), nil
 }
 
@@ -747,10 +1089,18 @@ func (w *MKVWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Close the block writer first (this finalizes clusters)
+	// Close the video block writer first (this finalizes clusters)
 	if w.blockWriter != nil {
 		if err := w.blockWriter.Close(); err != nil {
-			// Log but continue to close file
+			// Log but continue
+			_ = err
+		}
+	}
+
+	// Close the audio block writer if present
+	if w.audioWriter != nil {
+		if err := w.audioWriter.Close(); err != nil {
+			// Log but continue
 			_ = err
 		}
 	}
@@ -764,4 +1114,21 @@ func (w *MKVWriter) GetStats() (frameCount, size int64, duration time.Duration) 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.frameCount, w.size, time.Since(w.startTime)
+}
+
+// GetAudioStats returns audio-specific statistics
+func (w *MKVWriter) GetAudioStats() (audioCount int64, hasAudio bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.audioCount, w.hasAudio
+}
+
+// Sync flushes data to disk via fsync
+func (w *MKVWriter) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file != nil && !w.closed.Load() {
+		return w.file.Sync()
+	}
+	return nil
 }
