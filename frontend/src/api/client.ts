@@ -1,6 +1,6 @@
 import axios, { AxiosError } from 'axios';
 import type { AxiosInstance } from 'axios';
-import type { ApiResponse, ApiError, ConfigResponse, CalibrationStatus } from '../types/api';
+import type { ApiResponse, ApiError, ConfigResponse, CalibrationStatus, RecordingStatus } from '../types/api';
 
 // API configuration
 const API_CONFIG = {
@@ -104,6 +104,22 @@ class ApiClient {
       const response = await this.client.get<CalibrationStatus>('/calibration/status');
       return response.data;
     });
+  }
+
+  // Recording control API
+  async startRecording(): Promise<{ status: string; recording_id: string }> {
+    const response = await this.client.post<{ status: string; recording_id: string }>('/recording/start');
+    return response.data;
+  }
+
+  async stopRecording(): Promise<{ status: string }> {
+    const response = await this.client.post<{ status: string }>('/recording/stop');
+    return response.data;
+  }
+
+  async getRecordingStatus(): Promise<RecordingStatus> {
+    const response = await this.client.get<RecordingStatus>('/recording/status');
+    return response.data;
   }
 
   // Health check

@@ -109,6 +109,21 @@ export interface CalibrationResult {
   stdDev: number;
 }
 
+// Recording status types
+export interface RecordingState {
+  state: 'idle' | 'continuous' | 'event' | 'continuous+event';
+  active_recording_ids: string[] | null;
+  is_running: boolean;
+}
+
+export interface RecordingStatus {
+  state: RecordingState;
+  frames_received: number;
+  frames_dropped: number;
+  segments_created: number;
+  emergency_buffer: number;
+}
+
 // API response wrapper
 export interface ApiResponse<T = any> {
   success: boolean;

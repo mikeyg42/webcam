@@ -66,7 +66,7 @@ const config = {
         methods: ['GET', 'POST']
     },
     ionSfu: {
-        url: process.env.ION_SFU_URL || 'ws://localhost:7001/ws',
+        url: process.env.ION_SFU_URL || 'ws://localhost:7100/ws',
         reconnectInterval: 5000,
         maxReconnectAttempts: 10
     },
@@ -85,7 +85,7 @@ const app = express();
 app.set('trust proxy', true);
 
 // Security middleware
-const ionSfuUrl = process.env.ION_SFU_URL || 'ws://localhost:7001/ws';
+const ionSfuUrl = process.env.ION_SFU_URL || 'ws://localhost:7100/ws';
 const ionSfuWssUrl = ionSfuUrl.replace('ws://', 'wss://');
 
 app.use(helmet({
@@ -581,8 +581,9 @@ app.get('/api/auth/status', (req, res) => {
 // Endpoint to provide WebRTC configuration (Tailscale-only)
 app.get('/api/webrtc-config', (req, res) => {
     // Tailscale-only configuration - no TURN server needed
+    // H.264 is used via GStreamer VideoToolbox for WebRTC streaming
     const webrtcConfig = {
-        codec: 'vp9',
+        codec: 'h264',
         iceServers: [
             // STUN for initial discovery (optional with Tailscale)
             { urls: "stun:stun.l.google.com:19302" }
@@ -653,9 +654,15 @@ app.use('/api', async (req, res) => {
     try {
         // req.url here has /api stripped by Express, so we need to add it back
         const url = `${goBackendUrl}/api${req.url}`;
+
+        // Use AbortController for timeout (30 seconds for slow operations like calibration)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
+
         const options = {
             method: req.method,
             headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
         };
 
         if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -663,6 +670,7 @@ app.use('/api', async (req, res) => {
         }
 
         const response = await fetch(url, options);
+        clearTimeout(timeoutId);
 
         // Check content type to handle both JSON and text responses
         // Go's http.Error() returns text/plain which would crash response.json()
@@ -676,8 +684,11 @@ app.use('/api', async (req, res) => {
             res.status(response.status).json({ error: text });
         }
     } catch (error) {
-        rateLimitedLog.error(`api-proxy-${req.method}`, `Error proxying ${req.method} /api${req.url} to Go backend:`, error.message);
-        res.status(500).json({ error: 'Failed to proxy request to backend' });
+        const errorMsg = error.name === 'AbortError'
+            ? 'Request timed out (30s)'
+            : error.message;
+        rateLimitedLog.error(`api-proxy-${req.method}`, `Error proxying ${req.method} /api${req.url} to Go backend:`, errorMsg);
+        res.status(500).json({ error: `Failed to proxy request to backend: ${errorMsg}` });
     }
 });
 

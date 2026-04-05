@@ -36,6 +36,11 @@ pkill -f "node server.js" && log_info "Node.js server stopped" || log_warn "Node
 log_info "Stopping Go security camera application..."
 pkill -f "./security-camera" && log_info "Go camera application stopped" || log_warn "Go camera application not running"
 
+# Step 2b: Stop native ion-sfu
+log_info "Stopping ion-sfu..."
+pkill -f "bin/ion-sfu" && log_info "ion-sfu stopped" || log_warn "ion-sfu not running"
+
+
 # Step 3: Stop Docker Compose services
 log_info "Stopping Docker Compose services..."
 if [ -f "docker-compose.yml" ] || [ -f "compose.yml" ]; then

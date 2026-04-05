@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { motion } from 'motion/react';
 import { Video, VideoOff, Loader2 } from 'lucide-react';
 import { useConnectionStore } from '../../stores/connectionStore';
+import { useRecordingStore } from '../../stores/recordingStore';
 import { StatusIndicator } from '../feedback/StatusIndicator';
 import { slideUp } from '../../lib/motion';
 
@@ -10,6 +11,7 @@ export function CameraView() {
   const stream = useConnectionStore((state) => state.stream);
   const connectionState = useConnectionStore((state) => state.connectionState);
   const status = useConnectionStore((state) => state.status);
+  const isRecording = useRecordingStore((s) => s.isRecording);
 
   useEffect(() => {
     if (videoRef.current && stream) {
@@ -82,11 +84,21 @@ export function CameraView() {
 
         {/* Live indicator when connected */}
         {stream && connectionState === 'connected' && (
-          <div className="absolute top-3 left-3 flex items-center gap-2 bg-bg-primary/80 backdrop-blur-sm px-3 py-1.5 rounded-full border border-border">
-            <span className="w-2 h-2 bg-status-success rounded-full animate-pulse" />
-            <span className="text-xs font-mono text-status-success uppercase tracking-wider">
-              Live
-            </span>
+          <div className="absolute top-3 left-3 flex items-center gap-3">
+            <div className="flex items-center gap-2 bg-bg-primary/80 backdrop-blur-sm px-3 py-1.5 rounded-full border border-border">
+              <span className="w-2 h-2 bg-status-success rounded-full animate-pulse" />
+              <span className="text-xs font-mono text-status-success uppercase tracking-wider">
+                Live
+              </span>
+            </div>
+            {isRecording && (
+              <div className="flex items-center gap-2 bg-status-error/90 backdrop-blur-sm px-3 py-1.5 rounded-full">
+                <span className="w-2 h-2 bg-white rounded-full animate-pulse" />
+                <span className="text-xs font-mono text-white uppercase tracking-wider">
+                  Rec
+                </span>
+              </div>
+            )}
           </div>
         )}
       </div>

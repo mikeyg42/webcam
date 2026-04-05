@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Plug, PlugZap, Bug, Trash2, ChevronDown } from 'lucide-react';
+import { Plug, PlugZap, Bug, Trash2, ChevronDown, Circle, Square } from 'lucide-react';
 import { useConnectionStore } from '../../stores/connectionStore';
+import { useRecordingStore } from '../../stores/recordingStore';
 import { Button } from '../primitives/Button';
 import { Card } from '../layout/Card';
 import { slideUp, fadeIn } from '../../lib/motion';
@@ -13,6 +14,20 @@ export function CameraControls() {
   const connect = useConnectionStore((state) => state.connect);
   const disconnect = useConnectionStore((state) => state.disconnect);
   const clearDebugLogs = useConnectionStore((state) => state.clearDebugLogs);
+
+  const isRecording = useRecordingStore((s) => s.isRecording);
+  const segmentsCreated = useRecordingStore((s) => s.segmentsCreated);
+  const framesDropped = useRecordingStore((s) => s.framesDropped);
+  const recIsLoading = useRecordingStore((s) => s.isLoading);
+  const recError = useRecordingStore((s) => s.error);
+  const startRecording = useRecordingStore((s) => s.start);
+  const stopRecording = useRecordingStore((s) => s.stop);
+  const fetchStatus = useRecordingStore((s) => s.fetchStatus);
+
+  // Fetch recording status on mount to sync with backend state
+  useEffect(() => {
+    fetchStatus();
+  }, [fetchStatus]);
 
   const handleConnect = async () => {
     try {
@@ -32,7 +47,7 @@ export function CameraControls() {
       animate="visible"
       className="space-y-4"
     >
-      {/* Control Buttons */}
+      {/* Connection Controls */}
       <div className="flex gap-3 justify-center">
         {!isConnected && !isConnecting ? (
           <Button onClick={handleConnect} className="min-w-[180px]">
@@ -62,6 +77,64 @@ export function CameraControls() {
           />
         </Button>
       </div>
+
+      {/* Recording Controls */}
+      <Card padding="md">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            {isRecording ? (
+              <>
+                <span className="relative flex h-3 w-3">
+                  <span className="absolute inline-flex h-full w-full rounded-full bg-status-error opacity-75 animate-ping" />
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-status-error" />
+                </span>
+                <div>
+                  <span className="text-sm font-medium text-status-error uppercase tracking-label">
+                    Recording
+                  </span>
+                  <span className="text-xs text-text-tertiary ml-2">
+                    {segmentsCreated} segments{framesDropped > 0 ? ` · ${framesDropped} dropped` : ''}
+                  </span>
+                </div>
+              </>
+            ) : (
+              <>
+                <span className="h-3 w-3 rounded-full bg-text-tertiary" />
+                <span className="text-sm text-text-tertiary uppercase tracking-label">
+                  Not Recording
+                </span>
+              </>
+            )}
+          </div>
+
+          {isRecording ? (
+            <Button
+              variant="danger"
+              size="sm"
+              onClick={stopRecording}
+              loading={recIsLoading}
+              disabled={recIsLoading}
+            >
+              <Square className="w-3 h-3 mr-1.5 fill-current" />
+              Stop
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              onClick={startRecording}
+              loading={recIsLoading}
+              disabled={recIsLoading}
+            >
+              <Circle className="w-3 h-3 mr-1.5 fill-current" />
+              Record
+            </Button>
+          )}
+        </div>
+
+        {recError && (
+          <p className="text-xs text-status-error mt-2">{recError}</p>
+        )}
+      </Card>
 
       {/* Debug Panel */}
       <AnimatePresence>

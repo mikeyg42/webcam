@@ -64,19 +64,10 @@ services:
     networks:
       - webcam2
 
-  # ion-sfu - WebRTC Selective Forwarding Unit (existing)
-  ion-sfu:
-    image: pionwebrtc/ion-sfu:latest-jsonrpc
-    container_name: webcam2-ion-sfu
-    restart: unless-stopped
-    ports:
-      - "7001:7000"     # WebSocket (host:7001 -> container:7000)
-      - "5000-5200:5000-5200/udp"  # WebRTC media
-    volumes:
-      - ./configs/sfu.toml:/configs/sfu.toml:ro
-    command: -c /configs/sfu.toml
-    networks:
-      - webcam2
+  # NOTE: ion-sfu is NOT in Docker. It runs natively on the host because
+  # macOS Docker Desktop's Linux VM prevents bidirectional UDP between
+  # containers and the host (required for WebRTC ICE). See start-all.sh
+  # for the native SFU startup logic and detailed explanation.
 
 volumes:
   postgres_data:

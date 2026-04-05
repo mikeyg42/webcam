@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -66,7 +67,7 @@ func (w *websocketAdapter) Read(p []byte) (n int, err error) {
 	case websocket.TextMessage, websocket.BinaryMessage:
 		// Both text and binary messages are treated as JSON data
 		// ion-sfu may send JSON as binary messages, which is valid
-		log.Printf("WebSocket received message type %d, length %d", messageType, len(data))
+		// Debug logging moved to caller with debugMode check
 	default:
 		return 0, fmt.Errorf("unsupported WebSocket message type: %d", messageType)
 	}
@@ -142,6 +143,7 @@ type DTLSConfig struct {
 // Manager handles WebRTC connection and signaling
 type Manager struct {
 	config                   *config.Config // from config package
+	debugMode                bool           // enables verbose debug logging
 	PeerConnection           *webrtc.PeerConnection
 	connectionID             uint64
 	wsConnection             *websocket.Conn
@@ -301,7 +303,7 @@ func (h *rtcHandler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonr
 //================
 
 // Initialize Tailscale-only RTC manager
-func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder) (*Manager, error) {
+func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websocket.Conn, recorder *video.Recorder, debugMode bool) (*Manager, error) {
 	ctx, cancel := context.WithCancel(appCtx)
 
 	// Skip Tailscale initialization entirely in dev mode
@@ -351,6 +353,7 @@ func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websock
 
 	m := &Manager{
 		config:                  myconfig,
+		debugMode:               debugMode,
 		wsConnection:            wsConn,
 		camera:                  mediadevices.MediaDeviceInfo{},
 		microphone:              mediadevices.MediaDeviceInfo{},
@@ -389,8 +392,50 @@ func NewManager(appCtx context.Context, myconfig *config.Config, wsConn *websock
 	return m, nil
 }
 
+// resolveDockerHostIP finds the IP address the Docker VM uses to reach the host.
+// On macOS Docker Desktop, host.docker.internal doesn't resolve on the host itself,
+// so we find the IP by looking for the Docker bridge gateway interface.
+func resolveDockerHostIP() string {
+	// First try DNS (works inside Docker containers)
+	addrs, err := net.LookupHost("host.docker.internal")
+	if err == nil {
+		for _, addr := range addrs {
+			if net.ParseIP(addr).To4() != nil {
+				return addr
+			}
+		}
+		if len(addrs) > 0 {
+			return addrs[0]
+		}
+	}
+
+	// On macOS host, Docker Desktop uses 192.168.65.0/24 subnet.
+	// Find this by scanning interfaces for the Docker bridge.
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok {
+				ip := ipNet.IP.To4()
+				if ip != nil && ip[0] == 192 && ip[1] == 168 && ip[2] == 65 {
+					return ip.String()
+				}
+			}
+		}
+	}
+	return ""
+}
+
 func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
-	log.Println("DEBUGGING: WebRTC Manager Initialize() started")
+	if m.debugMode {
+		log.Println("[WebRTC] Manager Initialize() started")
+	}
 
 	// Create MediaEngine
 	mediaEngine := webrtc.MediaEngine{}
@@ -398,9 +443,8 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	// Register default codecs first
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("failed to register default codecs: %v", err)
-	} else {
-		fmt.Println("Default codecs registered successfully")
 	}
+	log.Printf("[WebRTC] Default codecs registered successfully")
 
 	// Enable TWCC for video
 	mediaEngine.RegisterFeedback(webrtc.RTCPFeedback{
@@ -448,9 +492,10 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	opusParams.BitRate = 32_000
 	opusParams.Latency = opus.Latency20ms // 20 ms frame size for real-time communication
 
-	log.Printf("Using H.264 video constraints: BitRate=%d (from %d bps bandwidth), KeyFrameInterval=%d, Preset=VeryFast (optimized for macOS)\n",
-		x264Params.BitRate, m.estimateBandwidth(), x264Params.KeyFrameInterval)
-	log.Printf("Using audio constraints: BitRate=%d, Latency=%d\n", opusParams.BitRate, opusParams.Latency)
+	if m.debugMode {
+		log.Printf("[WebRTC] H.264 video: BitRate=%d, KeyFrameInterval=%d", x264Params.BitRate, x264Params.KeyFrameInterval)
+		log.Printf("[WebRTC] Opus audio: BitRate=%d, Latency=%d", opusParams.BitRate, opusParams.Latency)
+	}
 
 	// Create H.264-only codec selector for macOS hardware acceleration
 	// This forces mediadevices to use H.264 (VideoToolbox on macOS)
@@ -458,7 +503,9 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 		mediadevices.WithVideoEncoders(&x264Params), // H.264 only
 		mediadevices.WithAudioEncoders(&opusParams),
 	)
-	log.Printf("H.264 Codec Selector Configured: %v", codecSelector)
+	if m.debugMode {
+		log.Printf("[WebRTC] H.264 Codec Selector Configured: %v", codecSelector)
+	}
 
 	// Register H.264 codec with the MediaEngine for macOS VideoToolbox
 	// This ensures only H.264 is available during negotiation
@@ -501,26 +548,30 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.SetDTLSDisableInsecureSkipVerify(true)
 
-	// Force ICE gathering on Tailscale interface only
-	settingEngine.SetInterfaceFilter(func(name string) bool {
-		// macOS: utun* interfaces
-		// Linux/Unix: tailscale0
-		return name == "tailscale0" || strings.HasPrefix(name, "utun")
-	})
-
-	// Rewrite host candidates to Tailscale IP (pin to tailnet)
-	// Skip in dev mode (TAILSCALE_DEV_MODE=true) for local testing with ion-sfu
 	tailscaleDevMode := os.Getenv("TAILSCALE_DEV_MODE") == "true"
-	if m.tailscaleManager != nil && !tailscaleDevMode {
-		tsIP := m.tailscaleManager.GetLocalTailscaleIP()
-		if tsIP != "" {
-			settingEngine.SetNAT1To1IPs([]string{tsIP}, webrtc.ICECandidateTypeHost)
-			log.Printf("ICE configured to use Tailscale IP: %s", tsIP)
-		}
-	} else if tailscaleDevMode {
-		log.Println("Skipping Tailscale NAT1To1 ICE configuration (dev mode - using localhost)")
+
+	if tailscaleDevMode {
+		// Dev mode: ion-sfu runs natively on the host (not Docker) because macOS
+		// Docker Desktop can't do bidirectional UDP between host and container.
+		// Both SFU and Go backend advertise 127.0.0.1 via NAT1To1. No interface
+		// filter — pion gathers on all interfaces, NAT1To1 rewrites addresses.
+		settingEngine.SetNAT1To1IPs([]string{"127.0.0.1"}, webrtc.ICECandidateTypeHost)
+		log.Println("ICE configured for dev mode - NAT1To1=127.0.0.1 (native SFU on host)")
 	} else {
-		log.Println("Skipping Tailscale ICE configuration (Tailscale disabled)")
+		// Production: restrict to Tailscale interfaces only
+		settingEngine.SetInterfaceFilter(func(name string) bool {
+			return name == "tailscale0" || strings.HasPrefix(name, "utun")
+		})
+
+		if m.tailscaleManager != nil {
+			tsIP := m.tailscaleManager.GetLocalTailscaleIP()
+			if tsIP != "" {
+				settingEngine.SetNAT1To1IPs([]string{tsIP}, webrtc.ICECandidateTypeHost)
+				log.Printf("ICE configured to use Tailscale IP: %s", tsIP)
+			}
+		} else {
+			log.Println("Skipping Tailscale ICE configuration (Tailscale disabled)")
+		}
 	}
 
 	// Restrict to UDP only
@@ -995,13 +1046,14 @@ func (m *Manager) handleOffer(ctx context.Context, offer *webrtc.SessionDescript
 
 // handleOfferAndGetAnswer processes an incoming offer and returns the answer
 func (m *Manager) handleOfferAndGetAnswer(ctx context.Context, offer *webrtc.SessionDescription) (*webrtc.SessionDescription, error) {
-	log.Println("[handleOfferAndGetAnswer] Starting to process incoming offer")
-	// Debug: log the incoming offer SDP to understand what ion-sfu is asking for
-	sdpLines := strings.Count(offer.SDP, "\r\n") + strings.Count(offer.SDP, "\n")
-	hasVideo := strings.Contains(offer.SDP, "m=video")
-	hasAudio := strings.Contains(offer.SDP, "m=audio")
-	hasApp := strings.Contains(offer.SDP, "m=application")
-	log.Printf("[handleOfferAndGetAnswer] Incoming offer: %d lines, hasVideo=%v, hasAudio=%v, hasApp=%v", sdpLines, hasVideo, hasAudio, hasApp)
+	if m.debugMode {
+		log.Println("[WebRTC] handleOfferAndGetAnswer: processing incoming offer")
+		sdpLines := strings.Count(offer.SDP, "\r\n") + strings.Count(offer.SDP, "\n")
+		hasVideo := strings.Contains(offer.SDP, "m=video")
+		hasAudio := strings.Contains(offer.SDP, "m=audio")
+		hasApp := strings.Contains(offer.SDP, "m=application")
+		log.Printf("[WebRTC] Offer: %d lines, video=%v, audio=%v, app=%v", sdpLines, hasVideo, hasAudio, hasApp)
+	}
 
 	if err := validateSDP(offer); err != nil {
 		log.Printf("[handleOfferAndGetAnswer] SDP validation failed: %v", err)
@@ -1033,12 +1085,13 @@ func (m *Manager) handleOfferAndGetAnswer(ctx context.Context, offer *webrtc.Ses
 	if err != nil {
 		return nil, err
 	}
-	// Debug: log the answer SDP we're creating
-	answerLines := strings.Count(answer.SDP, "\r\n") + strings.Count(answer.SDP, "\n")
-	answerHasVideo := strings.Contains(answer.SDP, "m=video")
-	answerHasAudio := strings.Contains(answer.SDP, "m=audio")
-	answerHasApp := strings.Contains(answer.SDP, "m=application")
-	log.Printf("[handleOfferAndGetAnswer] Created answer: %d lines, hasVideo=%v, hasAudio=%v, hasApp=%v", answerLines, answerHasVideo, answerHasAudio, answerHasApp)
+	if m.debugMode {
+		answerLines := strings.Count(answer.SDP, "\r\n") + strings.Count(answer.SDP, "\n")
+		answerHasVideo := strings.Contains(answer.SDP, "m=video")
+		answerHasAudio := strings.Contains(answer.SDP, "m=audio")
+		answerHasApp := strings.Contains(answer.SDP, "m=application")
+		log.Printf("[WebRTC] Answer: %d lines, video=%v, audio=%v, app=%v", answerLines, answerHasVideo, answerHasAudio, answerHasApp)
+	}
 
 	if err := m.PeerConnection.SetLocalDescription(answer); err != nil {
 		return nil, err
@@ -1178,22 +1231,15 @@ func (m *Manager) GenerateStream(codecSelector *mediadevices.CodecSelector) (med
 		log.Println("[GenerateStream] Primary constraints succeeded")
 	}
 
-	// detailed debugging of what we actually got
-	log.Printf("[GenerateStream] Stream created with %d video tracks and %d audio tracks",
-		len(stream.GetVideoTracks()), len(stream.GetAudioTracks()))
-
-	// Debug video tracks with available methods
-	for i, track := range stream.GetVideoTracks() {
-		log.Printf("[GenerateStream] Video Track %d:", i)
-		log.Printf("  - ID: %s", track.ID())
-		log.Printf("  - Kind: %s", track.Kind())
-	}
-
-	// Debug audio tracks
-	for i, track := range stream.GetAudioTracks() {
-		log.Printf("[GenerateStream] Audio Track %d:", i)
-		log.Printf("  - ID: %s", track.ID())
-		log.Printf("  - Kind: %s", track.Kind())
+	if m.debugMode {
+		log.Printf("[WebRTC] Stream: %d video, %d audio tracks",
+			len(stream.GetVideoTracks()), len(stream.GetAudioTracks()))
+		for i, track := range stream.GetVideoTracks() {
+			log.Printf("[WebRTC] Video[%d]: ID=%s, Kind=%s", i, track.ID(), track.Kind())
+		}
+		for i, track := range stream.GetAudioTracks() {
+			log.Printf("[WebRTC] Audio[%d]: ID=%s, Kind=%s", i, track.ID(), track.Kind())
+		}
 	}
 
 	return stream, nil
@@ -1212,7 +1258,7 @@ func (m *Manager) GenerateANDSetStream(codecSelector *mediadevices.CodecSelector
 	m.mediaStream = stream
 	m.mu.Unlock()
 
-	fmt.Println("Media stream generated successfully and saved to Manager")
+	log.Printf("[WebRTC] Media stream generated successfully")
 	return nil
 }
 
@@ -1244,11 +1290,12 @@ func (m *Manager) setupVideoTrack() (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSen
 	params := videoRtpSender.GetParameters()
 	if len(params.Encodings) > 0 && params.Encodings[0].SSRC != 0 {
 		m.negotiatedVideoSSRC = uint32(params.Encodings[0].SSRC)
-		log.Printf("[setupVideoTrack] Negotiated video SSRC: %d", m.negotiatedVideoSSRC)
 	}
 	if len(params.Codecs) > 0 {
 		m.negotiatedVideoPayloadType = uint8(params.Codecs[0].PayloadType)
-		log.Printf("[setupVideoTrack] Negotiated video PayloadType: %d", m.negotiatedVideoPayloadType)
+	}
+	if m.debugMode {
+		log.Printf("[WebRTC] Video track: SSRC=%d, PayloadType=%d", m.negotiatedVideoSSRC, m.negotiatedVideoPayloadType)
 	}
 
 	return videoTrack, videoRtpSender, nil
@@ -1279,11 +1326,12 @@ func (m *Manager) setupAudioTrack() (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSen
 	params := audioRtpSender.GetParameters()
 	if len(params.Encodings) > 0 && params.Encodings[0].SSRC != 0 {
 		m.negotiatedAudioSSRC = uint32(params.Encodings[0].SSRC)
-		log.Printf("[setupAudioTrack] Negotiated audio SSRC: %d", m.negotiatedAudioSSRC)
 	}
 	if len(params.Codecs) > 0 {
 		m.negotiatedAudioPayloadType = uint8(params.Codecs[0].PayloadType)
-		log.Printf("[setupAudioTrack] Negotiated audio PayloadType: %d", m.negotiatedAudioPayloadType)
+	}
+	if m.debugMode {
+		log.Printf("[WebRTC] Audio track: SSRC=%d, PayloadType=%d", m.negotiatedAudioSSRC, m.negotiatedAudioPayloadType)
 	}
 
 	return audioTrack, audioRtpSender, nil
@@ -1293,13 +1341,10 @@ func (m *Manager) setupAudioTrack() (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSen
 // after SDP negotiation completes. These values are only available after SetRemoteDescription.
 func (m *Manager) updateNegotiatedParameters() {
 	if m.PeerConnection == nil {
-		log.Println("[updateNegotiatedParameters] PeerConnection is nil, skipping")
 		return
 	}
 
 	senders := m.PeerConnection.GetSenders()
-	log.Printf("[updateNegotiatedParameters] Checking %d senders for negotiated parameters", len(senders))
-
 	for _, sender := range senders {
 		if sender == nil || sender.Track() == nil {
 			continue
@@ -1311,22 +1356,24 @@ func (m *Manager) updateNegotiatedParameters() {
 		if trackKind == "video" {
 			if len(params.Encodings) > 0 && params.Encodings[0].SSRC != 0 {
 				m.negotiatedVideoSSRC = uint32(params.Encodings[0].SSRC)
-				log.Printf("[updateNegotiatedParameters] Updated video SSRC: %d", m.negotiatedVideoSSRC)
 			}
 			if len(params.Codecs) > 0 {
 				m.negotiatedVideoPayloadType = uint8(params.Codecs[0].PayloadType)
-				log.Printf("[updateNegotiatedParameters] Updated video PayloadType: %d", m.negotiatedVideoPayloadType)
 			}
 		} else if trackKind == "audio" {
 			if len(params.Encodings) > 0 && params.Encodings[0].SSRC != 0 {
 				m.negotiatedAudioSSRC = uint32(params.Encodings[0].SSRC)
-				log.Printf("[updateNegotiatedParameters] Updated audio SSRC: %d", m.negotiatedAudioSSRC)
 			}
 			if len(params.Codecs) > 0 {
 				m.negotiatedAudioPayloadType = uint8(params.Codecs[0].PayloadType)
-				log.Printf("[updateNegotiatedParameters] Updated audio PayloadType: %d", m.negotiatedAudioPayloadType)
 			}
 		}
+	}
+
+	if m.debugMode {
+		log.Printf("[WebRTC] Negotiated params - Video: SSRC=%d PT=%d, Audio: SSRC=%d PT=%d",
+			m.negotiatedVideoSSRC, m.negotiatedVideoPayloadType,
+			m.negotiatedAudioSSRC, m.negotiatedAudioPayloadType)
 	}
 }
 
@@ -1334,62 +1381,41 @@ func (m *Manager) handleMediaPackets(srcTrack mediadevices.Track, localTrack *we
 	const maxBufferSize = 25 // Maximum number of packets to buffer
 	pktBuffer := make(chan []*rtp.Packet, maxBufferSize)
 
-	// OPUS 4 DEBUGGING: Track type analysis
-	log.Printf("[TRACK_DEBUG] Track type: %T", srcTrack)
-	log.Printf("[TRACK_DEBUG] Track ID: %s", srcTrack.ID())
-	log.Printf("[TRACK_DEBUG] Track Kind: %s", srcTrack.Kind().String())
-
-	// OPUS 4 DEBUGGING: LocalTrack analysis
 	mimeType := localTrack.Codec().MimeType
-	log.Printf("[TRACK_DEBUG] LocalTrack codec: %s", mimeType)
-	log.Printf("[TRACK_DEBUG] LocalTrack Number of Channels: %v", localTrack.Codec().Channels)
-	log.Printf("[TRACK_DEBUG] LocalTrack SSRC provided: %d", ssrc)
+	if m.debugMode {
+		log.Printf("[WebRTC] Track type: %T, ID: %s, Kind: %s", srcTrack, srcTrack.ID(), srcTrack.Kind().String())
+		log.Printf("[WebRTC] LocalTrack codec: %s, Channels: %v, SSRC: %d", mimeType, localTrack.Codec().Channels, ssrc)
+	}
 
-	// We need the "codec name" for calling NewRTPReader, which generally is safe to assume is the second part of the MIME type
+	// Extract codec name from MIME type
 	mimeParts := strings.SplitN(mimeType, "/", 2)
 	if len(mimeParts) != 2 {
-		log.Printf("[TRACK_DEBUG] ERROR: Invalid MIME type format: %s", mimeType)
+		log.Printf("[WebRTC] Invalid MIME type format: %s", mimeType)
 		return
 	}
 	codec := mimeParts[1]
-	log.Printf("[TRACK_DEBUG] Extracted codec name: %s", codec)
 
-	// OPUS 4 DEBUGGING: Try multiple codec variations
-	log.Printf("[TRACK_DEBUG] Attempting to create RTP reader with codec: '%s', SSRC: %d, MTU: %d", codec, ssrc, mtu)
-
+	// Try creating RTP reader with codec fallbacks
 	rtpReader, err := srcTrack.NewRTPReader(codec, ssrc, mtu)
 	if err != nil {
-		log.Printf("[TRACK_DEBUG] FAILED with codec '%s': %v", codec, err)
-
-		// OPUS 4 SUGGESTION: Try lowercase codec
+		// Try lowercase codec
 		lowerCodec := strings.ToLower(codec)
-		log.Printf("[TRACK_DEBUG] Trying lowercase codec: '%s'", lowerCodec)
 		rtpReader, err = srcTrack.NewRTPReader(lowerCodec, ssrc, mtu)
 		if err != nil {
-			log.Printf("[TRACK_DEBUG] FAILED with lowercase codec '%s': %v", lowerCodec, err)
-
-			// OPUS 4 SUGGESTION: Try empty codec
-			log.Printf("[TRACK_DEBUG] Trying empty codec string")
+			// Try empty codec as last resort
 			rtpReader, err = srcTrack.NewRTPReader("", ssrc, mtu)
 			if err != nil {
-				log.Printf("[TRACK_DEBUG] FAILED with empty codec: %v", err)
-
-				// OPUS 4 SUGGESTION: Check if srcTrack is nil or invalid
-				if srcTrack == nil {
-					log.Printf("[TRACK_DEBUG] ERROR: srcTrack is nil!")
-				} else {
-					log.Printf("[TRACK_DEBUG] srcTrack is valid, but NewRTPReader consistently fails")
-				}
-
-				log.Printf("RTP reader failed with all attempts: original='%s', lowercase='%s', empty=''", codec, lowerCodec)
+				log.Printf("[WebRTC] RTP reader failed for all codec variants: %s", codec)
 				return
 			}
-			log.Printf("[TRACK_DEBUG] SUCCESS with empty codec!")
-		} else {
-			log.Printf("[TRACK_DEBUG] SUCCESS with lowercase codec: '%s'", lowerCodec)
+			if m.debugMode {
+				log.Printf("[WebRTC] RTP reader created with empty codec fallback")
+			}
+		} else if m.debugMode {
+			log.Printf("[WebRTC] RTP reader created with lowercase codec: %s", lowerCodec)
 		}
-	} else {
-		log.Printf("[TRACK_DEBUG] SUCCESS with original codec: '%s'", codec)
+	} else if m.debugMode {
+		log.Printf("[WebRTC] RTP reader created with codec: %s", codec)
 	}
 
 	// Producer
@@ -1693,9 +1719,11 @@ func (m *Manager) forwardExternalRTP(rtpChan <-chan *rtp.Packet, track *webrtc.T
 		packetsDropped = &m.audioPacketsDropped
 	}
 
-	log.Printf("[forwardExternalRTP] %s remapping: SSRC=%d, PayloadType=%d", mediaKind, ssrc, payloadType)
+	if m.debugMode {
+		log.Printf("[WebRTC] %s remapping: SSRC=%d, PayloadType=%d", mediaKind, ssrc, payloadType)
+	}
 
-	// Stats ticker for periodic logging
+	// Stats ticker for periodic logging (only active in debug mode)
 	statsTicker := time.NewTicker(10 * time.Second)
 	defer statsTicker.Stop()
 
@@ -1740,14 +1768,15 @@ func (m *Manager) forwardExternalRTP(rtpChan <-chan *rtp.Packet, track *webrtc.T
 			atomic.AddUint64(packetsSent, 1)
 
 		case <-statsTicker.C:
-			// Log stats periodically
-			m.rtpStatsLock.RLock()
-			sent := atomic.LoadUint64(packetsSent)
-			dropped := atomic.LoadUint64(packetsDropped)
-			m.rtpStatsLock.RUnlock()
-
-			if sent > 0 || dropped > 0 {
-				log.Printf("[forwardExternalRTP] %s stats: sent=%d, dropped=%d", mediaKind, sent, dropped)
+			// Log stats periodically (debug mode only)
+			if m.debugMode {
+				m.rtpStatsLock.RLock()
+				sent := atomic.LoadUint64(packetsSent)
+				dropped := atomic.LoadUint64(packetsDropped)
+				m.rtpStatsLock.RUnlock()
+				if sent > 0 || dropped > 0 {
+					log.Printf("[WebRTC] %s stats: sent=%d, dropped=%d", mediaKind, sent, dropped)
+				}
 			}
 		}
 	}
@@ -1984,7 +2013,9 @@ func (m *Manager) handleSenderReport(data []byte, mediaKind string) {
 	packetCount := uint32(data[16])<<24 | uint32(data[17])<<16 | uint32(data[18])<<8 | uint32(data[19])
 	octetCount := uint32(data[20])<<24 | uint32(data[21])<<16 | uint32(data[22])<<8 | uint32(data[23])
 
-	log.Printf("[handleSenderReport] %s - Packets: %d, Octets: %d", mediaKind, packetCount, octetCount)
+	if m.debugMode {
+		log.Printf("[WebRTC] SR %s: packets=%d, octets=%d", mediaKind, packetCount, octetCount)
+	}
 }
 
 // handleReceiverReport analyzes RR packets for reception statistics
@@ -2001,39 +2032,31 @@ func (m *Manager) handleReceiverReport(data []byte, mediaKind string) {
 
 		lossRate := float64(fractionLost) / 256.0
 
+		// Send warning for significant packet loss (production-critical)
 		if lossRate > 0.05 { // 5% loss threshold
 			select {
 			case m.ConnectionDoctor.warnings <- Warning{
 				Timestamp:   time.Now(),
 				Level:       SuggestionLevel,
 				Type:        PacketLossWarning,
-				Message:     fmt.Sprintf("RTCP RR indicates %s packet loss: %.2f%% (%d total)", mediaKind, lossRate*100, totalLost),
+				Message:     fmt.Sprintf("RTCP RR %s loss: %.1f%% (%d total)", mediaKind, lossRate*100, totalLost),
 				Measurement: lossRate,
 			}:
 			default:
-				// Channel full
 			}
 		}
 
-		log.Printf("[handleReceiverReport] %s - Loss rate: %.2f%%, Total lost: %d", mediaKind, lossRate*100, totalLost)
+		if m.debugMode {
+			log.Printf("[WebRTC] RR %s: loss=%.1f%%, total_lost=%d", mediaKind, lossRate*100, totalLost)
+		}
 	}
 }
 
 // handleTWCCFeedback processes Transport-wide Congestion Control feedback
 func (m *Manager) handleTWCCFeedback(data []byte, mediaKind string) {
 	// TWCC feedback packets indicate network congestion
-	log.Printf("[handleTWCCFeedback] Received TWCC feedback for %s", mediaKind)
-
-	// Send info to connection doctor
-	select {
-	case m.ConnectionDoctor.warnings <- Warning{
-		Timestamp: time.Now(),
-		Level:     InfoLevel,
-		Type:      BitrateWarning,
-		Message:   fmt.Sprintf("Received TWCC congestion feedback for %s", mediaKind),
-	}:
-	default:
-		// Channel full
+	if m.debugMode {
+		log.Printf("[WebRTC] TWCC feedback for %s", mediaKind)
 	}
 }
 
@@ -2052,11 +2075,13 @@ func (m *Manager) handlePayloadSpecificFeedback(data []byte, mediaKind string) {
 			Timestamp: time.Now(),
 			Level:     SuggestionLevel,
 			Type:      PacketLossWarning,
-			Message:   fmt.Sprintf("Received NACK feedback for %s - requesting packet retransmission", mediaKind),
+			Message:   fmt.Sprintf("NACK %s: packet retransmission requested", mediaKind),
 		}:
 		default:
 		}
-		log.Printf("[handlePayloadSpecificFeedback] Received NACK for %s", mediaKind)
+		if m.debugMode {
+			log.Printf("[WebRTC] NACK received for %s", mediaKind)
+		}
 
 	case 2: // PLI - Picture Loss Indication
 		select {
@@ -2064,11 +2089,13 @@ func (m *Manager) handlePayloadSpecificFeedback(data []byte, mediaKind string) {
 			Timestamp: time.Now(),
 			Level:     SuggestionLevel,
 			Type:      FramerateWarning,
-			Message:   fmt.Sprintf("Received PLI feedback for %s - picture corruption detected", mediaKind),
+			Message:   fmt.Sprintf("PLI %s: picture corruption detected", mediaKind),
 		}:
 		default:
 		}
-		log.Printf("[handlePayloadSpecificFeedback] Received PLI for %s", mediaKind)
+		if m.debugMode {
+			log.Printf("[WebRTC] PLI received for %s", mediaKind)
+		}
 
 	case 4: // FIR - Full Intra Request
 		select {
@@ -2076,14 +2103,13 @@ func (m *Manager) handlePayloadSpecificFeedback(data []byte, mediaKind string) {
 			Timestamp: time.Now(),
 			Level:     SuggestionLevel,
 			Type:      FramerateWarning,
-			Message:   fmt.Sprintf("Received FIR feedback for %s - requesting keyframe", mediaKind),
+			Message:   fmt.Sprintf("FIR %s: keyframe requested", mediaKind),
 		}:
 		default:
 		}
-		log.Printf("[handlePayloadSpecificFeedback] Received FIR for %s", mediaKind)
-
-	default:
-		log.Printf("[handlePayloadSpecificFeedback] Unknown PSF type %d for %s", feedbackType, mediaKind)
+		if m.debugMode {
+			log.Printf("[WebRTC] FIR received for %s", mediaKind)
+		}
 	}
 }
 
@@ -2098,14 +2124,14 @@ func (m *Manager) processRTCPWithBuffer(data []byte, attributes interface{}, med
 	packetType := data[1]
 
 	if version != 2 {
-		log.Printf("[processRTCPWithBuffer] Invalid RTCP version for %s: %d", mediaKind, version)
-		return
+		return // Invalid RTCP version
 	}
 
 	// Check if we should process this packet type to prevent feedback loops
 	if !m.rtcpFeedbackBuffer.ShouldProcessPacket(packetType, mediaKind) {
-		log.Printf("[processRTCPWithBuffer] Skipping %s packet type %d for %s to prevent feedback loop",
-			mediaKind, packetType, mediaKind)
+		if m.debugMode {
+			log.Printf("[WebRTC] Skipping %s packet type %d (feedback loop prevention)", mediaKind, packetType)
+		}
 		return
 	}
 
@@ -2141,7 +2167,7 @@ func (m *Manager) processRTCPWithBuffer(data []byte, attributes interface{}, med
 		case 201: // Receiver Report (RR)
 			m.handleReceiverReport(data, mediaKind)
 		case 202: // Source Description (SDES)
-			log.Printf("[processRTCPWithBuffer] Received SDES packet for %s (SSRC: %d)", mediaKind, ssrc)
+			// SDES packets are routine - only log in debug mode
 		case 203: // Goodbye (BYE)
 			select {
 			case m.ConnectionDoctor.warnings <- Warning{
@@ -2158,15 +2184,16 @@ func (m *Manager) processRTCPWithBuffer(data []byte, attributes interface{}, med
 		case 206: // Payload Specific Feedback (PSF) - includes NACK, PLI, FIR
 			m.handlePayloadSpecificFeedback(data, mediaKind)
 		default:
-			log.Printf("[processRTCPWithBuffer] Unknown RTCP packet type %d for %s (SSRC: %d)",
-				packetType, mediaKind, ssrc)
+			if m.debugMode {
+				log.Printf("[WebRTC] Unknown RTCP type %d for %s (SSRC: %d)", packetType, mediaKind, ssrc)
+			}
 		}
 	}
 
-	// Log buffer statistics periodically (every 100 packets)
-	if m.rtcpFeedbackBuffer.Size() > 0 && m.rtcpFeedbackBuffer.Size()%100 == 0 {
+	// Log buffer statistics periodically (debug mode only)
+	if m.debugMode && m.rtcpFeedbackBuffer.Size() > 0 && m.rtcpFeedbackBuffer.Size()%100 == 0 {
 		stats := m.rtcpFeedbackBuffer.GetFeedbackStats(30 * time.Second)
-		log.Printf("[processRTCPWithBuffer] RTCP feedback stats (last 30s): %+v", stats)
+		log.Printf("[WebRTC] RTCP stats (last 30s): %+v", stats)
 	}
 }
 
@@ -2603,35 +2630,26 @@ func (m *Manager) SendOffer(offer *webrtc.SessionDescription) error {
 }
 
 // logNegotiatedCodecs inspects all transceivers and logs the negotiated codecs.
-// Safe to call after SetRemoteDescription (offer or answer).
+// Safe to call after SetRemoteDescription (offer or answer). Only logs in debug mode.
 func (m *Manager) logNegotiatedCodecs(context string) {
-	if m.PeerConnection == nil {
-		log.Printf("[logNegotiatedCodecs:%s] PeerConnection is nil", context)
+	if !m.debugMode || m.PeerConnection == nil {
 		return
 	}
 
 	transceivers := m.PeerConnection.GetTransceivers()
 	if len(transceivers) == 0 {
-		log.Printf("[logNegotiatedCodecs:%s] No transceivers found", context)
+		log.Printf("[WebRTC:%s] No transceivers", context)
 		return
 	}
 
 	for i, t := range transceivers {
-		// Skip transceivers without a sender (may be recvonly)
 		if t.Sender() == nil {
-			log.Printf("[logNegotiatedCodecs:%s] Transceiver[%d] kind=%s has no sender", context, i, t.Kind())
 			continue
 		}
-
 		params := t.Sender().GetParameters()
-		if len(params.Codecs) == 0 {
-			log.Printf("[logNegotiatedCodecs:%s] Transceiver[%d] kind=%s has no negotiated codecs", context, i, t.Kind())
-			continue
-		}
-
 		for _, cp := range params.Codecs {
-			log.Printf("[logNegotiatedCodecs:%s] Transceiver[%d] kind=%s NEGOTIATED CODEC: %s (pt=%d fmtp=%q)",
-				context, i, t.Kind().String(), cp.MimeType, cp.PayloadType, cp.SDPFmtpLine)
+			log.Printf("[WebRTC:%s] Transceiver[%d] %s: %s (pt=%d)",
+				context, i, t.Kind().String(), cp.MimeType, cp.PayloadType)
 		}
 	}
 }

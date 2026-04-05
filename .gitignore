@@ -14,9 +14,7 @@ credentials/
 tailscale_auth_key
 *.auth
 tailscale.json
-
-# Current secrets file (temporary)
-CURRENT_SECRETS.txt
+tailscale-api.json
 
 # --- Go specific ---
 # Binaries for programs and plugins
@@ -40,7 +38,6 @@ go.work
 
 # --- Node.js specific ---
 # Logs
-logs
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -83,9 +80,11 @@ jspm_packages/
 .yarn-integrity
 
 # dotenv environment variables file
-.env
 .env.test
 .env.production
+
+# Lock files
+frontend/package-lock.json
 
 # --- Build outputs ---
 # Compiled binaries
@@ -93,6 +92,7 @@ jspm_packages/
 /webcam
 /camera
 dist/
+frontend/dist/
 build/
 out/
 
@@ -110,7 +110,6 @@ temp/
 
 # OS generated files
 .DS_Store
-.DS_Store?
 ._*
 .Spotlight-V100
 .Trashes
@@ -127,9 +126,8 @@ recordings/
 *.webm
 
 # --- Logs and runtime ---
-*.log
-log/
 logs/
+log/
 
 # --- Database files ---
 *.db
@@ -139,13 +137,10 @@ logs/
 # --- SSL certificates ---
 *.crt
 *.csr
-*.key
-*.pem
 ssl/
 certs/
 
 # --- Docker ---
-.dockerignore
 Dockerfile.local
 
 # --- Backup files ---
@@ -169,6 +164,21 @@ docs/_build/
 yarn.lock
 package-lock.json
 
+# --- Archives and backups ---
+Archive/
+Archive.zip
+*.zip
+
+# --- Serena workspace ---
+.serena/
+
+# --- Debug images ---
+debug_*.png
+
+# --- Data files ---
+*.csv
+
 # Keep example files but ignore local copies
 !*.example
 !*.sample
+bin/

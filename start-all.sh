@@ -126,22 +126,31 @@ find_available_port() {
       local cmd=$(ps -p "$pid" -o command= 2>/dev/null || echo "")
       if [[ "$cmd" == *"$process_name"* ]]; then
         is_our_process=true
-        log_warn "Port ${port} is occupied by our previous process (PID: ${pid}). Killing it…"
+        echo -e "${YELLOW}[WARN]${NC} Port ${port} is occupied by our previous process (PID: ${pid}). Killing it…" >&2
         kill -9 "$pid" 2>/dev/null || true
       fi
     done
 
     if $is_our_process; then
-      # Wait for port to be released
-      sleep 1
+      # Wait for port to be released (OS may take a few seconds)
+      sleep 3
+      # Retry a few times
+      for i in 1 2 3; do
+        if ! lsof -ti:${port} >/dev/null 2>&1; then
+          echo "$port"
+          return 0
+        fi
+        sleep 1
+      done
+      # Still occupied after retries, check one more time
       if ! lsof -ti:${port} >/dev/null 2>&1; then
         echo "$port"
         return 0
       fi
     fi
 
-    # Try next port
-    log_warn "Port ${port} is in use by another process, trying ${port}+1…"
+    # Try next port (log to stderr so stdout is clean for capture)
+    echo -e "${YELLOW}[WARN]${NC} Port ${port} is in use by another process, trying $((port+1))…" >&2
     port=$((port + 1))
   done
 
@@ -179,6 +188,29 @@ if [[ -z "$COMPOSE_FILE" ]]; then
   exit 1
 fi
 
+# ----------------------------
+# Find free ports for ion-sfu
+#
+# WHY DYNAMIC PORTS: macOS AirPlay Receiver grabs ports 5000 (UDP) and 7000 (TCP)
+# at boot, which are ion-sfu's defaults. Rather than requiring users to disable
+# AirPlay, we find free ports starting at 7100 (signaling) and 15000 (media).
+#
+# WHY NATIVE SFU ON macOS: Docker Desktop for macOS runs containers in a Linux VM.
+# This means network_mode:host doesn't actually share the macOS host network, and
+# bridge-mode port mapping doesn't support bidirectional UDP (the SFU can receive
+# UDP from the host via port mapping, but can't send UDP back because 127.0.0.1
+# inside Docker refers to the container, not the host). Since WebRTC requires
+# bidirectional UDP between the Go backend and the SFU, we run ion-sfu natively
+# on macOS. On Linux, the Docker container works fine with network_mode:host.
+# ----------------------------
+ION_SFU_PORT=$(find_available_port 7100 "json-rpc")
+if [[ -z "$ION_SFU_PORT" ]]; then
+  log_error "Failed to find available port for ion-sfu signaling"
+  exit 1
+fi
+export ION_SFU_PORT
+log_info "ion-sfu signaling port: ${ION_SFU_PORT}"
+
 log_info "Starting Docker Compose services (file: $COMPOSE_FILE)…"
 docker compose -f "$COMPOSE_FILE" up -d
 
@@ -197,15 +229,35 @@ wait_for_service "PostgreSQL" "docker exec $postgres_cid pg_isready -U recorder 
 # MinIO readiness (HTTP liveness)
 wait_for_service "MinIO" "curl -fsS http://localhost:9000/minio/health/live" 60
 
-# Ion SFU readiness: check if container is running and healthy
-# ion-sfu doesn't have a traditional health endpoint, so we just verify the container is running
-# and give it a few extra seconds to initialize its WebSocket server on port 7001
-log_info "Waiting for ion-sfu container to be running…"
-sleep 5
-if docker ps --format '{{.Names}}' | grep -q "webcam2-ion-sfu"; then
-  log_info "ion-sfu is ready."
+# ----------------------------
+# Start ion-sfu natively on the host
+#
+# WHY NOT DOCKER: macOS Docker Desktop runs containers in a Linux VM. This means
+# network_mode:host shares the VM's network (not macOS), and bridge networking
+# can't do bidirectional UDP (inbound port mapping works, but outbound from
+# container to host via 127.0.0.1 hits the container's own loopback). WebRTC
+# requires bidirectional UDP for ICE, so the SFU must run on the host itself.
+# The binary at bin/ion-sfu is a static Go build (CGO_ENABLED=0) from
+# github.com/pion/ion-sfu. Rebuild with:
+#   cd /tmp && git clone --depth 1 https://github.com/pion/ion-sfu.git
+#   cd ion-sfu && CGO_ENABLED=0 go build -o $PROJECT_DIR/bin/ion-sfu ./cmd/signal/json-rpc/
+# ----------------------------
+SFU_BINARY="$PROJECT_DIR/bin/ion-sfu"
+if [[ ! -x "$SFU_BINARY" ]]; then
+  log_error "ion-sfu binary not found at $SFU_BINARY. See comment in start-all.sh for build instructions."
+  exit 1
+fi
+
+log_info "Starting ion-sfu natively on port ${ION_SFU_PORT}..."
+"$SFU_BINARY" -c "$PROJECT_DIR/configs/sfu.toml" -a ":${ION_SFU_PORT}" > "$LOG_DIR/ion-sfu.log" 2>&1 &
+SFU_PID=$!
+sleep 2
+
+if kill -0 "$SFU_PID" 2>/dev/null; then
+  log_info "ion-sfu is running (PID: $SFU_PID, port: $ION_SFU_PORT)"
 else
-  log_error "ion-sfu container is not running. Check: docker compose logs ion-sfu"
+  log_error "ion-sfu failed to start. Check: $LOG_DIR/ion-sfu.log"
+  cat "$LOG_DIR/ion-sfu.log"
   exit 1
 fi
 
@@ -235,7 +287,7 @@ log_info "Frontend built."
 # Step 5: Start Node.js WS proxy
 # ----------------------------
 log_info "Starting Node.js WebSocket proxy server…"
-export ION_SFU_URL="${ION_SFU_URL:-ws://localhost:7001/ws}"
+export ION_SFU_URL="${ION_SFU_URL:-ws://localhost:${ION_SFU_PORT}/ws}"
 
 # Find available port for Node.js server
 PORT=$(find_available_port 3000 "node server.js")
