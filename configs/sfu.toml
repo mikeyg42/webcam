@@ -35,17 +35,12 @@ bestqualityfirst = true
 enabletemporallayer = false
 
 [webrtc]
-# Single port, portrange will not work if you enable this
-# singleport = 5000
+# Single port mode — all WebRTC media multiplexed on one port.
+# More reliable than portrange for local development.
+singleport = 15000
 
-# Range of ports that ion accepts WebRTC traffic on
-# Format: [min, max]   and max - min >= 100
-portrange = [15000, 15200]
-
-# Tailscale-only mode: no TURN server needed
-# Optional STUN for NAT traversal (though Tailscale handles this)
-# [[webrtc.iceserver]]
-# urls = ["stun:stun.l.google.com:19302"]
+# portrange alternative (not used when singleport is set):
+# portrange = [15000, 15200]
 
 # sdp semantics:
 # "unified-plan"
@@ -68,7 +63,7 @@ mdns = true
 # SFU runs natively on the host (not Docker) — see start-all.sh.
 # 127.0.0.1 works because both SFU and Go backend share the host loopback.
 nat1to1 = ["127.0.0.1"]
-# icelite = true
+icelite = true
 
 [webrtc.timeouts]
 # The duration in [sec] without network activity before a ICE Agent is considered disconnected
@@ -80,4 +75,4 @@ keepalive = 4
 
 [log]
 # 0 - INFO 1 - DEBUG 2 - TRACE
-v = 1
+v = 2

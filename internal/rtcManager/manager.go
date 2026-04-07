@@ -182,6 +182,13 @@ type Manager struct {
 	signalingReady     atomic.Bool // Track when initial signaling setup is complete
 	signalingReadyTime time.Time   // When signaling was marked ready (for cooldown)
 
+	// ICE candidate buffering: trickle candidates from the SFU can arrive before
+	// SetRemoteDescription is called (race between the join RPC response and trickle
+	// notifications). Buffer them here and drain after SetRemoteDescription.
+	pendingCandidatesMu sync.Mutex
+	pendingCandidates   []webrtc.ICECandidateInit
+	remoteDescSet       atomic.Bool
+
 	// External RTP source support (GStreamer pipeline)
 	videoTrack               *webrtc.TrackLocalStaticRTP
 	audioTrack               *webrtc.TrackLocalStaticRTP
@@ -285,11 +292,7 @@ func (h *rtcHandler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonr
 			return
 		}
 		if trickleMsg.Candidate != nil {
-			if err := h.manager.PeerConnection.AddICECandidate(*trickleMsg.Candidate); err != nil {
-				log.Printf("Failed to add ICE candidate: %v", err)
-			} else {
-				log.Printf("Successfully added ICE candidate from target %d", trickleMsg.Target)
-			}
+			h.manager.addOrBufferCandidate(*trickleMsg.Candidate, trickleMsg.Target)
 		}
 	default:
 		conn.ReplyWithError(ctx, req.ID, &jsonrpc2.Error{
@@ -574,10 +577,10 @@ func (m *Manager) Initialize() (*mediadevices.CodecSelector, error) {
 		}
 	}
 
-	// Restrict to UDP only
+	// Restrict to UDP4 only — IPv6 candidates aren't rewritten by NAT1To1
+	// and cause ICE pair explosion with ion-sfu's pion v3
 	settingEngine.SetNetworkTypes([]webrtc.NetworkType{
 		webrtc.NetworkTypeUDP4,
-		webrtc.NetworkTypeUDP6,
 	})
 
 	// Set ICE candidate timeout
@@ -849,9 +852,12 @@ func (m *Manager) setupCallbacks() {
 	// ICE Candidate handling
 	m.PeerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate != nil {
+			log.Printf("[ICE] Local candidate: %s", candidate.String())
 			if err := m.SendICECandidate(candidate); err != nil {
 				log.Printf("Failed to send ICE candidate: %v", err)
 			}
+		} else {
+			log.Println("[ICE] Local candidate gathering complete")
 		}
 	})
 }
@@ -973,6 +979,44 @@ func (m *Manager) handleNegotiationNeeded() error {
 	return m.SendOffer(&offer)
 }
 
+// addOrBufferCandidate adds an ICE candidate if the remote description is set,
+// otherwise buffers it for later. This handles the race where trickle candidates
+// arrive from the SFU before the join RPC returns the answer SDP.
+func (m *Manager) addOrBufferCandidate(candidate webrtc.ICECandidateInit, target int) {
+	if m.remoteDescSet.Load() {
+		if err := m.PeerConnection.AddICECandidate(candidate); err != nil {
+			log.Printf("Failed to add ICE candidate: %v", err)
+		} else {
+			log.Printf("Successfully added ICE candidate from target %d", target)
+		}
+		return
+	}
+	// Buffer for later
+	m.pendingCandidatesMu.Lock()
+	m.pendingCandidates = append(m.pendingCandidates, candidate)
+	m.pendingCandidatesMu.Unlock()
+	log.Printf("Buffered ICE candidate (remote description not set yet), target=%d", target)
+}
+
+// drainPendingCandidates adds all buffered ICE candidates after SetRemoteDescription.
+func (m *Manager) drainPendingCandidates() {
+	m.pendingCandidatesMu.Lock()
+	candidates := m.pendingCandidates
+	m.pendingCandidates = nil
+	m.pendingCandidatesMu.Unlock()
+
+	for _, c := range candidates {
+		if err := m.PeerConnection.AddICECandidate(c); err != nil {
+			log.Printf("Failed to add buffered ICE candidate: %v", err)
+		} else {
+			log.Println("Successfully added buffered ICE candidate")
+		}
+	}
+	if len(candidates) > 0 {
+		log.Printf("Drained %d buffered ICE candidates", len(candidates))
+	}
+}
+
 func (m *Manager) SendICECandidate(candidate *webrtc.ICECandidate) error {
 	return m.rpcConn.Notify(m.ctx, "trickle", candidate)
 }
@@ -1015,7 +1059,13 @@ func (m *Manager) SetupSignaling() error {
 		return fmt.Errorf("[SetupSignaling] join request failed: %v", err)
 	}
 
-	// Set remote description with the answer
+	// Dump SDP for debugging ICE
+	log.Printf("[SetupSignaling] LOCAL OFFER SDP:\n%s", offer.SDP)
+	log.Printf("[SetupSignaling] REMOTE ANSWER SDP:\n%s", answer.SDP)
+
+	// Set remote description with the answer, then drain buffered ICE candidates.
+	// Trickle candidates may have arrived from the SFU during the join RPC call
+	// and been buffered because the remote description wasn't set yet.
 	if err := m.PeerConnection.SetRemoteDescription(answer); err != nil {
 		// Log the error but don't fail completely if it's a codec issue
 		if strings.Contains(err.Error(), "codec is not supported") || strings.Contains(err.Error(), "unable to start track") {
@@ -1025,6 +1075,10 @@ func (m *Manager) SetupSignaling() error {
 			return fmt.Errorf("[SetupSignaling] failed to set remote description: %v", err)
 		}
 	}
+	// Remote description is now set — drain any buffered trickle candidates
+	m.remoteDescSet.Store(true)
+	m.drainPendingCandidates()
+
 	// Log the negotiated codecs
 	m.logNegotiatedCodecs("SetupSignaling")
 
@@ -1059,6 +1113,33 @@ func (m *Manager) handleOfferAndGetAnswer(ctx context.Context, offer *webrtc.Ses
 		log.Printf("[handleOfferAndGetAnswer] SDP validation failed: %v", err)
 		return nil, fmt.Errorf("remote SDP validation failed: %w", err)
 	}
+
+	// If ICE is still checking from the initial exchange, delay handling re-offers
+	// to prevent the SFU's new ICE credentials from triggering an ICE restart that
+	// kills the in-progress connection. Wait up to 10 seconds for ICE to connect.
+	iceState := m.PeerConnection.ICEConnectionState()
+	if iceState == webrtc.ICEConnectionStateChecking || iceState == webrtc.ICEConnectionStateNew {
+		log.Printf("[handleOfferAndGetAnswer] ICE is %s, waiting for it to settle before processing re-offer...", iceState)
+		deadline := time.After(10 * time.Second)
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+	waitLoop:
+		for {
+			select {
+			case <-deadline:
+				log.Println("[handleOfferAndGetAnswer] Timed out waiting for ICE, proceeding with re-offer")
+				break waitLoop
+			case <-ticker.C:
+				s := m.PeerConnection.ICEConnectionState()
+				if s == webrtc.ICEConnectionStateConnected || s == webrtc.ICEConnectionStateCompleted ||
+					s == webrtc.ICEConnectionStateFailed || s == webrtc.ICEConnectionStateClosed {
+					log.Printf("[handleOfferAndGetAnswer] ICE settled to %s, proceeding", s)
+					break waitLoop
+				}
+			}
+		}
+	}
+
 	log.Println("[handleOfferAndGetAnswer] SDP validation passed")
 
 	// Check signaling state - if we're in have-local-offer, this is a glare condition
