@@ -79,6 +79,10 @@ func NewServer(ctx context.Context, cfg *config.Config, addr string, calibServic
 		log.Println("[APIServer] Warning: Credential management disabled (database or Tailscale not available)")
 	}
 
+	// LiveKit token endpoint for browser subscribers
+	lkTokenHandler := NewLiveKitTokenHandler(&cfg.LiveKit)
+	lkTokenHandler.RegisterRoutes(mux)
+
 	// Health check endpoint
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -94,7 +98,7 @@ func NewServer(ctx context.Context, cfg *config.Config, addr string, calibServic
 			Addr:           addr,
 			Handler:        handler,
 			ReadTimeout:    10 * time.Second,
-			WriteTimeout:   10 * time.Second,
+			WriteTimeout:   5 * time.Minute,
 			MaxHeaderBytes: 1 << 20, // 1 MB
 		},
 		mux:                 mux,
@@ -136,6 +140,15 @@ func (s *Server) SetRecordingControlHandler(controller RecordingController) {
 	}
 }
 
+// SetRecordingsBrowserHandler sets the recordings browser handler for listing, playing, and deleting recordings
+func (s *Server) SetRecordingsBrowserHandler(browser RecordingBrowser) {
+	if browser != nil {
+		handler := NewRecordingsBrowserHandler(browser)
+		handler.RegisterRoutes(s.mux)
+		log.Println("[APIServer] Recordings browser endpoints registered")
+	}
+}
+
 // corsMiddleware adds CORS headers to allow cross-origin requests
 func corsMiddleware(next http.Handler) http.Handler {
 	// Whitelist of allowed origins
@@ -154,7 +167,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 		// Only set CORS headers for whitelisted origins
 		if origin != "" && allowedOrigins[origin] {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}

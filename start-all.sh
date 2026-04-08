@@ -162,10 +162,7 @@ cleanup() {
   log_warn "Shutting down app processes…"
   [[ -n "${NODE_PID:-}" ]] && kill "${NODE_PID}" 2>/dev/null || true
   [[ -n "${GO_PID:-}" ]] && kill "${GO_PID}" 2>/dev/null || true
-
-  # Uncomment if you want containers to stop when the script exits:
-  # log_warn "Stopping docker compose services…"
-  # docker compose down -v
+  [[ -n "${SFU_PID:-}" ]] && kill "${SFU_PID}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -189,27 +186,20 @@ if [[ -z "$COMPOSE_FILE" ]]; then
 fi
 
 # ----------------------------
-# Find free ports for ion-sfu
-#
-# WHY DYNAMIC PORTS: macOS AirPlay Receiver grabs ports 5000 (UDP) and 7000 (TCP)
-# at boot, which are ion-sfu's defaults. Rather than requiring users to disable
-# AirPlay, we find free ports starting at 7100 (signaling) and 15000 (media).
+# Find free port for livekit-server
 #
 # WHY NATIVE SFU ON macOS: Docker Desktop for macOS runs containers in a Linux VM.
-# This means network_mode:host doesn't actually share the macOS host network, and
-# bridge-mode port mapping doesn't support bidirectional UDP (the SFU can receive
-# UDP from the host via port mapping, but can't send UDP back because 127.0.0.1
-# inside Docker refers to the container, not the host). Since WebRTC requires
-# bidirectional UDP between the Go backend and the SFU, we run ion-sfu natively
-# on macOS. On Linux, the Docker container works fine with network_mode:host.
+# network_mode:host shares the VM's network (not macOS), and bridge networking
+# can't do bidirectional UDP. WebRTC requires bidirectional UDP for ICE, so the
+# SFU must run on the host itself. On Linux, a Docker container works fine.
 # ----------------------------
-ION_SFU_PORT=$(find_available_port 7100 "json-rpc")
-if [[ -z "$ION_SFU_PORT" ]]; then
-  log_error "Failed to find available port for ion-sfu signaling"
+LIVEKIT_PORT=$(find_available_port 7880 "livekit-server")
+if [[ -z "$LIVEKIT_PORT" ]]; then
+  log_error "Failed to find available port for livekit-server"
   exit 1
 fi
-export ION_SFU_PORT
-log_info "ion-sfu signaling port: ${ION_SFU_PORT}"
+export LIVEKIT_PORT
+log_info "LiveKit signaling port: ${LIVEKIT_PORT}"
 
 log_info "Starting Docker Compose services (file: $COMPOSE_FILE)…"
 docker compose -f "$COMPOSE_FILE" up -d
@@ -217,11 +207,8 @@ docker compose -f "$COMPOSE_FILE" up -d
 # Resolve container IDs by service name if available; fallback to known names.
 postgres_cid="$(docker compose -f "$COMPOSE_FILE" ps -q postgres || true)"
 minio_cid="$(docker compose -f "$COMPOSE_FILE" ps -q minio || true)"
-ionsfu_cid="$(docker compose -f "$COMPOSE_FILE" ps -q ion-sfu || true)"
 
-# If service names differ in your compose file, these fallbacks may help:
 [[ -z "$postgres_cid" ]] && postgres_cid="webcam2-postgres"
-[[ -z "$ionsfu_cid"   ]] && ionsfu_cid="webcam2-ion-sfu"
 
 # PostgreSQL readiness (pg_isready in container)
 wait_for_service "PostgreSQL" "docker exec $postgres_cid pg_isready -U recorder -d recordings" 60
@@ -230,34 +217,27 @@ wait_for_service "PostgreSQL" "docker exec $postgres_cid pg_isready -U recorder 
 wait_for_service "MinIO" "curl -fsS http://localhost:9000/minio/health/live" 60
 
 # ----------------------------
-# Start ion-sfu natively on the host
+# Start livekit-server natively on the host
 #
-# WHY NOT DOCKER: macOS Docker Desktop runs containers in a Linux VM. This means
-# network_mode:host shares the VM's network (not macOS), and bridge networking
-# can't do bidirectional UDP (inbound port mapping works, but outbound from
-# container to host via 127.0.0.1 hits the container's own loopback). WebRTC
-# requires bidirectional UDP for ICE, so the SFU must run on the host itself.
-# The binary at bin/ion-sfu is a static Go build (CGO_ENABLED=0) from
-# github.com/pion/ion-sfu. Rebuild with:
-#   cd /tmp && git clone --depth 1 https://github.com/pion/ion-sfu.git
-#   cd ion-sfu && CGO_ENABLED=0 go build -o $PROJECT_DIR/bin/ion-sfu ./cmd/signal/json-rpc/
+# Install livekit-server:
+#   brew install livekit
+# Or download from: https://github.com/livekit/livekit/releases
 # ----------------------------
-SFU_BINARY="$PROJECT_DIR/bin/ion-sfu"
-if [[ ! -x "$SFU_BINARY" ]]; then
-  log_error "ion-sfu binary not found at $SFU_BINARY. See comment in start-all.sh for build instructions."
+if ! command -v livekit-server >/dev/null 2>&1; then
+  log_error "livekit-server not found. Install with: brew install livekit"
   exit 1
 fi
 
-log_info "Starting ion-sfu natively on port ${ION_SFU_PORT}..."
-"$SFU_BINARY" -c "$PROJECT_DIR/configs/sfu.toml" -a ":${ION_SFU_PORT}" > "$LOG_DIR/ion-sfu.log" 2>&1 &
+log_info "Starting livekit-server on port ${LIVEKIT_PORT}..."
+livekit-server --config "$PROJECT_DIR/configs/livekit.yaml" --bind 0.0.0.0 --port "$LIVEKIT_PORT" --dev > "$LOG_DIR/livekit.log" 2>&1 &
 SFU_PID=$!
 sleep 2
 
 if kill -0 "$SFU_PID" 2>/dev/null; then
-  log_info "ion-sfu is running (PID: $SFU_PID, port: $ION_SFU_PORT)"
+  log_info "livekit-server is running (PID: $SFU_PID, port: $LIVEKIT_PORT)"
 else
-  log_error "ion-sfu failed to start. Check: $LOG_DIR/ion-sfu.log"
-  cat "$LOG_DIR/ion-sfu.log"
+  log_error "livekit-server failed to start. Check: $LOG_DIR/livekit.log"
+  cat "$LOG_DIR/livekit.log"
   exit 1
 fi
 
@@ -286,8 +266,7 @@ log_info "Frontend built."
 # ----------------------------
 # Step 5: Start Node.js WS proxy
 # ----------------------------
-log_info "Starting Node.js WebSocket proxy server…"
-export ION_SFU_URL="${ION_SFU_URL:-ws://localhost:${ION_SFU_PORT}/ws}"
+log_info "Starting Node.js proxy server…"
 
 # Find available port for Node.js server
 PORT=$(find_available_port 3000 "node server.js")
@@ -369,15 +348,12 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}All services started successfully!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
-echo -e "${BLUE}Service URLs (for external access):${NC}"
-echo -e "  ${GREEN}Frontend:          http://localhost:8080${NC}"
-echo -e "  ${GREEN}WebSocket Proxy:   http://localhost:${PORT}${NC}  ${YELLOW}<-- Node.js proxy${NC}"
+echo -e "${BLUE}Service URLs:${NC}"
+echo -e "  ${GREEN}Frontend:          http://localhost:${PORT}${NC}  ${YELLOW}<-- Node.js proxy${NC}"
+echo -e "  ${GREEN}Go API:            http://localhost:8081${NC}"
+echo -e "  ${GREEN}LiveKit SFU:       ws://localhost:${LIVEKIT_PORT}${NC}"
 echo -e "  ${GREEN}MinIO Console:     http://localhost:9001${NC}"
 echo -e "  ${GREEN}PostgreSQL:        localhost:5432${NC}"
-echo ""
-echo -e "${YELLOW}NOTE: If connecting from another device, use these ports:${NC}"
-echo -e "  ${YELLOW}Frontend:   8080${NC}"
-echo -e "  ${YELLOW}WS Proxy:   ${PORT}${NC}"
 echo ""
 echo -e "${BLUE}Docker Services:${NC}"
 docker compose -f "$COMPOSE_FILE" ps

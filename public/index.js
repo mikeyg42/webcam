@@ -15,8 +15,9 @@ const serverHost = window.location.host;
 const websocketUrl = `${serverProtocol}//${serverHost}/ws?roomId=${encodeURIComponent(roomId)}`;
 
 // WebRTC Configuration - Will be loaded dynamically from server
+// H.264 is used via GStreamer VideoToolbox for WebRTC streaming
 let webrtcConfig = {
-    codec: 'vp9',
+    codec: 'h264',
     iceServers: [
         // Fallback STUN server (in case config fetch fails)
         { urls: "stun:stun.l.google.com:19302" }

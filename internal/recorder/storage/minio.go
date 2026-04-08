@@ -620,7 +620,7 @@ func detectContentType(filename string) string {
 	ext := strings.ToLower(filepath.Ext(filename))
 	switch ext {
 	case ".mkv":
-		return "video/x-matroska"
+		return "video/webm"
 	case ".webm":
 		return "video/webm"
 	case ".mp4":

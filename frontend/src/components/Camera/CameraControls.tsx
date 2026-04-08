@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Plug, PlugZap, Bug, Trash2, ChevronDown, Circle, Square } from 'lucide-react';
 import { useConnectionStore } from '../../stores/connectionStore';
 import { useRecordingStore } from '../../stores/recordingStore';
+import { useConfigStore } from '../../stores/configStore';
 import { Button } from '../primitives/Button';
 import { Card } from '../layout/Card';
 import { slideUp, fadeIn } from '../../lib/motion';
@@ -14,6 +15,15 @@ export function CameraControls() {
   const connect = useConnectionStore((state) => state.connect);
   const disconnect = useConnectionStore((state) => state.disconnect);
   const clearDebugLogs = useConnectionStore((state) => state.clearDebugLogs);
+
+  const { config } = useConfigStore();
+
+  // Determine if manual record button should be shown
+  // Show for: manual mode (no auto-recording flags) and motion mode (event-enabled)
+  // Hide for: disabled and continuous (auto-records)
+  const showRecordButton = config
+    ? (!config.recording.continuousEnabled) // not continuous
+    : true;
 
   const isRecording = useRecordingStore((s) => s.isRecording);
   const segmentsCreated = useRecordingStore((s) => s.segmentsCreated);
@@ -78,8 +88,8 @@ export function CameraControls() {
         </Button>
       </div>
 
-      {/* Recording Controls */}
-      <Card padding="md">
+      {/* Recording Controls — hidden for continuous mode (auto-records) */}
+      {showRecordButton && <Card padding="md">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             {isRecording ? (
@@ -134,7 +144,7 @@ export function CameraControls() {
         {recError && (
           <p className="text-xs text-status-error mt-2">{recError}</p>
         )}
-      </Card>
+      </Card>}
 
       {/* Debug Panel */}
       <AnimatePresence>

@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/pion/mediadevices"
 
 	"gocv.io/x/gocv"
@@ -29,13 +28,12 @@ import (
 	"github.com/mikeyg42/webcam/internal/imgconv"
 
 	"github.com/mikeyg42/webcam/internal/integration"
+	"github.com/mikeyg42/webcam/internal/livekitPublisher"
 	"github.com/mikeyg42/webcam/internal/motion"
 	"github.com/mikeyg42/webcam/internal/notification"
 	"github.com/mikeyg42/webcam/internal/permissions"
-	"github.com/mikeyg42/webcam/internal/quality"
 	"github.com/mikeyg42/webcam/internal/recorder"
 	"github.com/mikeyg42/webcam/internal/recorder/recorderlog"
-	"github.com/mikeyg42/webcam/internal/rtcManager"
 	"github.com/mikeyg42/webcam/internal/tailscale"
 	"github.com/mikeyg42/webcam/internal/validate"
 
@@ -47,11 +45,10 @@ import (
 // Application holds all system components
 type Application struct {
 	config             *config.Config
-	webrtcManager      *rtcManager.Manager
+	lkPublisher        *livekitPublisher.Publisher
 	motionDetector     *motion.Detector
 	recorderService    *recorder.RecordingService
 	calibrationService *calibration.Service
-	wsConnection       *websocket.Conn
 	notifier           *notification.Notifier
 	frameDistributor   *framestream.FrameDistributor
 	gstPipeline        *encoder.GStreamerPipeline // GStreamer H.264 encoder
@@ -206,33 +203,16 @@ func main() {
 		apiServer.Shutdown(shutdownCtx)
 	}()
 
-	// Wire quality priority callback to allow runtime updates from API
-	if app.webrtcManager != nil && app.webrtcManager.ConnectionDoctor != nil {
-		configHandler := apiServer.GetConfigHandler()
-		configHandler.SetQualityPriorityCallback(func(priorityStr string) error {
-			qm := app.webrtcManager.ConnectionDoctor.GetQualityManager()
-			if qm == nil {
-				return fmt.Errorf("quality manager not initialized")
-			}
-
-			priority, err := quality.ParsePriority(priorityStr)
-			if err != nil {
-				return fmt.Errorf("invalid priority: %v", err)
-			}
-
-			qm.SetPriority(priority)
-			return nil
-		})
-		log.Println("[Main] Quality priority callback wired to config API")
-
-		// Register quality metrics API endpoint
-		apiServer.SetQualityHandler(app.webrtcManager.ConnectionDoctor)
+	// Register quality metrics API endpoint (LiveKit publisher implements QualityManagerProvider)
+	if app.lkPublisher != nil {
+		apiServer.SetQualityHandler(app.lkPublisher)
 	}
 
 	// Register recording health and control API endpoints
 	if app.recorderService != nil {
 		apiServer.SetRecordingHealthHandler(app.recorderService)
 		apiServer.SetRecordingControlHandler(app.recorderService)
+		apiServer.SetRecordingsBrowserHandler(app.recorderService)
 	}
 
 	// DON'T start frame distributor yet - it will be started when user clicks "Calibrate Camera"
@@ -323,55 +303,31 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool, d
 		resultChan <- initResult{name: "recorderService", err: err, value: recorderService}
 	}()
 
-	// 4. WebSocket and WebRTC setup (async if not testing mode)
+	// 4. LiveKit publisher setup (async if not testing mode)
 	go func() {
 		if testingMode {
-			resultChan <- initResult{name: "webrtc", err: nil, value: nil}
+			resultChan <- initResult{name: "livekit", err: nil, value: nil}
 			return
 		}
 
-		// Connect to WebSocket server
-		addr := cfg.WebSocket.ListenAddr
-		if len(addr) > 0 && addr[0] == ':' {
-			addr = "localhost" + addr
-		}
-		wsURL := fmt.Sprintf("ws://%s/ws?roomId=cameraRoom", addr)
-		log.Printf("Connecting to WebSocket: %s", wsURL)
-
-		dialer := websocket.Dialer{
-			HandshakeTimeout: 10 * time.Second,
-		}
-		wsConn, _, err := dialer.Dial(wsURL, nil)
+		publisher, err := livekitPublisher.NewPublisher(appCtx, cfg, debugMode)
 		if err != nil {
-			resultChan <- initResult{name: "webrtc", err: fmt.Errorf("WebSocket connection failed: %v", err), value: nil}
-			return
-		}
-		log.Println("WebSocket connected")
-
-		// Create WebRTC manager
-		webrtcManager, err := rtcManager.NewManager(appCtx, cfg, wsConn, nil, debugMode)
-		if err != nil {
-			wsConn.Close()
-			resultChan <- initResult{name: "webrtc", err: fmt.Errorf("failed to create WebRTC manager: %v", err), value: nil}
+			resultChan <- initResult{name: "livekit", err: fmt.Errorf("failed to create LiveKit publisher: %v", err), value: nil}
 			return
 		}
 
-		resultChan <- initResult{name: "webrtc", err: nil, value: map[string]interface{}{
-			"conn":    wsConn,
-			"manager": webrtcManager,
-		}}
+		resultChan <- initResult{name: "livekit", err: nil, value: publisher}
 	}()
 
 	// Collect results
 	var (
-		notifier           *notification.Notifier
-		motionDetector     *motion.Detector
-		recorderService    *recorder.RecordingService
-		wsConn             *websocket.Conn
-		webrtcManager      *rtcManager.Manager
+		notifier        *notification.Notifier
+		motionDetector  *motion.Detector
+		recorderService *recorder.RecordingService
+		lkPub           *livekitPublisher.Publisher
 	)
 
-	// Wait for all 3 goroutines to complete (motionDetector+notifier, recorderService, webrtc)
+	// Wait for all 3 goroutines to complete (motionDetector+notifier, recorderService, livekit)
 	for i := 0; i < 3; i++ {
 		result := <-resultChan
 		if result.err != nil {
@@ -381,7 +337,6 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool, d
 
 		switch result.name {
 		case "motionDetector":
-			// Extract both detector and notifier
 			detectorData := result.value.(map[string]interface{})
 			motionDetector = detectorData["detector"].(*motion.Detector)
 			if detectorData["notifier"] != nil {
@@ -389,11 +344,9 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool, d
 			}
 		case "recorderService":
 			recorderService = result.value.(*recorder.RecordingService)
-		case "webrtc":
+		case "livekit":
 			if result.value != nil {
-				webrtcData := result.value.(map[string]interface{})
-				wsConn = webrtcData["conn"].(*websocket.Conn)
-				webrtcManager = webrtcData["manager"].(*rtcManager.Manager)
+				lkPub = result.value.(*livekitPublisher.Publisher)
 			}
 		}
 	}
@@ -409,8 +362,7 @@ func NewApplication(ctx context.Context, cfg *config.Config, testingMode bool, d
 		recorderService:    recorderService,
 		calibrationService: calibrationService,
 		notifier:           notifier,
-		wsConnection:       wsConn,
-		webrtcManager:      webrtcManager,
+		lkPublisher:        lkPub,
 		testingMode:        testingMode,
 		logger:             logger,
 	}
@@ -440,8 +392,8 @@ func (app *Application) Initialize() error {
 	if app.recorderService == nil {
 		return fmt.Errorf("recorder service not initialized")
 	}
-	if !app.testingMode && app.webrtcManager == nil {
-		return fmt.Errorf("WebRTC manager not initialized")
+	if !app.testingMode && app.lkPublisher == nil {
+		return fmt.Errorf("LiveKit publisher not initialized")
 	}
 
 	var camera, microphone mediadevices.MediaDeviceInfo
@@ -451,10 +403,9 @@ func (app *Application) Initialize() error {
 	if app.testingMode {
 		camera, microphone, err = app.selectDevicesForTesting()
 	} else {
-		// Initialize WebRTC manager (creates peer connection)
-		_, err = app.webrtcManager.Initialize()
-		if err != nil {
-			return fmt.Errorf("WebRTC initialization failed: %v", err)
+		// Connect to LiveKit room
+		if err := app.lkPublisher.Connect(); err != nil {
+			return fmt.Errorf("LiveKit connection failed: %v", err)
 		}
 
 		// Select devices based on config (with fallback to first available)
@@ -478,19 +429,20 @@ func (app *Application) Initialize() error {
 		log.Printf("[Main] Audio recording enabled with microphone: %s", microphone.Label)
 	}
 
-	// Start camera at 640x480
+	// Start camera at 1280x720 — matches the calibration resolution so there's
+	// no resolution change mid-stream when calibration restarts the camera.
 	log.Println("Starting camera for raw frame capture...")
-	if err := app.frameDistributor.Start(640, 480); err != nil {
+	if err := app.frameDistributor.Start(1280, 720); err != nil {
 		return fmt.Errorf("failed to start camera: %v", err)
 	}
-	log.Println("Camera started successfully at 640x480")
+	log.Println("Camera started successfully at 1280x720")
 
-	// Create GStreamer encoder pipeline
+	// Create GStreamer encoder pipeline at the same resolution
 	encoderConfig := encoder.DefaultEncoderConfig()
-	encoderConfig.Width = 640
-	encoderConfig.Height = 480
+	encoderConfig.Width = 1280
+	encoderConfig.Height = 720
 	encoderConfig.FrameRate = 15
-	encoderConfig.BitRateKbps = 1500
+	encoderConfig.BitRateKbps = 3000
 	encoderConfig.PreferHardware = true
 
 	app.gstPipeline, err = encoder.NewGStreamerPipeline(encoderConfig)
@@ -503,19 +455,11 @@ func (app *Application) Initialize() error {
 	}
 	log.Println("GStreamer H.264 encoder started successfully")
 
-	// Update device capability with actual hardware encoder detection
-	if app.webrtcManager != nil && app.webrtcManager.ConnectionDoctor != nil {
-		qm := app.webrtcManager.ConnectionDoctor.GetQualityManager()
-		if qm != nil {
-			hasHWEncoder := app.gstPipeline.IsHardwareEncoder()
-			deviceCap := quality.DetectDeviceCapability(
-				app.config.Video.Width,
-				app.config.Video.Height,
-				app.config.Video.FrameRate,
-				hasHWEncoder,
-			)
-			qm.UpdateDeviceCapability(deviceCap)
-		}
+	// Log hardware encoder detection
+	if app.gstPipeline.IsHardwareEncoder() {
+		log.Println("[Main] Using hardware video encoder (VideoToolbox)")
+	} else {
+		log.Println("[Main] Using software video encoder")
 	}
 
 	// Feed frames from distributor to GStreamer pipeline
@@ -553,81 +497,24 @@ func (app *Application) Initialize() error {
 
 	// Note: RecordingService doesn't need SetFrameSource - it receives frames via motion events
 
-	// Create integration pipeline with WebRTC manager
+	// Create integration pipeline (no WebRTC manager needed — LiveKit handles streaming)
 	app.pipeline = integration.NewPipeline(app.ctx, app.config, app.frameDistributor,
-		app.motionDetector, app.recorderService, app.webrtcManager)
+		app.motionDetector, app.recorderService, nil)
 
-	// Setup WebRTC signaling
-	if !app.testingMode && app.webrtcManager != nil {
-		// Setup passthrough tracks for external RTP input from GStreamer FIRST
-		// These tracks don't capture from devices - they're just conduits for RTP packets
-		// IMPORTANT: Tracks must exist on peer connection BEFORE signaling creates the SDP offer
-		log.Println("Setting up WebRTC passthrough tracks for GStreamer RTP...")
-
-		// Get the actual codec from GStreamer to ensure track matches encoder output
+	// Publish tracks to LiveKit and wire GStreamer RTP output
+	if !app.testingMode && app.lkPublisher != nil {
 		videoCodec := app.gstPipeline.GetCodecMimeType()
-		if err := app.webrtcManager.SetupPassthroughTracks(videoCodec); err != nil {
-			return fmt.Errorf("failed to setup passthrough tracks: %v", err)
+		log.Printf("[LiveKit] Publishing tracks (video codec: %s)", videoCodec)
+
+		if err := app.lkPublisher.PublishTracks(videoCodec, 1280, 720); err != nil {
+			return fmt.Errorf("failed to publish LiveKit tracks: %v", err)
 		}
-		log.Printf("WebRTC passthrough tracks setup complete (video codec: %s)", videoCodec)
 
-		log.Println("Setting up WebRTC signaling...")
-
-		// Setup signaling (creates SDP offer with the tracks we just added)
-		if err := app.webrtcManager.SetupSignaling(); err != nil {
-			return fmt.Errorf("signaling setup failed: %v", err)
-		}
-		log.Println("WebRTC signaling setup complete - waiting for browser connection")
-
-		// Wire GStreamer RTP output to WebRTC tracks
-		log.Println("Attaching GStreamer RTP source to WebRTC manager...")
 		videoRTPChan := app.gstPipeline.GetRTPChannel()
-
-		// Note: Audio RTP not yet implemented in GStreamer pipeline, passing nil
-		if err := app.webrtcManager.AttachExternalRTPSource(videoRTPChan, nil); err != nil {
-			return fmt.Errorf("failed to attach external RTP source: %v", err)
+		if err := app.lkPublisher.AttachRTPSource(videoRTPChan, nil); err != nil {
+			return fmt.Errorf("failed to attach RTP source to LiveKit: %v", err)
 		}
-		log.Println("GStreamer RTP source successfully attached to WebRTC - video streaming active")
-
-		// Wire up quality manager callbacks for dynamic bitrate/profile adjustment
-		if app.webrtcManager.ConnectionDoctor != nil {
-			qm := app.webrtcManager.ConnectionDoctor.GetQualityManager()
-			if qm == nil {
-				log.Println("[QualityManager] Warning: Quality manager not initialized")
-			} else {
-				// Callback for bitrate adjustments
-				qm.SetBitrateCallback(func(newBitrateKbps int) error {
-					if app.gstPipeline != nil && app.gstPipeline.SupportsDynamicBitrate() {
-						if err := app.gstPipeline.SetBitrate(newBitrateKbps); err != nil {
-							log.Printf("[QualityManager] Failed to adjust encoder bitrate: %v", err)
-							return err
-						}
-						log.Printf("[QualityManager] Encoder bitrate adjusted to %d Kbps", newBitrateKbps)
-						return nil
-					}
-					return nil
-				})
-
-				// Callback for profile changes (resolution/framerate adjustments)
-				// NOTE: Runtime resolution changes are complex and not yet implemented
-				// They would require: 1) Stop GStreamer pipeline, 2) Reconfigure encoder,
-				// 3) Restart pipeline, 4) Renegotiate WebRTC SDP
-				// For MVP, bitrate-only adaptation is sufficient
-				qm.SetProfileCallback(func(newProfile *quality.QualityProfile) error {
-					log.Printf("[QualityManager] Profile change requested: %s (%dx%d@%dfps, %d-%d Kbps) - NOT IMPLEMENTED",
-						newProfile.Name,
-						newProfile.Resolution.Width,
-						newProfile.Resolution.Height,
-						newProfile.FrameRate,
-						newProfile.BitrateRange.Min,
-						newProfile.BitrateRange.Max)
-					log.Println("[QualityManager] Runtime resolution changes not yet implemented - bitrate adaptation only")
-					return nil
-				})
-
-				log.Println("[QualityManager] Dynamic quality adjustment callbacks wired successfully")
-			}
-		}
+		log.Println("[LiveKit] Video streaming active via LiveKit SFU")
 	}
 
 	log.Println("Initialization complete")
@@ -1030,12 +917,8 @@ func (app *Application) Shutdown(ctx context.Context) error {
 			}
 		}
 
-		if app.wsConnection != nil {
-			app.wsConnection.Close()
-		}
-
-		if app.webrtcManager != nil {
-			app.webrtcManager.Cleanup()
+		if app.lkPublisher != nil {
+			app.lkPublisher.Disconnect()
 		}
 
 		close(done)

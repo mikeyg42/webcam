@@ -1,12 +1,12 @@
 import { create } from 'zustand';
+import { type Track } from 'livekit-client';
 import { getWebSocketManager, type ConnectionState } from '../lib/websocket';
 
 interface ConnectionStoreState {
   connectionState: ConnectionState;
   status: string;
   debugLogs: string[];
-  stream: MediaStream | null;
-  videoTrack: MediaStreamTrack | null;
+  livekitTrack: Track | null;
   error: string | null;
 
   // Actions
@@ -34,8 +34,8 @@ export const useConnectionStore = create<ConnectionStoreState>((set, get) => {
     get().addDebugLog(message);
   });
 
-  wsManager.on('track', (track: MediaStreamTrack, stream: MediaStream) => {
-    set({ stream, videoTrack: track });
+  wsManager.on('track', (track: Track) => {
+    set({ livekitTrack: track });
   });
 
   wsManager.on('error', (error: any) => {
@@ -56,8 +56,7 @@ export const useConnectionStore = create<ConnectionStoreState>((set, get) => {
     connectionState: 'disconnected',
     status: 'Not connected',
     debugLogs: [],
-    stream: null,
-    videoTrack: null,
+    livekitTrack: null,
     error: null,
 
     connect: async () => {
@@ -73,8 +72,7 @@ export const useConnectionStore = create<ConnectionStoreState>((set, get) => {
     disconnect: () => {
       wsManager.disconnect();
       set({
-        stream: null,
-        videoTrack: null,
+        livekitTrack: null,
         status: 'Disconnected',
         error: null,
       });

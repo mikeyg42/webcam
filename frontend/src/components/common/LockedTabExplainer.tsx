@@ -26,8 +26,8 @@ const explanations: Record<LockReason, {
   },
   'calibration-required': {
     icon: <Focus className="w-8 h-8" />,
-    title: 'Calibration Required',
-    description: 'Calibrate motion detection before viewing the live camera feed. This teaches the system what your "empty scene" looks like.',
+    title: 'Motion Detection Calibration Required',
+    description: 'Calibrate motion detection before viewing the live camera feed. This step establishes the baseline for detecting motion in your scene and is required when motion detection or event-based recording is enabled.',
     action: 'Start Calibration',
     targetTab: 'calibration',
   },

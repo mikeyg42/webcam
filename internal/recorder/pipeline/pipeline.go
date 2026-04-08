@@ -45,6 +45,11 @@ const (
 )
 
 // Segment represents a recording segment
+type pendingFrame struct {
+	data      []byte
+	timestamp time.Time
+}
+
 type Segment struct {
 	ID          string
 	RecordingID string
@@ -62,10 +67,13 @@ type Segment struct {
 	UploadedAt  time.Time
 	Error       error
 
-	writer       *MKVWriter
-	lastSyncTime time.Time     // Last time we called fsync
-	syncInterval time.Duration // Interval between fsyncs (default 5s)
-	mu           sync.RWMutex
+	writer              *MKVWriter
+	pendingWriterConfig *MKVWriterConfig // Deferred MKV creation until first keyframe
+	cachedSeqHdr        []byte           // Sequence header available at segment creation time
+	pendingFrames       []pendingFrame   // Frames buffered before writer is created
+	lastSyncTime        time.Time        // Last time we called fsync
+	syncInterval        time.Duration    // Interval between fsyncs (default 5s)
+	mu                  sync.RWMutex
 }
 
 // Segmenter manages recording segments
@@ -234,25 +242,19 @@ func (s *Segmenter) newSegmentLocked(recordingID string) (*Segment, error) {
 		syncInterval: 5 * time.Second,
 	}
 
-	// Create MKV writer with video config, audio config, and cached sequence header
-	cfg := MKVWriterConfig{
+	// Store the MKV config but defer writer creation until the first keyframe arrives.
+	// This ensures CodecPrivate (AV1 Sequence Header) is always present in the track header,
+	// which is required for any decoder (browser or ffmpeg) to play the file.
+	segment.pendingWriterConfig = &MKVWriterConfig{
 		Width:        s.videoWidth,
 		Height:       s.videoHeight,
 		FrameRate:    s.frameRate,
-		CodecPrivate: s.cachedSequenceHeader, // Pass cached AV1 Sequence Header
+		CodecPrivate: s.cachedSequenceHeader,
 		AudioEnabled: s.audioEnabled,
 		SampleRate:   s.audioSampleRate,
 		Channels:     s.audioChannels,
 	}
-	writer, err := NewMKVWriterWithConfig(segment.TempPath, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create MKV writer: %w", err)
-	}
-
-	// Pass the cached sequence header to the writer so it can prepend to non-keyframe starts
-	writer.sequenceHeader = s.cachedSequenceHeader
-
-	segment.writer = writer
+	segment.cachedSeqHdr = s.cachedSequenceHeader
 
 	s.segments[recordingID] = segment
 	s.metrics.SegmentsCreated.Add(1)
@@ -294,6 +296,42 @@ func (s *Segmenter) WriteFrame(recordingID string, data []byte, timestamp time.T
 	// Now lock the segment for writing
 	segment.mu.Lock()
 	defer segment.mu.Unlock()
+
+	// Lazy writer creation: buffer frames until we have a sequence header,
+	// then create the MKV writer with CodecPrivate set correctly.
+	if segment.writer == nil && segment.pendingWriterConfig != nil {
+		seqHdr := segment.cachedSeqHdr
+		if seqHdr == nil {
+			seqHdr = extractSequenceHeader(data)
+		}
+		if seqHdr != nil {
+			// We have a sequence header — create the writer now
+			segment.pendingWriterConfig.CodecPrivate = seqHdr
+			writer, err := NewMKVWriterWithConfig(segment.TempPath, *segment.pendingWriterConfig)
+			if err != nil {
+				return fmt.Errorf("failed to create MKV writer: %w", err)
+			}
+			writer.sequenceHeader = seqHdr
+			segment.writer = writer
+			segment.pendingWriterConfig = nil
+
+			// Flush any frames that were buffered while waiting
+			for _, pf := range segment.pendingFrames {
+				if _, err := writer.WriteFrame(pf.data, pf.timestamp); err != nil {
+					s.logger.Warnw("Failed to write buffered frame", "error", err)
+				}
+			}
+			segment.pendingFrames = nil
+		} else {
+			// Still no sequence header — buffer this frame (limit to avoid unbounded growth)
+			if len(segment.pendingFrames) < 300 {
+				buf := make([]byte, len(data))
+				copy(buf, data)
+				segment.pendingFrames = append(segment.pendingFrames, pendingFrame{data: buf, timestamp: timestamp})
+			}
+			return nil
+		}
+	}
 
 	if segment.writer == nil {
 		return fmt.Errorf("segment writer is nil")

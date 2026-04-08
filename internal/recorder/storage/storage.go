@@ -24,13 +24,7 @@ type ObjectStore interface {
 	// URL generation
 	GeneratePresignedURL(ctx context.Context, key string, expiry time.Duration, opts ...URLOption) (string, error)
 	GeneratePresignedUploadURL(ctx context.Context, key string, expiry time.Duration, opts ...URLOption) (string, error)
-	
-	// Multipart operations for large files
-	InitiateMultipartUpload(ctx context.Context, key string, opts ...PutOption) (string, error)
-	UploadPart(ctx context.Context, key, uploadID string, partNumber int, reader io.Reader, size int64) (string, error)
-	CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []CompletedPart) error
-	AbortMultipartUpload(ctx context.Context, key, uploadID string) error
-	
+
 	// Storage management
 	GetBucketInfo(ctx context.Context) (*BucketInfo, error)
 	SetObjectMetadata(ctx context.Context, key string, metadata map[string]string) error
@@ -59,12 +53,6 @@ type BucketInfo struct {
 	TotalSize    int64
 	ObjectCount  int64
 	Available    bool
-}
-
-// CompletedPart represents a completed multipart upload part
-type CompletedPart struct {
-	PartNumber int
-	ETag       string
 }
 
 // PutOption configures Put operations

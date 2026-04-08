@@ -2,6 +2,7 @@
 package api
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -309,8 +310,8 @@ func (h *ConfigHandler) configToResponse() ConfigResponse {
 func (h *ConfigHandler) configToResponseFromConfig(cfg *config.Config) ConfigResponse {
 	return ConfigResponse{
 		Recording: RecordingSettings{
-			ContinuousEnabled: false, // This will be read from recorder config
-			EventEnabled:      true,
+			ContinuousEnabled: cfg.Recording.ContinuousEnabled,
+			EventEnabled:      cfg.Recording.EventEnabled,
 			SaveDirectory:     cfg.Video.OutputPath,
 			SegmentDuration:   5,  // minutes, hardcoded in adapter
 			PreMotionBuffer:   10, // seconds, hardcoded in adapter
@@ -332,7 +333,7 @@ func (h *ConfigHandler) configToResponseFromConfig(cfg *config.Config) ConfigRes
 			BitRate:    cfg.Audio.BitRate,
 		},
 		Motion: MotionSettings{
-			Enabled:              true,
+			Enabled:              cfg.Motion.Enabled,
 			Threshold:            float32(cfg.Motion.Threshold),
 			MinimumArea:          cfg.Motion.MinArea,
 			CooldownPeriod:       int(cfg.Motion.CooldownPeriod.Seconds()),
@@ -398,11 +399,16 @@ func (h *ConfigHandler) updateInternalConfig(req *ConfigResponse) {
 	cfg.Audio.BitRate = req.Audio.BitRate
 
 	// Update motion settings
+	cfg.Motion.Enabled = req.Motion.Enabled
 	cfg.Motion.Threshold = int(req.Motion.Threshold)
 	cfg.Motion.MinArea = req.Motion.MinimumArea
 	cfg.Motion.CooldownPeriod = time.Duration(req.Motion.CooldownPeriod) * time.Second
 	cfg.Motion.NoMotionDelay = time.Duration(req.Motion.NoMotionDelay) * time.Second
 	cfg.Motion.MinConsecutiveFrames = req.Motion.MinConsecutiveFrames
+
+	// Update recording settings
+	cfg.Recording.ContinuousEnabled = req.Recording.ContinuousEnabled
+	cfg.Recording.EventEnabled = req.Recording.EventEnabled
 
 	// Update Tailscale settings
 	cfg.Tailscale.Enabled = req.Tailscale.Enabled
@@ -518,6 +524,11 @@ func (h *ConfigHandler) saveConfig() error {
 	// Get config response (which doesn't include passwords for security)
 	configResp := h.configToResponse()
 
+	// Override motion duration fields with nanosecond values for proper time.Duration deserialization
+	// Go's time.Duration expects nanoseconds, but configToResponse() converts to seconds for API display
+	configResp.Motion.CooldownPeriod = int(h.config.Motion.CooldownPeriod)
+	configResp.Motion.NoMotionDelay = int(h.config.Motion.NoMotionDelay)
+
 	// Add encrypted passwords if master key is available
 	if h.masterKey != "" {
 		// Encrypt WebRTC password
@@ -578,10 +589,8 @@ func (h *ConfigHandler) ListCameras(w http.ResponseWriter, r *http.Request) {
 	cameraIndex := 0
 	for _, device := range devices {
 		if device.Kind == mediadevices.VideoInput {
-			// Create a more user-friendly label
-			label := device.Label
-			if label == "" || strings.HasPrefix(label, "0x") {
-				// If no label or hex address, generate a friendly name
+			label := decodeDeviceLabel(device.Label)
+			if label == "" {
 				label = fmt.Sprintf("Camera %d", cameraIndex+1)
 			}
 
@@ -614,10 +623,8 @@ func (h *ConfigHandler) ListMicrophones(w http.ResponseWriter, r *http.Request) 
 	micIndex := 0
 	for _, device := range devices {
 		if device.Kind == mediadevices.AudioInput {
-			// Create a more user-friendly label
-			label := device.Label
-			if label == "" || strings.HasPrefix(label, "0x") {
-				// If no label or hex address, generate a friendly name
+			label := decodeDeviceLabel(device.Label)
+			if label == "" {
 				label = fmt.Sprintf("Microphone %d", micIndex+1)
 			}
 
@@ -696,6 +703,34 @@ func (h *ConfigHandler) RestartBackend(w http.ResponseWriter, r *http.Request) {
 }
 
 // RegisterRoutes registers HTTP routes for configuration API
+// decodeDeviceLabel converts a hex-encoded device label to a human-readable string.
+// macOS pion/mediadevices returns labels like "4170706c65..." which decode to
+// "AppleUSBAudioEngine:Marshall Electronics:MXL 990 USB:8331400:1".
+// The function extracts the most meaningful part (device manufacturer + model).
+func decodeDeviceLabel(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	// Try hex decoding
+	decoded, err := hex.DecodeString(raw)
+	if err != nil {
+		return raw // Not hex — return as-is
+	}
+	s := string(decoded)
+
+	// Format is typically "AppleUSBAudioEngine:Manufacturer:Model:Serial:Index"
+	// or "AppleHDAEngine:...:Speaker:..."
+	// Extract the manufacturer and model parts (indices 1 and 2)
+	parts := strings.Split(s, ":")
+	if len(parts) >= 3 {
+		return strings.TrimSpace(parts[1] + " " + parts[2])
+	}
+	if len(parts) >= 2 {
+		return strings.TrimSpace(parts[1])
+	}
+	return s
+}
+
 func (h *ConfigHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {

@@ -24,8 +24,9 @@ let tailscaleInfo = {
 };
 
 // WebRTC Configuration - Enhanced for Tailscale
+// H.264 is used via GStreamer VideoToolbox for WebRTC streaming
 let webrtcConfig = {
-    codec: 'vp9',
+    codec: 'h264',
     iceServers: [
         // Default STUN server for initial connectivity
         { urls: "stun:stun.l.google.com:19302" }

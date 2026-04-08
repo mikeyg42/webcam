@@ -15,7 +15,7 @@ interface ConfigFormProps {
   onConfigComplete?: () => void;
 }
 
-type SaveState = 'idle' | 'saving' | 'restarting' | 'checking' | 'success' | 'error';
+type SaveState = 'idle' | 'saving' | 'success' | 'error';
 
 export function ConfigForm({ onConfigComplete }: ConfigFormProps) {
   const { config, isLoading, isSaving, error, loadConfig, updateConfig } = useConfigStore();
@@ -79,10 +79,12 @@ export function ConfigForm({ onConfigComplete }: ConfigFormProps) {
   }, [validateForm]);
 
   const updateFormData = (section: keyof ConfigResponse, data: Partial<ConfigResponse[keyof ConfigResponse]>) => {
-    if (!formData) return;
-    setFormData({
-      ...formData,
-      [section]: { ...(formData[section] as object), ...data },
+    setFormData((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        [section]: { ...(prev[section] as object), ...data },
+      };
     });
   };
 
@@ -91,43 +93,19 @@ export function ConfigForm({ onConfigComplete }: ConfigFormProps) {
 
     try {
       setSaveState('saving');
-      setSaveProgress(20);
+      setSaveProgress(50);
       setSaveMessage('Saving configuration...');
 
       await updateConfig(formData);
-      setSaveProgress(40);
+      setSaveProgress(100);
 
-      setSaveState('restarting');
-      setSaveMessage('Restarting backend...');
-
-      const { apiClient } = await import('../../api/client');
-      await apiClient.restartBackend();
-      setSaveProgress(60);
-
-      setSaveState('checking');
-      setSaveMessage('Verifying connection...');
-
-      let isBackendUp = false;
-      for (let attempt = 0; attempt < 30; attempt++) {
-        await new Promise((r) => setTimeout(r, 1000));
-        setSaveProgress(60 + Math.floor((attempt / 30) * 35));
-        try {
-          await apiClient.healthCheck();
-          isBackendUp = true;
-          break;
-        } catch { /* continue */ }
-      }
-
-      if (isBackendUp) {
-        setSaveState('success');
-        setSaveProgress(100);
-        setSaveMessage('Configuration applied successfully!');
-        onConfigComplete?.();
-        setTimeout(() => { setSaveState('idle'); setSaveProgress(0); }, 3000);
-      } else {
-        setSaveState('error');
-        setSaveMessage('Backend restart timed out.');
-      }
+      // Config saved - no backend restart needed
+      // Motion settings are applied immediately
+      // Video/audio settings will be applied when calibration starts the camera
+      setSaveState('success');
+      setSaveMessage('Configuration saved! Proceed to Calibration to apply camera settings.');
+      onConfigComplete?.();
+      setTimeout(() => { setSaveState('idle'); setSaveProgress(0); }, 3000);
     } catch (err: unknown) {
       setSaveState('error');
       setSaveMessage(err instanceof Error ? err.message : 'An error occurred');

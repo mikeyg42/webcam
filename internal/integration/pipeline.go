@@ -79,9 +79,11 @@ func (p *Pipeline) Stop() {
 // consumeWebRTCFrames handles H.264 WebRTC channel consumption
 // Note: WebRTC now gets frames directly from the media stream via rtcManager
 // This consumer just prevents the channel from blocking
+// Uses subscription for restart-safe operation
 func (p *Pipeline) consumeWebRTCFrames() {
-	webrtcChannel := p.frameDistributor.GetWebRTCChannel()
-	log.Println("[Pipeline] Starting H.264 WebRTC channel consumer (WebRTC streams directly from media tracks)")
+	webrtcSub := p.frameDistributor.SubscribeWebRTC()
+	defer webrtcSub.Close()
+	log.Println("[Pipeline] Starting H.264 WebRTC channel consumer (subscription-based)")
 
 	frameCount := 0
 	lastLogTime := time.Now()
@@ -91,9 +93,9 @@ func (p *Pipeline) consumeWebRTCFrames() {
 		case <-p.ctx.Done():
 			log.Println("[Pipeline] H.264 WebRTC consumer stopping due to context cancellation")
 			return
-		case frame, ok := <-webrtcChannel:
+		case frame, ok := <-webrtcSub.Frames():
 			if !ok {
-				log.Println("[Pipeline] H.264 WebRTC channel closed, stopping consumer")
+				log.Println("[Pipeline] H.264 WebRTC subscription closed, stopping consumer")
 				return
 			}
 
@@ -116,9 +118,12 @@ func (p *Pipeline) consumeWebRTCFrames() {
 }
 
 // runMotionDetection handles motion detection pipeline
+// Uses subscription for restart-safe operation
 func (p *Pipeline) runMotionDetection() {
-	motionChannel := p.frameDistributor.GetMotionChannel()
-	log.Println("[Pipeline] Motion detection pipeline ready (waiting for detector to start)")
+	motionSub := p.frameDistributor.SubscribeMotion()
+	defer motionSub.Close()
+	motionChannel := motionSub.Frames()
+	log.Println("[Pipeline] Motion detection pipeline ready (subscription-based, waiting for detector to start)")
 
 	// Create persistent channels for motion detection with larger buffers
 	frameChan := make(chan gocv.Mat, 200)   // Larger buffer to handle processing delays
@@ -221,9 +226,12 @@ func (p *Pipeline) runMotionDetection() {
 
 // consumeRecordingFrames feeds frames to the recorder service
 // The recorder service handles encoding, segmentation, and storage
+// Uses subscription for restart-safe operation
 func (p *Pipeline) consumeRecordingFrames() {
-	recordChannel := p.frameDistributor.GetRecordChannel()
-	log.Println("[Pipeline] Starting recording frame consumer (new recorder service)")
+	recordSub := p.frameDistributor.SubscribeRecord()
+	defer recordSub.Close()
+	recordChannel := recordSub.Frames()
+	log.Println("[Pipeline] Starting recording frame consumer (subscription-based)")
 
 	frameCount := 0
 	lastLogTime := time.Now()

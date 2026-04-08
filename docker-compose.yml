@@ -64,10 +64,10 @@ services:
     networks:
       - webcam2
 
-  # NOTE: ion-sfu is NOT in Docker. It runs natively on the host because
-  # macOS Docker Desktop's Linux VM prevents bidirectional UDP between
-  # containers and the host (required for WebRTC ICE). See start-all.sh
-  # for the native SFU startup logic and detailed explanation.
+  # NOTE: livekit-server is NOT in Docker. It runs natively on the host
+  # because macOS Docker Desktop's Linux VM prevents bidirectional UDP
+  # between containers and the host (required for WebRTC ICE).
+  # See start-all.sh for the native livekit-server startup logic.
 
 volumes:
   postgres_data:

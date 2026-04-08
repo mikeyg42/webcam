@@ -1,4 +1,4 @@
-import { Settings, Focus, Video } from 'lucide-react';
+import { Settings, Focus, Video, Film } from 'lucide-react';
 import { Header, type Tab } from './Header';
 import { TabBar } from './TabBar';
 import { cn } from '../../lib/utils';
@@ -12,6 +12,8 @@ export interface AppShellProps {
   configComplete?: boolean;
   /** Whether calibration is complete (unlocks camera) */
   calibrationComplete?: boolean;
+  /** Whether calibration is needed (based on recording mode) */
+  calibrationNeeded?: boolean;
   /** Page content */
   children: React.ReactNode;
 }
@@ -21,6 +23,7 @@ export function AppShell({
   onTabChange,
   configComplete = false,
   calibrationComplete = false,
+  calibrationNeeded = true,
   children,
 }: AppShellProps) {
   // Define tabs with lock states
@@ -36,14 +39,25 @@ export function AppShell({
       label: 'Calibrate',
       icon: <Focus className="w-5 h-5" />,
       locked: !configComplete,
-      lockReason: 'Complete configuration first',
+      lockReason: calibrationNeeded
+        ? 'Complete configuration first'
+        : 'Not required for continuous recording',
+      hidden: !calibrationNeeded && configComplete,
     },
     {
       id: 'camera',
       label: 'Camera',
       icon: <Video className="w-5 h-5" />,
-      locked: !calibrationComplete,
-      lockReason: 'Complete calibration first',
+      locked: calibrationNeeded ? !calibrationComplete : !configComplete,
+      lockReason: calibrationNeeded
+        ? 'Complete calibration first'
+        : 'Complete configuration first',
+    },
+    {
+      id: 'recordings',
+      label: 'Recordings',
+      icon: <Film className="w-5 h-5" />,
+      locked: false,
     },
   ];
 
@@ -59,7 +73,8 @@ export function AppShell({
       {/* Main Content */}
       <main
         className={cn(
-          'max-w-lg mx-auto px-4 py-6',
+          'mx-auto px-4 py-6',
+          activeTab === 'camera' || activeTab === 'recordings' ? 'max-w-4xl' : 'max-w-lg',
           // Add bottom padding on mobile for TabBar
           'pb-24 md:pb-6'
         )}

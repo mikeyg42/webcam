@@ -1,5 +1,13 @@
-// WebSocket manager for ion-sfu signaling with reconnection logic
-// Note: This assumes ion-sdk-js is loaded from CDN in index.html
+// LiveKit client manager with reconnection logic
+// Replaces the old ion-sfu WebSocket manager
+
+import {
+  Room,
+  RoomEvent,
+  Track,
+  type RemoteTrackPublication,
+  type RemoteParticipant,
+} from 'livekit-client';
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'failed';
 
@@ -10,10 +18,7 @@ export interface WebSocketConfig {
 }
 
 export class WebSocketManager {
-  private signal: any = null;
-  private client: any = null;
-  private websocketUrl: string;
-  private roomId: string;
+  private room: Room;
   private connectionState: ConnectionState = 'disconnected';
   private reconnectAttempts: number = 0;
   private maxReconnectAttempts: number;
@@ -24,17 +29,18 @@ export class WebSocketManager {
   constructor(config: WebSocketConfig = {}) {
     this.maxReconnectAttempts = config.maxReconnectAttempts ?? 5;
     this.reconnectInterval = config.reconnectInterval ?? 3000;
-    this.roomId = config.roomId ?? 'cameraRoom';
 
-    // Construct WebSocket URL
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host;
-    this.websocketUrl = `${protocol}//${host}/ws?roomId=${encodeURIComponent(this.roomId)}`;
+    this.room = new Room({
+      adaptiveStream: true,
+      dynacast: true,
+    });
+
+    this.setupRoomListeners();
   }
 
   async connect(): Promise<void> {
     if (this.connectionState === 'connected' || this.connectionState === 'connecting') {
-      console.log('[WebSocket] Already connected or connecting');
+      console.log('[LiveKit] Already connected or connecting');
       return;
     }
 
@@ -42,25 +48,18 @@ export class WebSocketManager {
     this.emit('status', 'Connecting to security camera...');
 
     try {
-      // Check if ion-sdk-js is loaded
-      if (typeof (window as any).IonSDK === 'undefined' || typeof (window as any).Signal === 'undefined') {
-        throw new Error('Ion SDK not loaded. Make sure ion-sdk-js is loaded from CDN.');
+      // Fetch token and LiveKit URL from the Go backend
+      const response = await fetch('/api/livekit-token');
+      if (!response.ok) {
+        throw new Error(`Token request failed: ${response.status}`);
       }
+      const { token, url } = await response.json();
+      this.emit('debug', `LiveKit URL: ${url}`);
 
-      // Load WebRTC configuration
-      const webrtcConfig = await this.loadWebRTCConfig();
-
-      // Create Signal and Client instances
-      const Signal = (window as any).Signal;
-      const IonSDK = (window as any).IonSDK;
-
-      this.signal = new Signal.IonSFUJSONRPCSignal(this.websocketUrl);
-      this.client = new IonSDK.Client(this.signal, webrtcConfig);
-
-      this.setupSignalListeners();
-      this.setupClientListeners();
+      await this.room.connect(url, token);
+      // Room event handlers below will fire 'connected' etc.
     } catch (error) {
-      console.error('[WebSocket] Connection error:', error);
+      console.error('[LiveKit] Connection error:', error);
       this.emit('error', error);
       this.handleConnectionFailure();
     }
@@ -68,17 +67,7 @@ export class WebSocketManager {
 
   disconnect(): void {
     this.clearReconnectTimeout();
-
-    if (this.client) {
-      this.client.close();
-      this.client = null;
-    }
-
-    if (this.signal) {
-      this.signal.close();
-      this.signal = null;
-    }
-
+    this.room.disconnect();
     this.setConnectionState('disconnected');
     this.emit('status', 'Disconnected');
   }
@@ -87,11 +76,7 @@ export class WebSocketManager {
     return this.connectionState;
   }
 
-  getClient(): any {
-    return this.client;
-  }
-
-  // Event emitter pattern
+  // Event emitter pattern (same interface as old ion-sfu manager)
   on(event: string, handler: Function): void {
     if (!this.eventHandlers.has(event)) {
       this.eventHandlers.set(event, new Set());
@@ -111,80 +96,62 @@ export class WebSocketManager {
         try {
           handler(...args);
         } catch (error) {
-          console.error(`[WebSocket] Error in ${event} handler:`, error);
+          console.error(`[LiveKit] Error in ${event} handler:`, error);
         }
       });
     }
   }
 
-  private async loadWebRTCConfig(): Promise<any> {
-    try {
-      const response = await fetch('/api/webrtc-config');
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      const config = await response.json();
-      this.emit('debug', `WebRTC config loaded: ${config.iceServers?.length ?? 0} ICE servers`);
-      return config;
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      this.emit('debug', `Failed to load WebRTC config: ${errorMessage}. Using fallback.`);
-      // Fallback configuration
-      return {
-        codec: 'vp9',
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-        iceTransportPolicy: 'all',
-      };
-    }
-  }
-
-  private setupSignalListeners(): void {
-    if (!this.signal) return;
-
-    this.signal.onopen = async () => {
+  private setupRoomListeners(): void {
+    this.room.on(RoomEvent.Connected, () => {
       this.setConnectionState('connected');
       this.reconnectAttempts = 0;
-      this.emit('debug', 'WebSocket connection established');
+      this.emit('debug', 'Connected to LiveKit room');
       this.emit('status', 'Connected to security camera');
       this.emit('connected');
+    });
 
-      // Join the room to receive streams
-      try {
-        await this.client.join(this.roomId);
-        this.emit('debug', `Joined room: ${this.roomId}`);
-      } catch (error) {
-        console.error('[WebSocket] Failed to join room:', error);
-        this.emit('error', error);
-        this.emit('debug', `Failed to join room ${this.roomId}: ${error}`);
-      }
-    };
-
-    this.signal.onclose = (event: CloseEvent) => {
-      this.emit('debug', `WebSocket closed: ${event.code} - ${event.reason}`);
-
+    this.room.on(RoomEvent.Disconnected, () => {
+      this.emit('debug', 'Disconnected from LiveKit room');
       if (this.connectionState !== 'disconnected') {
         this.handleConnectionFailure();
       }
-    };
+    });
 
-    this.signal.onerror = (error: Event) => {
-      console.error('[WebSocket] Signal error:', error);
-      this.emit('error', error);
-      this.handleConnectionFailure();
-    };
-  }
+    this.room.on(RoomEvent.Reconnecting, () => {
+      this.setConnectionState('reconnecting');
+      this.emit('status', 'Reconnecting...');
+      this.emit('debug', 'LiveKit reconnecting');
+    });
 
-  private setupClientListeners(): void {
-    if (!this.client) return;
+    this.room.on(RoomEvent.Reconnected, () => {
+      this.setConnectionState('connected');
+      this.emit('status', 'Reconnected to security camera');
+      this.emit('debug', 'LiveKit reconnected');
+    });
 
-    this.client.ontrack = (track: MediaStreamTrack, stream: MediaStream) => {
-      this.emit('debug', `Received ${track.kind} track`);
-      this.emit('track', track, stream);
+    this.room.on(
+      RoomEvent.TrackSubscribed,
+      (track: Track, _pub: RemoteTrackPublication, _participant: RemoteParticipant) => {
+        this.emit('debug', `Subscribed to ${track.kind} track`);
 
-      if (track.kind === 'video') {
-        this.emit('status', 'Receiving video stream');
-      }
-    };
+        // Emit the LiveKit Track object so the video component can use track.attach()
+        // which registers the element with LiveKit's adaptive stream system
+        this.emit('track', track);
+
+        if (track.kind === Track.Kind.Video) {
+          this.emit('status', 'Receiving video stream');
+        }
+      },
+    );
+
+    this.room.on(RoomEvent.TrackUnsubscribed, (track: Track) => {
+      this.emit('debug', `Unsubscribed from ${track.kind} track`);
+    });
+
+    this.room.on(RoomEvent.ConnectionQualityChanged, (quality, participant) => {
+      this.emit('debug', `Connection quality: ${quality} (${participant.identity})`);
+    });
   }
 
   private setConnectionState(state: ConnectionState): void {
@@ -222,7 +189,7 @@ export class WebSocketManager {
   }
 }
 
-// Export singleton factory
+// Export singleton factory (same interface as old manager)
 let wsManagerInstance: WebSocketManager | null = null;
 
 export function getWebSocketManager(config?: WebSocketConfig): WebSocketManager {

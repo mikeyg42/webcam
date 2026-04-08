@@ -712,6 +712,7 @@ func (g *GStreamerPipeline) makeRTPPay(kind encoderKind) (*gst.Element, *gst.Cap
 			return nil, nil, fmt.Errorf("create rtph265pay: %w", err)
 		}
 		_ = pay.SetProperty("config-interval", 1)
+		_ = pay.SetProperty("mtu", uint(1200))
 		c := gst.NewCapsFromString("application/x-rtp,media=video,encoding-name=H265,clock-rate=90000")
 		return pay, c, nil
 
@@ -721,6 +722,7 @@ func (g *GStreamerPipeline) makeRTPPay(kind encoderKind) (*gst.Element, *gst.Cap
 			return nil, nil, fmt.Errorf("create rtph264pay: %w", err)
 		}
 		_ = pay.SetProperty("config-interval", 1)
+		_ = pay.SetProperty("mtu", uint(1200))
 		c := gst.NewCapsFromString("application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,packetization-mode=1,profile-level-id=42e01f")
 		return pay, c, nil
 	}

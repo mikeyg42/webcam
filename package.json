@@ -14,7 +14,8 @@
     "express": "^4.21.2",
     "helmet": "^8.0.0",
     "uuid": "^11.1.0",
-    "ws": "^8.18.1"
+    "ws": "^8.18.1",
+    "yarn": "^1.22.22"
   },
   "description": "",
   "devDependencies": {

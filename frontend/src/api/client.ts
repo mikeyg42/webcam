@@ -122,6 +122,38 @@ class ApiClient {
     return response.data;
   }
 
+  // Recordings browser API
+  async listRecordings(filters?: { type?: string; limit?: number; offset?: number }): Promise<any[]> {
+    const params = new URLSearchParams();
+    if (filters?.type) params.set('type', filters.type);
+    if (filters?.limit) params.set('limit', String(filters.limit));
+    if (filters?.offset) params.set('offset', String(filters.offset));
+    const response = await this.client.get<any[]>('/recordings', { params });
+    return response.data;
+  }
+
+  async getRecording(id: string): Promise<any> {
+    const response = await this.client.get(`/recordings/${id}`);
+    return response.data;
+  }
+
+  async deleteRecording(id: string): Promise<void> {
+    await this.client.delete(`/recordings/${id}`);
+  }
+
+  async renameRecording(id: string, name: string): Promise<any> {
+    const response = await this.client.patch(`/recordings/${id}`, { name });
+    return response.data;
+  }
+
+  getDownloadUrl(id: string): string {
+    return `/api/recordings/${id}/download`;
+  }
+
+  getSegmentStreamUrl(id: string, index: number): string {
+    return `/api/recordings/${id}/segments/${index}/stream`;
+  }
+
   // Health check
   async healthCheck(): Promise<{ status: string }> {
     return this.retryRequest(async () => {

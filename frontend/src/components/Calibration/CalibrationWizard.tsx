@@ -96,7 +96,10 @@ export function CalibrationWizard({ onCalibrationComplete }: CalibrationWizardPr
           Motion Detection Calibration
         </h1>
         <p className="text-sm text-text-secondary max-w-md mx-auto">
-          Teach the system what your empty scene looks like to accurately detect motion.
+          This step is <strong>only required for motion detection</strong>. Teach the system what your empty scene looks like to accurately detect motion and trigger recordings.
+        </p>
+        <p className="text-xs text-text-tertiary max-w-md mx-auto mt-2">
+          If you're using continuous recording only, this step is not needed.
         </p>
       </div>
 

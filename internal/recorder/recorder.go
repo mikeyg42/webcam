@@ -4,6 +4,7 @@ package recorder
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"image"
 	"os"
@@ -978,7 +979,7 @@ func (r *RecordingService) uploadSegment(rec *storage.Recording, seg *pipeline.S
 		seg.Index)
 
 	// Upload file
-	if err := r.objectStore.PutFile(ctx, key, seg.FilePath, storage.WithContentType("video/x-matroska")); err != nil {
+	if err := r.objectStore.PutFile(ctx, key, seg.FilePath, storage.WithContentType("video/webm")); err != nil {
 		r.logger.Error("Failed to upload segment",
 			recorderlog.String("segment_id", seg.ID),
 			recorderlog.String("key", key),
@@ -1364,6 +1365,86 @@ func (r *RecordingService) GenerateStreamURL(ctx context.Context, recordingID st
 		return "", fmt.Errorf("failed to generate URL: %w", err)
 	}
 	return url, nil
+}
+
+// DeleteRecording removes a recording and its segments from both object storage and the database.
+// Object deletion failures are logged but do not abort the database cleanup, since dangling objects
+// are preferable to dangling database rows.
+func (r *RecordingService) DeleteRecording(ctx context.Context, id string) error {
+	segments, err := r.metadataStore.GetSegments(ctx, id)
+	if err != nil {
+		return fmt.Errorf("failed to get segments for deletion: %w", err)
+	}
+
+	if len(segments) > 0 {
+		keys := make([]string, len(segments))
+		for i, seg := range segments {
+			keys[i] = seg.StorageKey
+		}
+		if err := r.objectStore.DeleteMultiple(ctx, keys); err != nil {
+			r.logger.Error("Failed to delete segments from object store", recorderlog.String("recording_id", id), recorderlog.Error(err))
+		}
+	}
+
+	if err := r.metadataStore.DeleteRecording(ctx, id); err != nil {
+		return fmt.Errorf("failed to delete recording metadata: %w", err)
+	}
+
+	r.logger.Info("Recording deleted", recorderlog.String("recording_id", id), recorderlog.Int("segments_removed", len(segments)))
+	return nil
+}
+
+// UpdateRecordingName writes a display name into the recording's JSONB metadata column.
+// The rest of the existing metadata map is preserved.
+func (r *RecordingService) UpdateRecordingName(ctx context.Context, id string, name string) error {
+	rec, err := r.metadataStore.GetRecording(ctx, id)
+	if err != nil {
+		return fmt.Errorf("recording not found: %w", err)
+	}
+	if rec.Metadata == nil {
+		rec.Metadata = make(map[string]interface{})
+	}
+	rec.Metadata["name"] = name
+
+	metaJSON, err := json.Marshal(rec.Metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+	return r.metadataStore.UpdateRecording(ctx, id, map[string]interface{}{
+		"metadata": string(metaJSON),
+	})
+}
+
+// GetRecordingWithSegments retrieves a recording with its full segment list.
+// Each segment with a valid storage key gets a fresh pre-signed URL (1-hour expiry).
+func (r *RecordingService) GetRecordingWithSegments(ctx context.Context, id string) (*storage.Recording, error) {
+	rec, err := r.metadataStore.GetRecording(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("recording not found: %w", err)
+	}
+
+	segments, err := r.metadataStore.GetSegments(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get segments: %w", err)
+	}
+
+	for _, seg := range segments {
+		if seg.StorageKey != "" {
+			url, err := r.objectStore.GeneratePresignedURL(ctx, seg.StorageKey, time.Hour)
+			if err == nil {
+				seg.PresignedURL = url
+			}
+		}
+	}
+
+	rec.Segments = segments
+	return rec, nil
+}
+
+// GetObjectStore returns the underlying object store.
+// The download handler uses this to stream raw segment bytes directly to the client.
+func (r *RecordingService) GetObjectStore() storage.ObjectStore {
+	return r.objectStore
 }
 
 // UpdateConfig updates the recording service configuration at runtime

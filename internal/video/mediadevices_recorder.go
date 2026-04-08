@@ -175,10 +175,13 @@ func (rm *MediaDevicesRecordingManager) HandleMotion(motionChan <-chan bool) {
 }
 
 // processRecordingFrames handles the actual frame recording from the distributor
+// Uses subscription for restart-safe operation
 func (rm *MediaDevicesRecordingManager) processRecordingFrames() {
-	recordChannel := rm.frameDistributor.GetRecordChannel() // FIXED: Changed from GetRecordingFrameChannel()
+	recordSub := rm.frameDistributor.SubscribeRecord()
+	defer recordSub.Close()
+	recordChannel := recordSub.Frames()
 
-	log.Printf("[RecordingManager] Frame processor started")
+	log.Printf("[RecordingManager] Frame processor started (subscription-based)")
 
 	for {
 		select {
@@ -188,7 +191,7 @@ func (rm *MediaDevicesRecordingManager) processRecordingFrames() {
 
 		case frame, ok := <-recordChannel:
 			if !ok {
-				log.Printf("[RecordingManager] Record channel closed")
+				log.Printf("[RecordingManager] Record subscription closed")
 				return
 			}
 

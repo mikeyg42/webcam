@@ -44,6 +44,9 @@ type Config struct {
 	// WebRTC settings
 	WebRTC WebRTCConfig `yaml:"webrtc" json:"webrtc"`
 
+	// LiveKit SFU
+	LiveKit LiveKitConfig `yaml:"livekit" json:"livekit"`
+
 	// WebSocket configuration
 	WebSocket WebSocketConfig `yaml:"websocket" json:"websocket"`
 
@@ -201,6 +204,20 @@ type WebSocketConfig struct {
 	KeyFile  string `yaml:"key_file" json:"key_file"`
 }
 
+// LiveKitConfig contains LiveKit SFU connection settings
+type LiveKitConfig struct {
+	Host      string `yaml:"host" json:"host" default:"localhost"`
+	Port      int    `yaml:"port" json:"port" default:"7880"`
+	APIKey    string `yaml:"api_key" json:"apiKey" default:"devkey"`
+	APISecret string `yaml:"api_secret" json:"apiSecret" default:"secret"`
+	RoomName  string `yaml:"room_name" json:"roomName" default:"camera"`
+}
+
+// URL returns the WebSocket URL for the LiveKit server
+func (c *LiveKitConfig) URL() string {
+	return fmt.Sprintf("ws://%s:%d", c.Host, c.Port)
+}
+
 // MailSendConfig contains MailerSend email service configuration
 type MailSendConfig struct {
 	APIToken  string `yaml:"api_token" json:"api_token"`
@@ -303,10 +320,6 @@ type MinIOConfig struct {
 	// Timeouts
 	ConnectTimeout time.Duration `yaml:"connect_timeout" json:"connectTimeout" default:"30s"`
 	RequestTimeout time.Duration `yaml:"request_timeout" json:"requestTimeout" default:"5m"`
-
-	// Multipart upload settings
-	PartSize    int64 `yaml:"part_size_mb" json:"partSizeMb" default:"64"` // MB
-	Concurrency int   `yaml:"concurrency" json:"concurrency" default:"4"`
 }
 
 // S3Config contains AWS S3 settings
@@ -588,6 +601,13 @@ func DefaultConfig() *Config {
 			Debug:          false,
 			Scopes:         []string{"https://www.googleapis.com/auth/gmail.send"},
 		},
+		LiveKit: LiveKitConfig{
+			Host:      "localhost",
+			Port:      7880,
+			APIKey:    "devkey",
+			APISecret: "secret",
+			RoomName:  "camera",
+		},
 		WebRTC: WebRTCConfig{
 			ICEServers: []ICEServer{
 				{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -644,8 +664,6 @@ func DefaultConfig() *Config {
 				MaxDownloads:    20,
 				ConnectTimeout:  30 * time.Second,
 				RequestTimeout:  5 * time.Minute,
-				PartSize:        64,
-				Concurrency:     4,
 			},
 			Postgres: PostgresConfig{
 				Host:            "localhost",
@@ -763,6 +781,16 @@ func LoadConfig(path string) (*Config, error) {
 				return nil, fmt.Errorf("failed to parse config file: %w", err)
 			}
 		}
+	}
+
+	// Migration: fix legacy duration values stored as seconds instead of nanoseconds
+	// If duration values are suspiciously small (< 1s but > 0), they were likely saved
+	// as integer seconds and need to be converted to proper time.Duration (nanoseconds)
+	if config.Motion.CooldownPeriod > 0 && config.Motion.CooldownPeriod < time.Second {
+		config.Motion.CooldownPeriod = config.Motion.CooldownPeriod * time.Second
+	}
+	if config.Motion.NoMotionDelay > 0 && config.Motion.NoMotionDelay < time.Second {
+		config.Motion.NoMotionDelay = config.Motion.NoMotionDelay * time.Second
 	}
 
 	// Set up aliases after loading

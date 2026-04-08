@@ -8,6 +8,7 @@ export interface Tab {
   icon?: React.ReactNode;
   locked?: boolean;
   lockReason?: string;
+  hidden?: boolean;
 }
 
 export interface HeaderProps {
@@ -38,7 +39,7 @@ export function Header({
 
           {/* Tab Navigation */}
           <nav className="flex items-center gap-1" role="tablist">
-            {tabs.map((tab) => {
+            {tabs.filter(tab => !tab.hidden).map((tab) => {
               const isActive = activeTab === tab.id;
               const isLocked = tab.locked;
 

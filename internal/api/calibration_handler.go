@@ -4,42 +4,62 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"image"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 
 	"github.com/mikeyg42/webcam/internal/calibration"
+	"github.com/mikeyg42/webcam/internal/config"
+	"github.com/mikeyg42/webcam/internal/framestream"
 	"github.com/mikeyg42/webcam/internal/motion"
+	"github.com/mikeyg42/webcam/internal/tailscale"
+	"github.com/pion/mediadevices"
+	_ "github.com/pion/mediadevices/pkg/driver/camera"     // Camera driver
+	_ "github.com/pion/mediadevices/pkg/driver/microphone" // Microphone driver
 )
 
 // CalibrationHandler handles calibration API requests
 type CalibrationHandler struct {
 	calibService     *calibration.Service
 	detector         *motion.Detector
-	frameDistributor interface {
-		GetMotionChannel() <-chan image.Image
-		Start(width, height int) error
-		Stop()
-		IsRunning() bool
-	}
-	ctx context.Context
+	frameDistributor *framestream.FrameDistributor
+	config           *config.Config
+	ctx              context.Context
+	tailscaleManager *tailscale.TailscaleManager
 }
 
 // NewCalibrationHandler creates a new calibration handler
-func NewCalibrationHandler(ctx context.Context, calibService *calibration.Service, detector *motion.Detector, frameDistributor interface {
-	GetMotionChannel() <-chan image.Image
-	Start(width, height int) error
-	Stop()
-	IsRunning() bool
-}) *CalibrationHandler {
+func NewCalibrationHandler(ctx context.Context, calibService *calibration.Service, detector *motion.Detector,
+	frameDistributor *framestream.FrameDistributor, cfg *config.Config) *CalibrationHandler {
 	return &CalibrationHandler{
 		ctx:              ctx,
 		calibService:     calibService,
 		detector:         detector,
 		frameDistributor: frameDistributor,
+		config:           cfg,
 	}
+}
+
+// SetTailscaleManager sets the Tailscale manager for authentication
+func (h *CalibrationHandler) SetTailscaleManager(tsManager *tailscale.TailscaleManager) {
+	h.tailscaleManager = tsManager
+}
+
+// requireAuth checks Tailscale authentication and returns error if unauthorized
+func (h *CalibrationHandler) requireAuth(w http.ResponseWriter, r *http.Request) bool {
+	if h.tailscaleManager != nil {
+		_, err := h.tailscaleManager.GetUserEmailFromRequest(r)
+		if err != nil {
+			log.Printf("[CalibrationHandler] Authentication failed: %v", err)
+			http.Error(w, "Unauthorized - Tailscale authentication required", http.StatusUnauthorized)
+			return false
+		}
+	} else {
+		log.Printf("[CalibrationHandler] Warning: Tailscale disabled - unauthenticated calibration access")
+	}
+	return true
 }
 
 // CalibrationStatusResponse represents the current calibration status
@@ -68,25 +88,64 @@ func (h *CalibrationHandler) StartCalibration(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Require Tailscale authentication
+	if !h.requireAuth(w, r) {
+		return
+	}
+
+	// Check if calibration is already in progress (prevents double-click issues)
+	progress := h.calibService.GetProgress()
+	if progress.State == calibration.StateRecording || progress.State == calibration.StateProcessing {
+		log.Printf("[API] Calibration already in progress (state: %s), ignoring duplicate request", progress.State)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Calibration already in progress.",
+		})
+		return
+	}
+
 	// Check if detector is running
 	if h.detector.IsRunning() {
 		http.Error(w, "Cannot calibrate while motion detection is running. Stop detection first.", http.StatusConflict)
 		return
 	}
 
-	// Start frame distributor (camera) if not already running
-	if !h.frameDistributor.IsRunning() {
-		log.Println("[API] Starting camera for calibration...")
-		if err := h.frameDistributor.Start(1280, 720); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to start camera: %v", err), http.StatusInternalServerError)
-			return
-		}
-		log.Println("[API] Camera started successfully at 1280x720")
+	// Stop frame distributor if running (it may be at wrong resolution or wrong device)
+	if h.frameDistributor.IsRunning() {
+		log.Println("[API] Stopping camera to apply new device settings...")
+		h.frameDistributor.Stop()
 	}
 
-	// Start calibration with frames from motion channel
-	motionChan := h.frameDistributor.GetMotionChannel()
-	if err := h.calibService.StartCalibration(h.ctx, motionChan); err != nil {
+	// Update devices from current config (in case user changed camera/mic in settings)
+	camera, microphone, audioEnabled, err := h.lookupDevicesFromConfig()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to find configured devices: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if err := h.frameDistributor.UpdateDevices(camera, microphone, audioEnabled); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to update devices: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Subscribe to motion frames BEFORE starting camera
+	// This ensures frames are captured even if distributor restarts during resolution change
+	motionSub := h.frameDistributor.SubscribeMotion()
+
+	log.Println("[API] Starting camera for calibration at 1280x720...")
+	if err := h.frameDistributor.Start(1280, 720); err != nil {
+		motionSub.Close() // Clean up subscription on error
+		http.Error(w, fmt.Sprintf("Failed to start camera: %v", err), http.StatusInternalServerError)
+		return
+	}
+	log.Println("[API] Camera started successfully at 1280x720")
+
+	// Start calibration with frames from motion subscription
+	// The subscription survives distributor restarts, solving the "0 samples" issue
+	// Pass cleanup function to close subscription when calibration completes
+	if err := h.calibService.StartCalibration(h.ctx, motionSub.Frames(), motionSub.Close); err != nil {
+		motionSub.Close()
 		http.Error(w, fmt.Sprintf("Failed to start calibration: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -104,6 +163,11 @@ func (h *CalibrationHandler) StartCalibration(w http.ResponseWriter, r *http.Req
 func (h *CalibrationHandler) GetCalibrationStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Require Tailscale authentication
+	if !h.requireAuth(w, r) {
 		return
 	}
 
@@ -146,6 +210,11 @@ func (h *CalibrationHandler) GetCalibrationResult(w http.ResponseWriter, r *http
 		return
 	}
 
+	// Require Tailscale authentication
+	if !h.requireAuth(w, r) {
+		return
+	}
+
 	progress := h.calibService.GetProgress()
 
 	if progress.Result == nil {
@@ -172,10 +241,21 @@ func (h *CalibrationHandler) ApplyCalibration(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Require Tailscale authentication
+	if !h.requireAuth(w, r) {
+		return
+	}
+
 	progress := h.calibService.GetProgress()
 
 	if progress.Result == nil {
 		http.Error(w, "No calibration result available. Run calibration first.", http.StatusBadRequest)
+		return
+	}
+
+	// Validate calibration result before applying
+	if err := validateCalibrationResult(progress.Result); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid calibration result: %v", err), http.StatusBadRequest)
 		return
 	}
 
@@ -192,10 +272,55 @@ func (h *CalibrationHandler) ApplyCalibration(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// validateCalibrationResult checks that calibration values are sane
+func validateCalibrationResult(result *calibration.CalibrationResult) error {
+	if result == nil {
+		return fmt.Errorf("calibration result is nil")
+	}
+
+	if result.Samples < 10 {
+		return fmt.Errorf("insufficient samples: got %d, need at least 10", result.Samples)
+	}
+
+	// Check for NaN/Inf values which indicate calculation errors
+	if math.IsNaN(result.Baseline) || math.IsInf(result.Baseline, 0) {
+		return fmt.Errorf("invalid baseline value (NaN or Inf)")
+	}
+	if math.IsNaN(result.Threshold) || math.IsInf(result.Threshold, 0) {
+		return fmt.Errorf("invalid threshold value (NaN or Inf)")
+	}
+	if math.IsNaN(result.StdDev) || math.IsInf(result.StdDev, 0) {
+		return fmt.Errorf("invalid standard deviation value (NaN or Inf)")
+	}
+
+	if result.Baseline < 0 {
+		return fmt.Errorf("invalid baseline: %.4f (must be >= 0)", result.Baseline)
+	}
+
+	if result.Threshold <= result.Baseline {
+		return fmt.Errorf("threshold (%.4f) must be greater than baseline (%.4f)", result.Threshold, result.Baseline)
+	}
+
+	if result.Threshold > 50 {
+		return fmt.Errorf("threshold too high: %.4f%% (max 50%%). Scene may have too much motion for calibration", result.Threshold)
+	}
+
+	if result.StdDev < 0 {
+		return fmt.Errorf("invalid standard deviation: %.4f (must be >= 0)", result.StdDev)
+	}
+
+	return nil
+}
+
 // GetCalibrationVideo handles GET /api/calibration/video
 func (h *CalibrationHandler) GetCalibrationVideo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Require Tailscale authentication
+	if !h.requireAuth(w, r) {
 		return
 	}
 
@@ -218,10 +343,38 @@ func (h *CalibrationHandler) GetCalibrationVideo(w http.ResponseWriter, r *http.
 	http.ServeFile(w, r, progress.VideoPath)
 }
 
+// ResetCalibration handles POST /api/calibration/reset
+func (h *CalibrationHandler) ResetCalibration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Require Tailscale authentication
+	if !h.requireAuth(w, r) {
+		return
+	}
+
+	h.calibService.Reset()
+
+	log.Println("[API] Calibration state reset via API")
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Calibration state reset. Ready to retry.",
+	})
+}
+
 // StartDetection handles POST /api/detection/start
 func (h *CalibrationHandler) StartDetection(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Require Tailscale authentication
+	if !h.requireAuth(w, r) {
 		return
 	}
 
@@ -273,6 +426,11 @@ func (h *CalibrationHandler) StopDetection(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Require Tailscale authentication
+	if !h.requireAuth(w, r) {
+		return
+	}
+
 	// Check if running
 	if !h.detector.IsRunning() {
 		w.Header().Set("Content-Type", "application/json")
@@ -312,6 +470,11 @@ func (h *CalibrationHandler) GetDetectionStatus(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	// Require Tailscale authentication
+	if !h.requireAuth(w, r) {
+		return
+	}
+
 	baseline, threshold, calibrated := h.detector.GetCalibration()
 	isRunning := h.detector.IsRunning()
 	stats := h.detector.GetStats()
@@ -337,7 +500,72 @@ func (h *CalibrationHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/calibration/result", h.GetCalibrationResult)
 	mux.HandleFunc("/api/calibration/apply", h.ApplyCalibration)
 	mux.HandleFunc("/api/calibration/video", h.GetCalibrationVideo)
+	mux.HandleFunc("/api/calibration/reset", h.ResetCalibration)
 	mux.HandleFunc("/api/detection/start", h.StartDetection)
 	mux.HandleFunc("/api/detection/stop", h.StopDetection)
 	mux.HandleFunc("/api/detection/status", h.GetDetectionStatus)
+}
+
+// lookupDevicesFromConfig finds camera and microphone devices based on current config
+func (h *CalibrationHandler) lookupDevicesFromConfig() (mediadevices.MediaDeviceInfo, mediadevices.MediaDeviceInfo, bool, error) {
+	var camera, microphone mediadevices.MediaDeviceInfo
+	audioEnabled := h.config.Audio.Enabled
+
+	// Get all available devices
+	devices := mediadevices.EnumerateDevices()
+
+	// Find camera by device ID from config
+	cameraID := h.config.Video.DeviceID
+	for _, d := range devices {
+		if d.Kind == mediadevices.VideoInput && d.DeviceID == cameraID {
+			camera = d
+			log.Printf("[API] Found camera: %s (ID: %s)", d.Label, d.DeviceID)
+			break
+		}
+	}
+
+	if camera.DeviceID == "" {
+		// Fallback: use first available camera
+		for _, d := range devices {
+			if d.Kind == mediadevices.VideoInput {
+				camera = d
+				log.Printf("[API] Using fallback camera: %s (ID: %s)", d.Label, d.DeviceID)
+				break
+			}
+		}
+	}
+
+	if camera.DeviceID == "" {
+		return camera, microphone, false, fmt.Errorf("no camera found")
+	}
+
+	// Find microphone by device ID from config (if audio enabled)
+	if audioEnabled {
+		micID := h.config.Audio.DeviceID
+		for _, d := range devices {
+			if d.Kind == mediadevices.AudioInput && d.DeviceID == micID {
+				microphone = d
+				log.Printf("[API] Found microphone: %s (ID: %s)", d.Label, d.DeviceID)
+				break
+			}
+		}
+
+		if microphone.DeviceID == "" {
+			// Fallback: use first available microphone
+			for _, d := range devices {
+				if d.Kind == mediadevices.AudioInput {
+					microphone = d
+					log.Printf("[API] Using fallback microphone: %s (ID: %s)", d.Label, d.DeviceID)
+					break
+				}
+			}
+		}
+
+		if microphone.DeviceID == "" {
+			log.Printf("[API] Warning: No microphone found, disabling audio")
+			audioEnabled = false
+		}
+	}
+
+	return camera, microphone, audioEnabled, nil
 }

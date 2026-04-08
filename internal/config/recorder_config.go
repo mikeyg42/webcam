@@ -30,8 +30,6 @@ func CreateStorageConfigs(cfg *Config) (storage.MinIOConfig, storage.PostgresCon
 		MaxDownloads:    cfg.Storage.MinIO.MaxDownloads,
 		ConnectTimeout:  cfg.Storage.MinIO.ConnectTimeout,
 		RequestTimeout:  cfg.Storage.MinIO.RequestTimeout,
-		PartSize:        cfg.Storage.MinIO.PartSize * 1024 * 1024, // Convert MB to bytes
-		Concurrency:     cfg.Storage.MinIO.Concurrency,
 	}
 
 	// PostgreSQL configuration

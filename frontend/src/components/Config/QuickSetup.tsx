@@ -1,9 +1,8 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
-import { Camera, Mic, Zap, Play, Network } from 'lucide-react';
+import { Camera, Mic, Play, Network } from 'lucide-react';
 import { Button } from '../primitives/Button';
 import { Select, type SelectOption } from '../primitives/Select';
-import { Toggle } from '../primitives/Toggle';
 import { Input } from '../primitives/Input';
 import { Card } from '../layout/Card';
 import { slideUp } from '../../lib/motion';
@@ -18,7 +17,7 @@ interface QuickSetupProps {
 }
 
 // Recording mode options
-type RecordingMode = 'none' | 'continuous' | 'motion';
+type RecordingMode = 'disabled' | 'motion' | 'manual' | 'continuous';
 
 export function QuickSetup({
   config,
@@ -60,18 +59,38 @@ export function QuickSetup({
     fetchDevices();
   }, []);
 
-  // Determine current recording mode
+  // Determine current recording mode from config flags
   const getRecordingMode = (): RecordingMode => {
     if (config.recording.continuousEnabled) return 'continuous';
-    if (config.recording.eventEnabled) return 'motion';
-    return 'none';
+    if (config.recording.eventEnabled && config.motion.enabled) return 'motion';
+    // Manual mode: recording not auto-enabled, but user can press record button
+    if (!config.recording.continuousEnabled && !config.recording.eventEnabled && !config.motion.enabled) {
+      // Check if this was explicitly set to manual vs disabled
+      // Use a convention: if the save directory is set, assume manual; otherwise disabled
+      return config.recording.saveDirectory?.trim() ? 'manual' : 'disabled';
+    }
+    return 'manual';
   };
 
   const setRecordingMode = (mode: RecordingMode) => {
-    onUpdate('recording', {
-      continuousEnabled: mode === 'continuous',
-      eventEnabled: mode === 'motion',
-    });
+    switch (mode) {
+      case 'disabled':
+        onUpdate('recording', { continuousEnabled: false, eventEnabled: false });
+        onUpdate('motion', { enabled: false });
+        break;
+      case 'motion':
+        onUpdate('recording', { continuousEnabled: false, eventEnabled: true });
+        onUpdate('motion', { enabled: true });
+        break;
+      case 'manual':
+        onUpdate('recording', { continuousEnabled: false, eventEnabled: false });
+        onUpdate('motion', { enabled: false });
+        break;
+      case 'continuous':
+        onUpdate('recording', { continuousEnabled: true, eventEnabled: false });
+        onUpdate('motion', { enabled: false });
+        break;
+    }
   };
 
   // Camera options
@@ -91,9 +110,10 @@ export function QuickSetup({
 
   // Recording mode options
   const recordingModeOptions: SelectOption[] = [
-    { value: 'none', label: 'No recording' },
+    { value: 'disabled', label: 'Recording disabled' },
     { value: 'motion', label: 'Motion-triggered' },
-    { value: 'continuous', label: 'Continuous' },
+    { value: 'manual', label: 'Manual (press record)' },
+    { value: 'continuous', label: 'Continuous (entire session)' },
   ];
 
   return (
@@ -167,7 +187,7 @@ export function QuickSetup({
           <div className="w-10 h-10 rounded-lg bg-accent/10 flex items-center justify-center shrink-0">
             <Play className="w-5 h-5 text-accent" />
           </div>
-          <div className="flex-1 min-w-0">
+          <div className="flex-1 min-w-0 space-y-3">
             <Select
               label="Recording Mode"
               helper="Motion-triggered saves storage by only recording when motion is detected"
@@ -175,23 +195,30 @@ export function QuickSetup({
               value={getRecordingMode()}
               onChange={(e) => setRecordingMode(e.target.value as RecordingMode)}
             />
-          </div>
-        </div>
-      </Card>
-
-      {/* Motion Detection Toggle */}
-      <Card padding="md">
-        <div className="flex items-start gap-4">
-          <div className="w-10 h-10 rounded-lg bg-accent/10 flex items-center justify-center shrink-0">
-            <Zap className="w-5 h-5 text-accent" />
-          </div>
-          <div className="flex-1 min-w-0">
-            <Toggle
-              checked={config.motion.enabled}
-              onChange={(enabled) => onUpdate('motion', { enabled })}
-              label="Motion Detection"
-              description="Analyze video for movement and trigger events"
-            />
+            {getRecordingMode() === 'continuous' && (
+              <div className="bg-accent/5 border border-accent/20 rounded-lg p-3 flex items-start gap-2">
+                <span className="text-accent text-sm">ℹ️</span>
+                <p className="text-xs text-text-secondary leading-relaxed">
+                  <strong className="text-accent">Continuous recording</strong> starts automatically when the camera connects. Skips calibration.
+                </p>
+              </div>
+            )}
+            {getRecordingMode() === 'motion' && (
+              <div className="bg-bg-subtle border border-border rounded-lg p-3 flex items-start gap-2">
+                <span className="text-text-tertiary text-sm">ℹ️</span>
+                <p className="text-xs text-text-secondary leading-relaxed">
+                  <strong className="text-text-primary">Motion-triggered</strong> automatically enables motion detection and requires calibration to establish a baseline.
+                </p>
+              </div>
+            )}
+            {getRecordingMode() === 'manual' && (
+              <div className="bg-bg-subtle border border-border rounded-lg p-3 flex items-start gap-2">
+                <span className="text-text-tertiary text-sm">ℹ️</span>
+                <p className="text-xs text-text-secondary leading-relaxed">
+                  <strong className="text-text-primary">Manual recording</strong> — use the Record button in the Camera tab to start and stop. Skips calibration.
+                </p>
+              </div>
+            )}
           </div>
         </div>
       </Card>

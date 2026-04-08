@@ -8,6 +8,7 @@ export interface Tab {
   icon?: React.ReactNode;
   locked?: boolean;
   lockReason?: string;
+  hidden?: boolean;
 }
 
 export interface TabBarProps {
@@ -26,7 +27,7 @@ export function TabBar({ tabs, activeTab, onTabChange }: TabBarProps) {
       role="tablist"
     >
       <div className="flex">
-        {tabs.map((tab) => {
+        {tabs.filter(tab => !tab.hidden).map((tab) => {
           const isActive = activeTab === tab.id;
           const isLocked = tab.locked;
 

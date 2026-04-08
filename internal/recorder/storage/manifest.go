@@ -85,15 +85,28 @@ type Segment struct {
 	PresignedURL string `json:"url,omitempty" db:"-"`
 }
 
-// SegmentStatus represents the status of a segment
+// SegmentStatus represents the status of a segment.
+// These statuses are unified between pipeline and storage layers.
 type SegmentStatus string
 
 const (
-	SegmentStatusRecording SegmentStatus = "recording"
-	SegmentStatusUploading SegmentStatus = "uploading"
-	SegmentStatusCompleted SegmentStatus = "completed"
-	SegmentStatusVerified  SegmentStatus = "verified"
-	SegmentStatusFailed    SegmentStatus = "failed"
+	SegmentStatusRecording  SegmentStatus = "recording"
+	SegmentStatusFinalizing SegmentStatus = "finalizing" // Being finalized (fsync, checksum)
+	SegmentStatusUploading  SegmentStatus = "uploading"  // Being uploaded to object store
+	SegmentStatusUploaded   SegmentStatus = "uploaded"   // Upload complete, not yet verified
+	SegmentStatusCompleted  SegmentStatus = "completed"  // Fully processed
+	SegmentStatusVerified   SegmentStatus = "verified"   // Verified in object store
+	SegmentStatusFailed     SegmentStatus = "failed"     // Failed at some stage
+)
+
+// Recording status constants
+const (
+	RecordingStatusRecording      = "recording"
+	RecordingStatusProcessing     = "processing"
+	RecordingStatusCompleted      = "completed"
+	RecordingStatusFailed         = "failed"
+	RecordingStatusCrashed        = "crashed"         // Found incomplete on startup
+	RecordingStatusPanicRecovered = "panic_recovered" // Saved after panic
 )
 
 // MotionEvent represents a motion detection event
