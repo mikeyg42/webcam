@@ -41,8 +41,20 @@ const config = {
     port: process.env.PORT || 3000,
     host: process.env.HOST || '0.0.0.0',
     cors: {
-        origin: process.env.CORS_ORIGIN || '*',
-        methods: ['GET', 'POST', 'DELETE']
+        origin: function(origin, callback) {
+            // Allow requests with no origin (same-origin, curl, etc.)
+            if (!origin) return callback(null, true);
+            // Allow localhost on ports 3000-3010 (dynamic Node proxy range)
+            // and 8081 (Go API) for development
+            const localhostMatch = /^https?:\/\/(localhost|127\.0\.0\.1):(3\d{3}|8081)$/;
+            // Allow Tailscale CGNAT range (100.64-127.x.x.x) on any port
+            const tailscaleMatch = /^https?:\/\/100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(:\d+)?$/;
+            if (localhostMatch.test(origin) || tailscaleMatch.test(origin)) {
+                return callback(null, true);
+            }
+            callback(new Error('CORS not allowed'));
+        },
+        methods: ['GET', 'POST', 'PATCH', 'DELETE']
     }
 };
 
