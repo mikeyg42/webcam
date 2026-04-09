@@ -82,8 +82,7 @@ func NewMailSendNotifier(config *MailSendConfig, systemName string) (*MailSendNo
 	}
 
 	if config.Debug {
-		log.Printf("MailSend notifier initialized with token: %s...",
-			config.APIToken[:10])
+		log.Println("MailSend notifier initialized (API token configured)")
 	}
 
 	return notifier, nil

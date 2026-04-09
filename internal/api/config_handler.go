@@ -53,13 +53,19 @@ func NewConfigHandler(cfg *config.Config, motionDetector *motion.Detector) *Conf
 			log.Printf("[WARN] Failed to generate master key: %v. Password encryption disabled.", err)
 			masterKey = ""
 		} else {
-			log.Println("=======================================================================")
-			log.Println("[IMPORTANT] No CONFIG_MASTER_KEY found. Generated new master key:")
-			log.Printf("  CONFIG_MASTER_KEY=%s", masterKey)
-			log.Println("")
-			log.Println("Add this to your environment variables to encrypt/decrypt passwords.")
-			log.Println("Without this key, encrypted passwords cannot be decrypted!")
-			log.Println("=======================================================================")
+			// Write generated key to a file with restricted permissions
+			// instead of logging it to stdout where log aggregators could capture it.
+			homeDir, _ := os.UserHomeDir()
+			keyFile := filepath.Join(homeDir, ".webcam2", "master.key")
+			if err := os.MkdirAll(filepath.Dir(keyFile), 0700); err == nil {
+				if err := os.WriteFile(keyFile, []byte(masterKey), 0600); err == nil {
+					log.Printf("[IMPORTANT] No CONFIG_MASTER_KEY found. Generated new key saved to: %s", keyFile)
+					log.Println("[IMPORTANT] Set CONFIG_MASTER_KEY from that file to persist across restarts.")
+				} else {
+					// Fall back to stderr (not the log pipeline)
+					fmt.Fprintf(os.Stderr, "[IMPORTANT] Generated master key (save this): CONFIG_MASTER_KEY=%s\n", masterKey)
+				}
+			}
 		}
 	}
 
@@ -505,10 +511,15 @@ func (h *ConfigHandler) validateConfigRequest(req *ConfigResponse) error {
 		return fmt.Errorf("invalid minimum area: %d", req.Motion.MinimumArea)
 	}
 
-	// Validate recording settings
+	// Validate recording settings — block path traversal
 	if req.Recording.SaveDirectory == "" {
 		return fmt.Errorf("save directory cannot be empty")
 	}
+	cleanDir := filepath.Clean(req.Recording.SaveDirectory)
+	if strings.Contains(cleanDir, "..") {
+		return fmt.Errorf("save directory must not contain path traversal (..)")
+	}
+	req.Recording.SaveDirectory = cleanDir
 
 	return nil
 }
@@ -676,21 +687,25 @@ func (h *ConfigHandler) RestartBackend(w http.ResponseWriter, r *http.Request) {
 
 	// Trigger restart script in background after response is sent
 	go func() {
-		time.Sleep(500 * time.Millisecond) // Brief delay to ensure response is delivered
+		time.Sleep(500 * time.Millisecond)
 
-		// Determine project root (where restart script is located)
-		projectRoot := os.Getenv("PROJECT_ROOT")
-		if projectRoot == "" {
-			// Try to find it relative to config file
-			configDir := filepath.Dir(h.configFile)
-			projectRoot = filepath.Join(configDir, "..", "projects", "webcam2")
-			// This is a fallback; ideally PROJECT_ROOT should be set
+		// Derive project root from executable path (not from config or env vars)
+		exePath, err := os.Executable()
+		if err != nil {
+			log.Printf("[Restart] Failed to determine executable path: %v", err)
+			return
+		}
+		projectRoot := filepath.Dir(exePath)
+		scriptPath := filepath.Join(projectRoot, "restart-backend-fast.sh")
+
+		// Verify the script exists and is a regular file
+		info, err := os.Stat(scriptPath)
+		if err != nil || info.IsDir() {
+			log.Printf("[Restart] Restart script not found at %s", scriptPath)
+			return
 		}
 
-		scriptPath := filepath.Join(projectRoot, "restart-backend-fast.sh")
 		log.Printf("[Restart] Executing: %s", scriptPath)
-
-		// Execute restart script (this will kill the current process)
 		cmd := exec.Command("/bin/bash", scriptPath)
 		cmd.Dir = projectRoot
 		cmd.Stdout = os.Stdout

@@ -4,7 +4,9 @@ package api
 import (
 	"context"
 	"log"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/mikeyg42/webcam/internal/calibration"
@@ -81,7 +83,7 @@ func NewServer(ctx context.Context, cfg *config.Config, addr string, calibServic
 
 	// LiveKit token endpoint for browser subscribers
 	lkTokenHandler := NewLiveKitTokenHandler(&cfg.LiveKit)
-	lkTokenHandler.RegisterRoutes(mux)
+	mux.HandleFunc("/api/livekit-token", requireTailscaleAuth(tsManager, lkTokenHandler.handleToken))
 
 	// Health check endpoint
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -136,7 +138,11 @@ func (s *Server) SetRecordingHealthHandler(provider RecordingHealthProvider) {
 func (s *Server) SetRecordingControlHandler(controller RecordingController) {
 	if controller != nil {
 		handler := NewRecordingControlHandler(controller)
-		handler.RegisterRoutes(s.mux)
+		// Wrap with Tailscale auth
+		s.mux.HandleFunc("/api/recording/start", requireTailscaleAuth(s.tailscaleManager, handler.HandleStart))
+		s.mux.HandleFunc("/api/recording/stop", requireTailscaleAuth(s.tailscaleManager, handler.HandleStop))
+		s.mux.HandleFunc("/api/recording/status", requireTailscaleAuth(s.tailscaleManager, handler.HandleStatus))
+		log.Println("[APIServer] Recording control endpoints registered with auth")
 	}
 }
 
@@ -144,28 +150,26 @@ func (s *Server) SetRecordingControlHandler(controller RecordingController) {
 func (s *Server) SetRecordingsBrowserHandler(browser RecordingBrowser) {
 	if browser != nil {
 		handler := NewRecordingsBrowserHandler(browser)
-		handler.RegisterRoutes(s.mux)
-		log.Println("[APIServer] Recordings browser endpoints registered")
+		auth := func(hf http.HandlerFunc) http.HandlerFunc {
+			return requireTailscaleAuth(s.tailscaleManager, hf)
+		}
+		s.mux.HandleFunc("GET /api/recordings", auth(handler.handleList))
+		s.mux.HandleFunc("GET /api/recordings/{id}", auth(handler.handleGet))
+		s.mux.HandleFunc("DELETE /api/recordings/{id}", auth(handler.handleDelete))
+		s.mux.HandleFunc("PATCH /api/recordings/{id}", auth(handler.handleUpdate))
+		s.mux.HandleFunc("GET /api/recordings/{id}/download", auth(handler.handleDownload))
+		s.mux.HandleFunc("GET /api/recordings/{id}/segments/{index}/stream", auth(handler.handleSegmentStream))
+		log.Println("[APIServer] Recordings browser endpoints registered with auth")
 	}
 }
 
 // corsMiddleware adds CORS headers to allow cross-origin requests
 func corsMiddleware(next http.Handler) http.Handler {
-	// Whitelist of allowed origins
-	allowedOrigins := map[string]bool{
-		"http://localhost:8080":  true,
-		"http://localhost:8081":  true,
-		"http://localhost:3000":  true,
-		"http://127.0.0.1:8080":  true,
-		"http://127.0.0.1:8081":  true,
-		"http://127.0.0.1:3000":  true,
-	}
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 
-		// Only set CORS headers for whitelisted origins
-		if origin != "" && allowedOrigins[origin] {
+		// Allow localhost and Tailscale origins (100.x.x.x range)
+		if origin != "" && isAllowedOrigin(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -180,6 +184,50 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// requireTailscaleAuth wraps an http.HandlerFunc with Tailscale authentication.
+// Returns 401 if Tailscale is configured and the request isn't from an authenticated user.
+func requireTailscaleAuth(tsManager *tailscale.TailscaleManager, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if tsManager != nil {
+			_, err := tsManager.GetUserEmailFromRequest(r)
+			if err != nil {
+				http.Error(w, "Unauthorized - Tailscale authentication required", http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+// isAllowedOrigin checks if an origin is localhost or a Tailscale IP (100.64.0.0/10)
+func isAllowedOrigin(origin string) bool {
+	// Strip scheme (http:// or https://)
+	host := origin
+	for _, prefix := range []string{"https://", "http://"} {
+		if len(host) > len(prefix) && host[:len(prefix)] == prefix {
+			host = host[len(prefix):]
+			break
+		}
+	}
+	// Strip port
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+
+	// Allow localhost
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+
+	// Allow Tailscale CGNAT range (100.64.0.0/10)
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	_, tailscaleNet, _ := net.ParseCIDR("100.64.0.0/10")
+	return tailscaleNet.Contains(ip)
 }
 
 // Start starts the API server

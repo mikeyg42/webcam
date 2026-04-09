@@ -332,6 +332,61 @@ if lsof -ti:8080 >/dev/null 2>&1; then
   fi
 fi
 
+# Generate LiveKit credentials if not already set in config
+# These must match between livekit.yaml and the Go app's config
+if [[ -z "${LIVEKIT_API_KEY:-}" ]]; then
+  export LIVEKIT_API_KEY="devkey-$(openssl rand -hex 8)"
+  export LIVEKIT_API_SECRET="$(openssl rand -hex 16)"
+  log_info "Generated LiveKit credentials for this session"
+
+  # Update livekit.yaml with the generated credentials
+  sed -i.bak "s/devkey:.*/$LIVEKIT_API_KEY: $LIVEKIT_API_SECRET/" "$PROJECT_DIR/configs/livekit.yaml" 2>/dev/null || true
+
+  # Write credentials to config so the Go app picks them up
+  CONFIG_DIR="$HOME/.webcam2"
+  mkdir -p "$CONFIG_DIR"
+  if [[ -f "$CONFIG_DIR/config.json" ]]; then
+    # Update existing config with new LiveKit credentials using python3
+    python3 -c "
+import json, sys
+try:
+    with open('$CONFIG_DIR/config.json', 'r') as f:
+        cfg = json.load(f)
+    if 'livekit' not in cfg:
+        cfg['livekit'] = {}
+    cfg['livekit']['apiKey'] = '$LIVEKIT_API_KEY'
+    cfg['livekit']['apiSecret'] = '$LIVEKIT_API_SECRET'
+    with open('$CONFIG_DIR/config.json', 'w') as f:
+        json.dump(cfg, f, indent=2)
+except Exception as e:
+    print(f'Warning: Could not update config.json with LiveKit credentials: {e}', file=sys.stderr)
+" 2>/dev/null || log_warn "Could not update config.json — app will use -testing mode"
+  fi
+
+  # Also rewrite livekit.yaml properly
+  cat > "$PROJECT_DIR/configs/livekit.yaml" << LKEOF
+port: ${LIVEKIT_PORT:-7880}
+rtc:
+  port_range_start: 50000
+  port_range_end: 50200
+  use_external_ip: false
+  tcp_port: 7881
+keys:
+  $LIVEKIT_API_KEY: $LIVEKIT_API_SECRET
+logging:
+  level: info
+LKEOF
+  log_info "LiveKit config updated with session credentials"
+
+  # Restart livekit-server with new config
+  kill "$SFU_PID" 2>/dev/null || true
+  sleep 1
+  livekit-server --config "$PROJECT_DIR/configs/livekit.yaml" --bind 0.0.0.0 --port "${LIVEKIT_PORT:-7880}" --dev > "$LOG_DIR/livekit.log" 2>&1 &
+  SFU_PID=$!
+  sleep 2
+  log_info "LiveKit restarted with new credentials (PID: $SFU_PID)"
+fi
+
 ./security-camera -debug > "$LOG_DIR/go-camera.log" 2>&1 &
 GO_PID=$!
 log_info "Go camera PID: ${GO_PID}"

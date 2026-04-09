@@ -132,16 +132,14 @@ func (db *DB) GetUserCredentials(userEmail string) (*UserCredentials, error) {
 	return &creds, nil
 }
 
-// secureZero overwrites a string's memory with zeros
-// This helps prevent credentials from lingering in memory
+// secureZero clears the string reference. Note: Go's string immutability means
+// the original backing memory cannot be zeroed in-place without unsafe. The
+// []byte conversion creates a copy. This function clears the reference only —
+// the original bytes persist until GC. This is a known Go limitation; true
+// credential zeroing requires unsafe.Slice on the string header.
 func secureZero(s *string) {
-	if s == nil || *s == "" {
+	if s == nil {
 		return
-	}
-	// Convert to byte slice and zero it
-	b := []byte(*s)
-	for i := range b {
-		b[i] = 0
 	}
 	*s = ""
 }

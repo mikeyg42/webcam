@@ -142,6 +142,16 @@ func main() {
 		log.Fatalf("Configuration validation failed: %v", err)
 	}
 
+	// Reject insecure default credentials in non-testing mode
+	insecureDefaults := map[string]string{
+		"LiveKit API key":    cfg.LiveKit.APIKey,
+		"LiveKit API secret": cfg.LiveKit.APISecret,
+		"WebRTC password":    cfg.WebRTC.Password,
+	}
+	dangerousValues := map[string]bool{
+		"devkey": true, "secret": true, "defaultpassword123": true, "defaultuser": true,
+	}
+
 	// Parse command line flags
 	var (
 		debugMode   bool
@@ -151,6 +161,15 @@ func main() {
 	flag.BoolVar(&debugMode, "debug", false, "Enable debug mode")
 	flag.BoolVar(&testingMode, "testing", false, "Testing mode (skip WebRTC)")
 	flag.Parse()
+
+	if !testingMode {
+		for name, val := range insecureDefaults {
+			if dangerousValues[val] {
+				log.Fatalf("SECURITY: %s is set to an insecure default (%q). "+
+					"Set a secure value in ~/.webcam2/config.json or use -testing mode.", name, val)
+			}
+		}
+	}
 
 	// Create application instance
 	app, err := NewApplication(ctx, cfg, testingMode, debugMode)

@@ -2,8 +2,11 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/livekit/protocol/auth"
@@ -45,10 +48,31 @@ func (h *LiveKitTokenHandler) handleToken(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Derive the LiveKit URL from the request's Host header so it works both
+	// locally (localhost) and remotely (Tailscale IP / hostname).
+	// Only trust the hostname if it's localhost or a Tailscale IP to prevent
+	// host header injection pointing browsers to attacker-controlled servers.
+	host := r.Host
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+
+	// Validate: only allow localhost or Tailscale CGNAT range
+	hostname := h.cfg.Host // fallback to config default
+	if host == "localhost" || host == "127.0.0.1" {
+		hostname = host
+	} else if ip := net.ParseIP(host); ip != nil {
+		_, tsNet, _ := net.ParseCIDR("100.64.0.0/10")
+		if tsNet.Contains(ip) {
+			hostname = host
+		}
+	}
+	livekitURL := fmt.Sprintf("ws://%s:%d", hostname, h.cfg.Port)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"token":      token,
-		"url":        h.cfg.URL(),
-		"roomName":   h.cfg.RoomName,
+		"token":    token,
+		"url":      livekitURL,
+		"roomName": h.cfg.RoomName,
 	})
 }
