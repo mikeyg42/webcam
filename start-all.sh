@@ -396,7 +396,28 @@ kill -0 "$NODE_PID" >/dev/null 2>&1 || { log_error "Node server exited. See $LOG
 kill -0 "$GO_PID"   >/dev/null 2>&1 || { log_error "Go app exited. See $LOG_DIR/go-camera.log"; tail -20 "$LOG_DIR/go-camera.log" || true; exit 1; }
 
 # ----------------------------
-# Step 7: Summary
+# Step 7: Start Caddy reverse proxy (HTTPS)
+# ----------------------------
+CADDY_BINARY="$PROJECT_DIR/bin/caddy"
+CF_TOKEN_FILE="$HOME/.webcam2/cloudflare_token"
+
+if [[ -x "$CADDY_BINARY" ]] && [[ -f "$CF_TOKEN_FILE" ]]; then
+  export CLOUDFLARE_API_TOKEN="$(cat "$CF_TOKEN_FILE")"
+  log_info "Starting Caddy reverse proxy for camera.uncannyportal.com..."
+  "$CADDY_BINARY" start --config "$PROJECT_DIR/configs/Caddyfile" --adapter caddyfile > "$LOG_DIR/caddy.log" 2>&1
+  if [[ $? -eq 0 ]]; then
+    log_info "Caddy started — HTTPS available at https://camera.uncannyportal.com"
+  else
+    log_warn "Caddy failed to start. HTTPS not available. Check $LOG_DIR/caddy.log"
+    log_warn "Local access still works at http://localhost:${PORT}"
+  fi
+else
+  log_warn "Caddy or Cloudflare token not found — HTTPS disabled"
+  log_warn "Local access at http://localhost:${PORT}"
+fi
+
+# ----------------------------
+# Step 8: Summary
 # ----------------------------
 echo ""
 echo -e "${GREEN}========================================${NC}"
@@ -404,7 +425,8 @@ echo -e "${GREEN}All services started successfully!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
 echo -e "${BLUE}Service URLs:${NC}"
-echo -e "  ${GREEN}Frontend:          http://localhost:${PORT}${NC}  ${YELLOW}<-- Node.js proxy${NC}"
+echo -e "  ${GREEN}Public (HTTPS):    https://camera.uncannyportal.com${NC}"
+echo -e "  ${GREEN}Local:             http://localhost:${PORT}${NC}"
 echo -e "  ${GREEN}Go API:            http://localhost:8081${NC}"
 echo -e "  ${GREEN}LiveKit SFU:       ws://localhost:${LIVEKIT_PORT}${NC}"
 echo -e "  ${GREEN}MinIO Console:     http://localhost:9001${NC}"

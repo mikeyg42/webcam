@@ -48,26 +48,34 @@ func (h *LiveKitTokenHandler) handleToken(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Derive the LiveKit URL from the request's Host header so it works both
-	// locally (localhost) and remotely (Tailscale IP / hostname).
-	// Only trust the hostname if it's localhost or a Tailscale IP to prevent
-	// host header injection pointing browsers to attacker-controlled servers.
+	// Derive the LiveKit URL based on how the client reached us:
+	// - Via custom domain (HTTPS/Caddy): use wss://domain/livekit-ws (proxied through Caddy)
+	// - Via localhost: use ws://localhost:7880 (direct)
+	// - Via Tailscale IP: use ws://100.x.x.x:7880 (direct)
 	host := r.Host
 	if idx := strings.LastIndex(host, ":"); idx != -1 {
 		host = host[:idx]
 	}
 
-	// Validate: only allow localhost or Tailscale CGNAT range
-	hostname := h.cfg.Host // fallback to config default
+	var livekitURL string
 	if host == "localhost" || host == "127.0.0.1" {
-		hostname = host
+		livekitURL = fmt.Sprintf("ws://%s:%d", host, h.cfg.Port)
 	} else if ip := net.ParseIP(host); ip != nil {
 		_, tsNet, _ := net.ParseCIDR("100.64.0.0/10")
 		if tsNet.Contains(ip) {
-			hostname = host
+			livekitURL = fmt.Sprintf("ws://%s:%d", host, h.cfg.Port)
+		} else {
+			livekitURL = fmt.Sprintf("ws://%s:%d", h.cfg.Host, h.cfg.Port)
 		}
+	} else {
+		// Custom domain (e.g., camera.uncannyportal.com) — route through Caddy's
+		// reverse proxy so the browser uses the same TLS connection
+		scheme := "wss"
+		if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
+			scheme = "ws"
+		}
+		livekitURL = fmt.Sprintf("%s://%s/livekit-ws", scheme, r.Host)
 	}
-	livekitURL := fmt.Sprintf("ws://%s:%d", hostname, h.cfg.Port)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{

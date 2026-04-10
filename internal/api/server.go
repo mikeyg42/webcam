@@ -221,6 +221,11 @@ func isAllowedOrigin(origin string) bool {
 		return true
 	}
 
+	// Allow custom domain
+	if host == "camera.uncannyportal.com" || strings.HasSuffix(host, ".uncannyportal.com") {
+		return true
+	}
+
 	// Allow Tailscale CGNAT range (100.64.0.0/10)
 	ip := net.ParseIP(host)
 	if ip == nil {

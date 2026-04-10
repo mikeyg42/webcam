@@ -40,6 +40,13 @@ pkill -f "./security-camera" && log_info "Go camera application stopped" || log_
 log_info "Stopping livekit-server..."
 pkill -f "livekit-server" && log_info "livekit-server stopped" || log_warn "livekit-server not running"
 
+# Step 2c: Stop Caddy
+CADDY_BINARY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/caddy"
+if [[ -x "$CADDY_BINARY" ]]; then
+  log_info "Stopping Caddy..."
+  "$CADDY_BINARY" stop 2>/dev/null && log_info "Caddy stopped" || log_warn "Caddy not running"
+fi
+
 
 # Step 3: Stop Docker Compose services
 log_info "Stopping Docker Compose services..."

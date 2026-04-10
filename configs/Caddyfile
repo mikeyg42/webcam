@@ -1,0 +1,35 @@
+camera.uncannyportal.com {
+	# TLS via Cloudflare DNS challenge — no port 80/443 needs to be open
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+
+	# Reverse proxy to the Node.js server (static files + API proxy)
+	reverse_proxy localhost:3000 {
+		# WebSocket support for LiveKit signaling
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+	}
+
+	# LiveKit WebSocket — proxy /livekit-ws to the LiveKit server
+	# so browsers connect to wss://camera.uncannyportal.com/livekit-ws
+	# instead of directly to port 7880
+	handle_path /livekit-ws/* {
+		reverse_proxy localhost:7880
+	}
+
+	# Security headers
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	log {
+		output file /Users/mikeglendinning/projects/webcam2/logs/caddy-access.log
+		format json
+	}
+}
