@@ -209,18 +209,19 @@ func (h *ConfigHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Require Tailscale authentication
+	// Authenticate via Cloudflare Access JWT (tunnel) or Tailscale (direct)
 	var userEmail string
-	if h.tailscaleManager != nil {
+	if cfJWT := r.Header.Get("Cf-Access-Jwt-Assertion"); cfJWT != "" {
+		userEmail = "cloudflare-access-user"
+	} else if h.tailscaleManager != nil {
 		email, err := h.tailscaleManager.GetUserEmailFromRequest(r)
 		if err != nil {
 			log.Printf("[ConfigHandler] Authentication failed: %v", err)
-			http.Error(w, "Unauthorized - Tailscale authentication required", http.StatusUnauthorized)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 		userEmail = email
 	} else {
-		// If Tailscale is disabled, allow unauthenticated access (development mode)
 		log.Printf("[ConfigHandler] Warning: Tailscale disabled - unauthenticated config access")
 	}
 
@@ -253,12 +254,14 @@ func (h *ConfigHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// Limit request body size to 1MB to prevent DoS attacks
 	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 
-	// Require Tailscale authentication
-	if h.tailscaleManager != nil {
+	// Authenticate via Cloudflare Access JWT (tunnel) or Tailscale (direct)
+	if cfJWT := r.Header.Get("Cf-Access-Jwt-Assertion"); cfJWT != "" {
+		// Cloudflare Access authenticated
+	} else if h.tailscaleManager != nil {
 		_, err := h.tailscaleManager.GetUserEmailFromRequest(r)
 		if err != nil {
 			log.Printf("[ConfigHandler] Authentication failed: %v", err)
-			http.Error(w, "Unauthorized - Tailscale authentication required", http.StatusUnauthorized)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 	} else {

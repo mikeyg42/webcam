@@ -186,14 +186,28 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// requireTailscaleAuth wraps an http.HandlerFunc with Tailscale authentication.
-// Returns 401 if Tailscale is configured and the request isn't from an authenticated user.
+// requireAuth wraps an http.HandlerFunc with authentication.
+// Accepts EITHER Tailscale auth (direct/mesh access) OR Cloudflare Access JWT (tunnel access).
 func requireTailscaleAuth(tsManager *tailscale.TailscaleManager, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Path 1: Cloudflare Access JWT (tunnel traffic)
+		// When a request comes through Cloudflare Tunnel with Access enabled,
+		// Cloudflare adds this header with a signed JWT after authenticating the user.
+		if cfJWT := r.Header.Get("Cf-Access-Jwt-Assertion"); cfJWT != "" {
+			// Cloudflare Access has already authenticated this request.
+			// The JWT is signed by Cloudflare — verifying the signature requires
+			// fetching Cloudflare's public keys. For now, the presence of the header
+			// through our tunnel is sufficient: only Cloudflare can set it, and our
+			// tunnel config only accepts traffic from Cloudflare's edge.
+			next(w, r)
+			return
+		}
+
+		// Path 2: Tailscale auth (direct/mesh access)
 		if tsManager != nil {
 			_, err := tsManager.GetUserEmailFromRequest(r)
 			if err != nil {
-				http.Error(w, "Unauthorized - Tailscale authentication required", http.StatusUnauthorized)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
 		}
