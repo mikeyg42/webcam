@@ -1,0 +1,19 @@
+tunnel: e737711b-ad28-4f48-ad4e-08a5cb9811ba
+credentials-file: /Users/mikeglendinning/.cloudflared/e737711b-ad28-4f48-ad4e-08a5cb9811ba.json
+
+ingress:
+  # LiveKit signaling WebSocket
+  - hostname: camera.uncannyportal.com
+    path: /livekit-ws/*
+    service: ws://localhost:7880
+    originRequest:
+      connectTimeout: 10s
+
+  # Web UI + API → Node.js proxy
+  - hostname: camera.uncannyportal.com
+    service: http://localhost:3000
+    originRequest:
+      connectTimeout: 30s
+
+  # Catch-all (required by cloudflared)
+  - service: http_status:404

@@ -163,6 +163,7 @@ cleanup() {
   [[ -n "${NODE_PID:-}" ]] && kill "${NODE_PID}" 2>/dev/null || true
   [[ -n "${GO_PID:-}" ]] && kill "${GO_PID}" 2>/dev/null || true
   [[ -n "${SFU_PID:-}" ]] && kill "${SFU_PID}" 2>/dev/null || true
+  [[ -n "${TUNNEL_PID:-}" ]] && kill "${TUNNEL_PID}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -396,23 +397,23 @@ kill -0 "$NODE_PID" >/dev/null 2>&1 || { log_error "Node server exited. See $LOG
 kill -0 "$GO_PID"   >/dev/null 2>&1 || { log_error "Go app exited. See $LOG_DIR/go-camera.log"; tail -20 "$LOG_DIR/go-camera.log" || true; exit 1; }
 
 # ----------------------------
-# Step 7: Start Caddy reverse proxy (HTTPS)
+# Step 7: Start Cloudflare Tunnel (public HTTPS)
 # ----------------------------
-CADDY_BINARY="$PROJECT_DIR/bin/caddy"
-CF_TOKEN_FILE="$HOME/.webcam2/cloudflare_token"
-
-if [[ -x "$CADDY_BINARY" ]] && [[ -f "$CF_TOKEN_FILE" ]]; then
-  export CLOUDFLARE_API_TOKEN="$(cat "$CF_TOKEN_FILE")"
-  log_info "Starting Caddy reverse proxy for camera.uncannyportal.com..."
-  "$CADDY_BINARY" start --config "$PROJECT_DIR/configs/Caddyfile" --adapter caddyfile > "$LOG_DIR/caddy.log" 2>&1
-  if [[ $? -eq 0 ]]; then
-    log_info "Caddy started — HTTPS available at https://camera.uncannyportal.com"
+if command -v cloudflared >/dev/null 2>&1 && [[ -f "$PROJECT_DIR/configs/cloudflared.yml" ]]; then
+  log_info "Starting Cloudflare Tunnel for camera.uncannyportal.com..."
+  cloudflared tunnel --config "$PROJECT_DIR/configs/cloudflared.yml" run webcam2 > "$LOG_DIR/cloudflared.log" 2>&1 &
+  TUNNEL_PID=$!
+  sleep 2
+  if kill -0 "$TUNNEL_PID" 2>/dev/null; then
+    log_info "Cloudflare Tunnel running (PID: $TUNNEL_PID)"
+    log_info "Public URL: https://camera.uncannyportal.com"
   else
-    log_warn "Caddy failed to start. HTTPS not available. Check $LOG_DIR/caddy.log"
+    log_warn "Cloudflare Tunnel failed to start. Check $LOG_DIR/cloudflared.log"
     log_warn "Local access still works at http://localhost:${PORT}"
   fi
 else
-  log_warn "Caddy or Cloudflare token not found — HTTPS disabled"
+  log_warn "cloudflared not installed or config missing — public HTTPS disabled"
+  log_warn "Install with: brew install cloudflared"
   log_warn "Local access at http://localhost:${PORT}"
 fi
 
