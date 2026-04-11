@@ -131,12 +131,17 @@ const goBackendUrl = process.env.GO_BACKEND_URL || 'http://localhost:8081';
 
 function getProxyHeaders(req) {
     const clientIP = req.ip || req.socket.remoteAddress;
-    return {
+    const headers = {
         'Content-Type': 'application/json',
         'X-Forwarded-For': clientIP,
         'X-Forwarded-Proto': req.protocol,
         'X-Forwarded-Host': req.get('host')
     };
+    // Forward Cloudflare Access JWT so Go backend can authenticate tunnel traffic
+    if (req.headers['cf-access-jwt-assertion']) {
+        headers['Cf-Access-Jwt-Assertion'] = req.headers['cf-access-jwt-assertion'];
+    }
+    return headers;
 }
 
 app.use('/api', async (req, res) => {
